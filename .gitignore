@@ -1,0 +1,31 @@
+# --- Secrets: never commit real keys ---
+.env
+.env.*
+!.env.example
+
+# --- Python / virtualenvs ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- Large raw candle data (re-downloadable via data_manager.py) ---
+data/raw_1m/*.parquet
+
+# --- Runtime state: journals, locks, backups, control channel ---
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.lock
+data/backups/
+data/live_bot.lock
+data/bot_control/
+data/test_bot_control/
+data/manual_mode.json
+data/logs/
+*.log
+
+# --- Verification-suite scratch directories ---
+data/step*_test/
+data/step8_smoke/

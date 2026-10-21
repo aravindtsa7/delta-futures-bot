@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Delta Futures Lab</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">Δ</span> Delta Futures Lab</div>
+    <span id="modeBadge" class="badge badge-research">RESEARCH MODE — LIVE TRADING DISABLED</span>
+    <span id="envBadge" class="badge badge-env">…</span>
+    <nav class="view-switch" aria-label="View">
+      <button class="vbtn active" data-view="lab">Backtest Lab</button>
+      <button class="vbtn" data-view="bot">Bot Operations</button>
+      <button class="vbtn" data-view="manual">Manual Trade</button>
+    </nav>
+    <span id="botBadge" class="badge badge-bot-off" title="Bot runner status">BOT STOPPED</span>
+    <div id="coverage" class="coverage"></div>
+    <div class="spacer"></div>
+    <span id="syncStatus" class="sync-status"></span>
+    <button id="syncBtn" class="btn">⟳ Sync Latest Candles</button>
+    <button id="addCoinBtn" class="btn btn-ghost">+ Add Coin</button>
+  </header>
+
+  <div class="layout" id="labView">
+    <aside class="panel controls" aria-label="Backtest controls">
+      <div class="field">
+        <label for="presetSelect">Quick Preset</label>
+        <select id="presetSelect"><option value="">— choose a preset —</option></select>
+        <div id="presetNote" class="hint"></div>
+      </div>
+      <div class="field">
+        <label for="presetCapital">Run presets at</label>
+        <select id="presetCapital">
+          <option value="preset">Preset's own capital (legacy Step 3C presets = ₹10,000)</option>
+          <option value="50000">₹50,000 for every preset</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <span class="label">Mode</span>
+        <div class="seg" role="radiogroup">
+          <label><input type="radio" name="runMode" value="single" checked> Single symbol</label>
+          <label><input type="radio" name="runMode" value="portfolio"> Shared wallet</label>
+        </div>
+      </div>
+
+      <div class="field" id="singleSymbolField">
+        <label for="symbolSelect">Symbol</label>
+        <select id="symbolSelect"></select>
+      </div>
+      <div class="field hidden" id="portfolioSymbolsField">
+        <span class="label">Symbols (one ₹ wallet)</span>
+        <div id="symbolChecks" class="checks"></div>
+      </div>
+
+      <div id="legsNotice" class="legs-notice hidden"></div>
+
+      <div class="row2">
+        <div class="field">
+          <label for="strategySelect">Strategy</label>
+          <select id="strategySelect"></select>
+        </div>
+        <div class="field">
+          <label for="tfSelect">Timeframe</label>
+          <select id="tfSelect"></select>
+        </div>
+      </div>
+
+      <div class="row2">
+        <div class="field">
+          <label for="daysSelect">Period</label>
+          <select id="daysSelect">
+            <option value="30">30 days</option>
+            <option value="60">60 days</option>
+            <option value="90">90 days</option>
+            <option value="180" selected>180 days</option>
+            <option value="365">365 days</option>
+            <option value="custom">Custom range</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="endSelect">Window end</label>
+          <select id="endSelect">
+            <option value="step3c">Step 3C anchor</option>
+            <option value="step4b">Step 4B anchor</option>
+            <option value="latest">Latest candle</option>
+          </select>
+        </div>
+      </div>
+      <div class="row2 hidden" id="customRange">
+        <div class="field"><label for="startDate">Start (UTC)</label><input id="startDate" type="date"></div>
+        <div class="field"><label for="endDate">End (UTC)</label><input id="endDate" type="date"></div>
+      </div>
+
+      <div class="section-title">Capital &amp; risk</div>
+      <div class="row2">
+        <div class="field"><label for="capital">Capital (₹)</label><input id="capital" type="number" min="100" step="100" value="50000"></div>
+        <div class="field"><label for="leverage">Leverage</label><input id="leverage" type="number" min="1" max="100" step="1" value="10"></div>
+      </div>
+      <div class="row2">
+        <div class="field"><label for="risk">Risk / trade %</label><input id="risk" type="number" min="0.1" max="100" step="0.1" value="2"></div>
+        <div class="field"><label for="dailyLoss">Daily loss stop %</label><input id="dailyLoss" type="number" min="0" max="100" step="0.5" value="5"></div>
+      </div>
+
+      <div class="section-title">Stops &amp; exits</div>
+      <div class="row3">
+        <div class="field">
+          <label for="stopMode">Stop mode</label>
+          <select id="stopMode"><option value="atr">ATR ×</option><option value="pct">Fixed %</option></select>
+        </div>
+        <div class="field"><label for="slValue">SL</label><input id="slValue" type="number" min="0.1" step="0.1" value="2"></div>
+        <div class="field"><label for="tpValue">TP</label><input id="tpValue" type="number" min="0.1" step="0.1" value="5"></div>
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label for="exitMode">Exit mode</label>
+          <select id="exitMode"></select>
+        </div>
+        <div class="field"><label for="trailAtr">Trail ATR ×</label><input id="trailAtr" type="number" min="0" step="0.5" value="2.5"></div>
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label for="feeMode">Fee mode</label>
+          <select id="feeMode"></select>
+        </div>
+        <div class="field">
+          <label for="triggerSource">SL/TP trigger</label>
+          <select id="triggerSource"></select>
+        </div>
+      </div>
+
+      <div class="section-title">Step 4B filters &amp; costs</div>
+      <div class="row2">
+        <div class="field">
+          <label for="slippage">Slippage (bps/fill)</label>
+          <select id="slippage"><option value="0">0</option><option value="2">2</option><option value="5">5</option></select>
+        </div>
+        <div class="field">
+          <span class="label">Lot sizing</span>
+          <label class="inline"><input type="checkbox" id="strictLot"> Strict risk lot cap</label>
+        </div>
+      </div>
+      <div class="field">
+        <label class="inline"><input type="checkbox" id="trend4h"> 4h EMA(50/200) trend filter (closed 4h bars)</label>
+        <label class="inline"><input type="checkbox" id="costGate"> Raw ATR ≥ 2× cost gate</label>
+      </div>
+
+      <button id="runBtn" class="btn btn-primary btn-run">▶ Run Backtest</button>
+      <div id="runInfo" class="hint"></div>
+    </aside>
+
+    <main class="main">
+      <section class="kpis" id="kpis" aria-label="Scorecard"></section>
+
+      <section class="panel charts">
+        <div class="chart-toolbar">
+          <div id="chartTabs" class="tabs small"></div>
+          <div id="legend" class="legend"></div>
+          <div class="spacer"></div>
+          <span class="muted">Times in UTC</span>
+        </div>
+        <div class="chart-wrap">
+          <div id="priceChart" class="chart chart-price"></div>
+          <div id="chartLoading" class="loading hidden"><div class="spinner"></div><span>Running backtest…</span></div>
+        </div>
+        <div class="chart-label">Equity (₹, mark-to-market) &amp; drawdown (%)</div>
+        <div id="equityChart" class="chart chart-equity"></div>
+        <div class="attribution">
+          Charts powered by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a>
+          — Copyright © TradingView, Inc.
+        </div>
+      </section>
+
+      <section class="panel bottom">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="ledger" role="tab">Trade Ledger</button>
+          <button class="tab" data-tab="wf" role="tab">Walk-Forward W1 / W2 / W3</button>
+          <button class="tab" data-tab="lb" role="tab">180-Day Leaderboard</button>
+        </div>
+
+        <div class="tab-body" id="tab-ledger">
+          <div class="tab-toolbar">
+            <span id="ledgerCount" class="muted">No trades yet</span>
+            <div class="spacer"></div>
+            <span class="muted">Click a row to inspect it on the chart</span>
+            <button id="exportCsv" class="btn btn-ghost btn-sm" disabled>⇩ Export CSV</button>
+          </div>
+          <div class="table-wrap"><table id="ledgerTable" class="data"></table></div>
+        </div>
+
+        <div class="tab-body hidden" id="tab-wf">
+          <div class="tab-toolbar"><span id="wfNote" class="muted"></span></div>
+          <div class="table-wrap"><table id="wfTable" class="data"></table></div>
+        </div>
+
+        <div class="tab-body hidden" id="tab-lb">
+          <div class="tab-toolbar filters">
+            <select id="lbSource"><option value="step3c">Step 3C · 180d walk-forward</option><option value="step3b">Step 3B · 90d train/test</option></select>
+            <select id="lbSymbol"><option value="">All symbols</option></select>
+            <select id="lbStrategy"><option value="">All strategies</option></select>
+            <select id="lbTf"><option value="">All timeframes</option></select>
+            <label class="inline"><input type="checkbox" id="lbPassing"> Passing filter only</label>
+            <span id="lbCount" class="muted"></span>
+            <div class="spacer"></div>
+            <span class="muted">Click a row to load &amp; run it</span>
+          </div>
+          <div class="table-wrap"><table id="lbTable" class="data"></table></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="botView" class="bot-view hidden">
+    <section class="panel bot-head">
+      <div class="bot-title">
+        <h2>Live / Paper Bot Operations</h2>
+        <span id="botModeBadge" class="badge badge-bot-off">–</span>
+        <span id="botStateBadge" class="badge badge-env">–</span>
+        <span id="botPausedBadge" class="badge badge-warn hidden">ENTRIES PAUSED</span>
+        <span id="botHaltBadge" class="badge badge-live hidden">HALTED</span>
+        <div class="spacer"></div>
+        <span id="botRefresh" class="muted">auto-refresh 5s</span>
+      </div>
+      <div class="bot-controls">
+        <label class="inline">Mode
+          <select id="botMode">
+            <option value="paper">Paper (public data, simulated fills)</option>
+            <option value="testnet">Testnet (Delta India demo)</option>
+            <option value="live" disabled>Live (disabled)</option>
+          </select>
+        </label>
+        <button id="botStep" class="btn">▶ Run 1 Cycle (--once)</button>
+        <button id="botStart" class="btn btn-primary">⏵ Start 24/7 Loop</button>
+        <button id="botPause" class="btn">⏸ Pause New Entries</button>
+        <button id="botResume" class="btn">⏵ Resume Entries</button>
+        <button id="botStop" class="btn">⏹ Stop Bot Process</button>
+        <button id="botBackup" class="btn btn-ghost">🗄 Backup State DB</button>
+        <button id="botTelegram" class="btn btn-ghost">✉ Test Telegram Alert</button>
+        <div class="spacer"></div>
+        <button id="botFlatten" class="btn btn-danger">⚠ Emergency Flatten All Positions</button>
+      </div>
+      <div id="botMsg" class="bot-msg hint"></div>
+    </section>
+
+    <section class="kpis" id="botKpis" aria-label="Bot telemetry"></section>
+
+    <section class="panel bot-card">
+      <div class="bot-card-head"><h3>Live Signal Status</h3><span class="muted">latest CLOSED 1h bar · 4h regime from the latest closed 4h bar · local 1m history</span></div>
+      <div class="table-wrap"><table id="botSignals" class="data"></table></div>
+    </section>
+
+    <div class="bot-grid">
+      <section class="panel bot-card">
+        <div class="bot-card-head"><h3>Open Positions</h3><span id="botPosCount" class="muted"></span></div>
+        <div class="table-wrap"><table id="botPositions" class="data"></table></div>
+      </section>
+      <section class="panel bot-card">
+        <div class="bot-card-head"><h3>Order Intents Journal</h3><span id="botIntentNote" class="muted"></span></div>
+        <div class="table-wrap"><table id="botIntents" class="data"></table></div>
+      </section>
+      <section class="panel bot-card">
+        <div class="bot-card-head"><h3>Bot Trade History</h3><span id="botTradeCount" class="muted"></span></div>
+        <div class="table-wrap"><table id="botTrades" class="data"></table></div>
+      </section>
+      <section class="panel bot-card">
+        <div class="bot-card-head"><h3>State Transitions &amp; Incidents</h3><span id="botRecon" class="muted"></span></div>
+        <div class="table-wrap"><table id="botEvents" class="data"></table></div>
+      </section>
+    </div>
+  </div>
+
+  <div id="manualView" class="manual-view hidden">
+    <section class="panel mt-modebar" id="mtModeBar">
+      <div class="mt-modes" role="group" aria-label="Manual trade mode">
+        <button class="mbtn" data-mode="paper">PAPER (Sim)</button>
+        <button class="mbtn hidden" data-mode="testnet" id="mtModeTestnet">TESTNET (Demo)</button>
+        <button class="mbtn mbtn-live" data-mode="live" id="mtModeLive">LIVE (Delta India Real INR)</button>
+      </div>
+      <span id="mtModeTag" class="badge badge-paper-blue">PAPER — Virtual ₹50,000</span>
+      <button id="mtVerify" class="btn btn-sm">🔌 Verify API &amp; Sync Wallet</button>
+      <span id="mtConn" class="mt-conn muted"></span>
+    </section>
+    <section class="panel mt-bar" id="mtBar">
+      <span id="mtModeBadge" class="badge badge-paper">PAPER WALLET</span>
+      <div class="mt-stat"><span>Wallet balance</span><b id="mtBalance">–</b></div>
+      <div class="mt-stat"><span>Available margin</span><b id="mtAvail">–</b></div>
+      <div class="mt-stat"><span>Used margin</span><b id="mtUsed">–</b></div>
+      <div class="mt-stat"><span>Unrealized PnL</span><b id="mtUpnl">–</b></div>
+      <div class="mt-stat"><span>Total equity</span><b id="mtEquity">–</b></div>
+      <div class="spacer"></div>
+      <span id="mtWatch" class="muted"></span>
+    </section>
+    <section id="mtBotBanner" class="panel mt-banner hidden">
+      <span><b>Auto-Bot is running</b> — it is the only writer of the shared wallet, so manual orders are disabled.</span>
+      <button id="mtStopBot" class="btn btn-danger">⏹ Auto-Bot is Running — Click to Stop Bot &amp; Trade Manually</button>
+    </section>
+
+    <div class="mt-grid">
+      <aside class="panel mt-ticket" aria-label="Order ticket">
+        <div class="field">
+          <label for="mtSymbol">Symbol</label>
+          <select id="mtSymbol"></select>
+        </div>
+        <div class="field">
+          <label for="mtSearch">+ Add any Delta India perpetual</label>
+          <div class="mt-row">
+            <input id="mtSearch" list="mtCatalog" placeholder="type e.g. SOL, XRP, DOGE" autocomplete="off">
+            <datalist id="mtCatalog"></datalist>
+            <button id="mtLoad" class="btn btn-sm" title="load it in the ticket (metadata only)">Load</button>
+            <button id="mtAdd" class="btn btn-sm btn-primary" title="add to the coin list everywhere (backtests + auto-bot)">+ Add</button>
+          </div>
+          <div id="mtProduct" class="hint"></div>
+        </div>
+
+        <div class="field">
+          <label for="mtLev">Leverage <span id="mtLevMax" class="muted"></span></label>
+          <div class="mt-row">
+            <input id="mtLevRange" type="range" min="1" max="100" step="1" value="10">
+            <input id="mtLev" type="number" min="1" max="200" step="1" value="10" class="mt-num"><span class="muted">x</span>
+          </div>
+          <div class="mt-chips" id="mtLevChips"></div>
+        </div>
+
+        <div class="field">
+          <label>Order type</label>
+          <div class="seg">
+            <label><input type="radio" name="mtType" value="market" checked> Market</label>
+            <label><input type="radio" name="mtType" value="limit"> Limit</label>
+          </div>
+          <input id="mtLimit" type="number" step="any" placeholder="limit price" class="hidden">
+        </div>
+
+        <div class="field">
+          <label>Size by</label>
+          <div class="seg">
+            <label><input type="radio" name="mtSize" value="margin" checked> Margin ₹</label>
+            <label><input type="radio" name="mtSize" value="contracts"> Contracts</label>
+            <label><input type="radio" name="mtSize" value="risk"> Risk %</label>
+          </div>
+          <input id="mtSizeVal" type="number" step="any" min="0" value="5000">
+        </div>
+
+        <div class="row2">
+          <div class="field"><label for="mtSl">Stop-loss <select id="mtSlMode" class="mt-mini"><option value="pct">%</option><option value="price">price</option></select></label>
+            <input id="mtSl" type="number" step="any" min="0" placeholder="optional"></div>
+          <div class="field"><label for="mtTp">Take-profit <select id="mtTpMode" class="mt-mini"><option value="pct">%</option><option value="price">price</option></select></label>
+            <input id="mtTp" type="number" step="any" min="0" placeholder="optional"></div>
+        </div>
+        <div class="field"><label for="mtTrail">Trailing stop distance (price units, optional)</label>
+          <input id="mtTrail" type="number" step="any" min="0" placeholder="e.g. 1.5"></div>
+
+        <div id="mtPreview" class="mt-preview">Preview appears here</div>
+        <div class="mt-actions">
+          <button id="mtBuy" class="btn btn-buy">BUY / LONG</button>
+          <button id="mtSell" class="btn btn-sell">SELL / SHORT</button>
+        </div>
+        <div id="mtMsg" class="hint"></div>
+      </aside>
+
+      <section class="panel mt-chart-panel">
+        <div class="mt-ticker" id="mtTicker"></div>
+        <div class="chart-toolbar">
+          <div class="tabs small" id="mtResTabs">
+            <button class="tab" data-res="1m">1m</button><button class="tab active" data-res="5m">5m</button>
+            <button class="tab" data-res="15m">15m</button><button class="tab" data-res="1h">1h</button>
+          </div>
+          <div class="spacer"></div>
+          <span class="muted">Lines: entry · SL · TP · est. liquidation · times in UTC</span>
+        </div>
+        <div id="mtChart" class="chart mt-chart"></div>
+        <div class="attribution">Charts powered by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a></div>
+      </section>
+    </div>
+
+    <section class="panel bot-card">
+      <div class="bot-card-head"><h3>Open Positions</h3><span id="mtPosNote" class="muted"></span></div>
+      <div class="table-wrap"><table id="mtPositions" class="data"></table></div>
+    </section>
+    <section class="panel bot-card">
+      <div class="bot-card-head"><h3>Resting Limit Orders</h3><span class="muted">paper: fill at the limit (maker fee) when the last price touches it</span></div>
+      <div class="table-wrap"><table id="mtPending" class="data"></table></div>
+    </section>
+    <section class="panel bot-card">
+      <div class="bot-card-head"><h3>Closed Trades (manual + bot)</h3><span id="mtTradeNote" class="muted"></span></div>
+      <div class="table-wrap"><table id="mtTrades" class="data"></table></div>
+    </section>
+  </div>
+
+  <dialog id="mtProtectDialog">
+    <form method="dialog" id="mtProtectForm">
+      <h3 id="mtProtectTitle">Edit protection</h3>
+      <div class="row2">
+        <div class="field"><label for="mtPSl">Stop-loss price</label><input id="mtPSl" type="number" step="any" min="0"></div>
+        <div class="field"><label for="mtPTp">Take-profit price</label><input id="mtPTp" type="number" step="any" min="0"></div>
+      </div>
+      <div class="field"><label for="mtPTrail">Trailing distance (0 = off)</label><input id="mtPTrail" type="number" step="any" min="0"></div>
+      <label class="inline"><input type="checkbox" id="mtPClearSl"> remove stop-loss</label>
+      <label class="inline"><input type="checkbox" id="mtPClearTp"> remove take-profit</label>
+      <div id="mtProtectMsg" class="hint"></div>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn btn-ghost" formnovalidate>Cancel</button>
+        <button id="mtProtectSave" value="default" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="addCoinDialog">
+    <form method="dialog" id="addCoinForm">
+      <h3>Add a perpetual futures symbol</h3>
+      <p class="hint">Validated against <code>GET /v2/products/{symbol}</code>, then TRADE / MARK / FUNDING 1m history is downloaded in the background.</p>
+      <div class="row2">
+        <div class="field"><label for="newSymbol">Symbol</label><input id="newSymbol" placeholder="e.g. SOLUSD" required pattern="[A-Za-z0-9]{2,20}" autocomplete="off"></div>
+        <div class="field"><label for="newDays">History (days)</label><input id="newDays" type="number" min="1" max="400" value="90"></div>
+      </div>
+      <div id="addCoinMsg" class="hint"></div>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn btn-ghost" formnovalidate>Cancel</button>
+        <button id="addCoinSubmit" value="default" class="btn btn-primary">Validate &amp; download</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+requests==2.34.2
+pandas==3.0.6
+numpy==2.5.4
+pyarrow==26.0.0
+fastapi==0.149.0
+uvicorn==0.54.0
+pydantic==2.14.1
+pydantic-settings==2.16.0
+rich==15.0.0
+httpx==0.28.1
+websockets==15.0.1
