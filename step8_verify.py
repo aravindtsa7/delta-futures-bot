@@ -60,6 +60,12 @@ def check(section: str, name: str, ok: bool, detail: str = "") -> bool:
     return bool(ok)
 
 
+def mb(**extra) -> dict:
+    """Step 9 mode binding for manual mutations: expected_mode + mode_generation (+ confirm='LIVE' in live)."""
+    mode, gen = bot_ops.mode_state()
+    return {"expected_mode": mode, "mode_generation": gen, **({"confirm": "LIVE"} if mode == "live" else {}), **extra}
+
+
 def setup() -> TestClient:
     if T.exists():
         shutil.rmtree(T)
@@ -110,11 +116,12 @@ def test_add_coin(c: TestClient) -> None:
     parquet = dm.raw_1m_path("SOLUSD", "TRADE")
     had_hist = parquet.exists()
     t0 = time.perf_counter()
-    r = c.post("/api/manual/symbols", json={"symbol": "SOLUSD", "backfill": False})
+    r = c.post("/api/manual/symbols", json={"symbol": "SOLUSD", "backfill": False, "enable_auto_bot": True})
     a = r.json()
     check("2 coins", "POST /api/manual/symbols SOLUSD: metadata saved, added to the shared coin list",
           r.status_code == 200 and "SOLUSD" in a["app_symbols"] and dm.metadata_path("SOLUSD").exists() and "SOLUSD" in dm.app_symbols(),
           f"{a['app_symbols']} in {time.perf_counter() - t0:.1f}s")
+    entry = json.loads(ee.BOT_PROFILES_FILE.read_text(encoding="utf-8")).get("SOLUSD") if ee.BOT_PROFILES_FILE.exists() else None
     t0 = time.perf_counter()
     s = c.get("/api/manual/state", params={"symbol": "SOLUSD", "resolution": "1m"}).json()
     pv = c.post("/api/manual/preview", json={"symbol": "SOLUSD", "side": "LONG", "leverage": 25, "margin_inr": 5000}).json()
@@ -134,9 +141,10 @@ def test_add_coin(c: TestClient) -> None:
     bad = c.post("/api/manual/preview", json={"symbol": "SOLUSD", "side": "LONG", "leverage": 150, "margin_inr": 5000})
     check("2 coins", "leverage above the product maximum (150x > 100x) refused", bad.status_code == 422, bad.json()["detail"])
     prof = ee.bot_profiles()
-    check("2 coins", "auto-bot universe: BTCUSD D_both, ETHUSD C_costgate, added SOLUSD defaults to C_costgate",
+    check("2 coins", "auto-bot universe: BTCUSD D_both, ETHUSD C_costgate, SOLUSD added with enable_auto_bot=true -> C_costgate",
           prof["BTCUSD"].variant == "D_both" and prof["ETHUSD"].variant == "C_costgate" and prof["SOLUSD"].variant == "C_costgate"
-          and prof["SOLUSD"].cost_gate and not prof["SOLUSD"].trend_filter_4h)
+          and prof["SOLUSD"].cost_gate and not prof["SOLUSD"].trend_filter_4h
+          and entry == {"variant": "C_costgate", "enabled": True}, f"bot_profiles.json SOLUSD {entry}")
     ee.BOT_PROFILES_FILE.write_text(json.dumps({"SOLUSD": {"variant": "D_both"}}), encoding="utf-8")
     p2 = ee.bot_profiles()
     ee.BOT_PROFILES_FILE.write_text(json.dumps({"SOLUSD": {"enabled": False}}), encoding="utf-8")
@@ -154,14 +162,14 @@ def test_guard(c: TestClient) -> None:
     while time.time() - t0 < 60 and not c.get("/api/manual/state", params={"symbol": "SOLUSD", "include_candles": False}).json()["bot"]["running"]:
         time.sleep(0.5)
     s = c.get("/api/manual/state", params={"symbol": "SOLUSD", "include_candles": False}).json()
-    r1 = c.post("/api/manual/order", json=order)
-    r1c = c.post("/api/manual/position/SOLUSD/close")
+    r1 = c.post("/api/manual/order", json={**order, **mb()})
+    r1c = c.post("/api/manual/position/SOLUSD/close", json=mb())
     check("3 guard", "auto-bot running -> manual_enabled false; POST /api/manual/order 409 (and close 409)",
           r.status_code == 200 and s["bot"]["running"] and not s["manual_enabled"] and r1.status_code == 409 and r1c.status_code == 409,
           f"pid {st.get('pid')}: {r1.json()['detail'][:90]}")
     stop = c.post("/api/bot/stop").json()
     t0 = time.perf_counter()
-    r2 = c.post("/api/manual/order", json=order)
+    r2 = c.post("/api/manual/order", json={**order, **mb()})
     o = r2.json()
     check("3 guard", "after POST /api/bot/stop the same order succeeds immediately", stop["stopped"] and stop["exit_code"] == 0
           and r2.status_code == 200 and o["result"] == "opened", f"opened in {time.perf_counter() - t0:.1f}s")
@@ -183,14 +191,14 @@ def test_trading(c: TestClient) -> None:
           f"{sol['contracts']} @ {sol['entry_price']:.4f}, margin ₹{sol['margin_inr']:.2f}, SL {sol['sl_price']} TP {sol['tp_price']}, "
           f"liq {sol['liq_price_est']:.4f}")
     new_sl, new_tp = round(sol["entry_price"] * 0.985, 4), round(sol["entry_price"] * 1.03, 4)
-    r = c.put("/api/manual/position/SOLUSD/protection", json={"sl_price": new_sl, "tp_price": new_tp})
-    bad = c.put("/api/manual/position/SOLUSD/protection", json={"sl_price": round(sol["entry_price"] * 1.05, 4)})
+    r = c.put("/api/manual/position/SOLUSD/protection", json={"sl_price": new_sl, "tp_price": new_tp, **mb()})
+    bad = c.put("/api/manual/position/SOLUSD/protection", json={"sl_price": round(sol["entry_price"] * 1.05, 4), **mb()})
     pp = r.json().get("position", {})
     check("4 trade", "PUT /api/manual/position/SOLUSD/protection edits SL/TP; an SL above the mark is refused (422)",
           r.status_code == 200 and abs(pp["sl_price"] - new_sl) < 1e-9 and abs(pp["tp_price"] - new_tp) < 1e-9 and bad.status_code == 422,
           f"SL {sol['sl_price']} -> {pp.get('sl_price')}, TP {sol['tp_price']} -> {pp.get('tp_price')}")
     r = c.post("/api/manual/order", json={"symbol": "BTCUSD", "side": "SHORT", "leverage": 15, "margin_inr": 4000,
-                                           "sl_pct": 1.5, "tp_pct": 3.0})
+                                           "sl_pct": 1.5, "tp_pct": 3.0, **mb()})
     s = c.get("/api/manual/state", params={"symbol": "BTCUSD", "include_candles": False}).json()
     btc = pos_of(s, "BTCUSD")
     check("4 trade", "BTCUSD SHORT 15x placed (TP below / SL above entry)", r.status_code == 200 and btc and btc["side"] == "SHORT"
@@ -212,8 +220,8 @@ def test_trading(c: TestClient) -> None:
 
     # add to SOL (same leverage) and the refusal at a different leverage
     n0 = pos_of(s, "SOLUSD")["contracts"]
-    r_add = c.post("/api/manual/order", json={"symbol": "SOLUSD", "side": "LONG", "leverage": 20, "contracts": 2})
-    r_bad = c.post("/api/manual/order", json={"symbol": "SOLUSD", "side": "LONG", "leverage": 10, "contracts": 1})
+    r_add = c.post("/api/manual/order", json={"symbol": "SOLUSD", "side": "LONG", "leverage": 20, "contracts": 2, **mb()})
+    r_bad = c.post("/api/manual/order", json={"symbol": "SOLUSD", "side": "LONG", "leverage": 10, "contracts": 1, **mb()})
     sol2 = pos_of(c.get("/api/manual/state", params={"symbol": "SOLUSD", "include_candles": False}).json(), "SOLUSD")
     check("4 trade", "add 2 contracts at 20x averages the entry; adding at 10x is refused", r_add.json().get("result") == "added"
           and sol2["contracts"] == n0 + 2 and r_bad.status_code == 422, f"{n0} -> {sol2['contracts']} @ {sol2['entry_price']:.4f}")
@@ -225,18 +233,18 @@ def test_trading(c: TestClient) -> None:
     check("4 trade", "watcher tick inside SL/TP leaves both positions open", w0["status"] == "ran" and len(s_mid["positions"]) == 2
           and not [a for a in w0["actions"] if a["kind"] == "exit"], json.dumps(w0["actions"])[:120])
     # ETH 100x long without SL -> liquidation on mark; XRP long with TP -> TP; a resting limit that fills; one cancelled
-    r_eth = c.post("/api/manual/order", json={"symbol": "ETHUSD", "side": "LONG", "leverage": 100, "contracts": 2})
-    r_xrp = c.post("/api/manual/order", json={"symbol": "XRPUSD", "side": "LONG", "leverage": 10, "margin_inr": 1000, "tp_pct": 2.0})
+    r_eth = c.post("/api/manual/order", json={"symbol": "ETHUSD", "side": "LONG", "leverage": 100, "contracts": 2, **mb()})
+    r_xrp = c.post("/api/manual/order", json={"symbol": "XRPUSD", "side": "LONG", "leverage": 10, "margin_inr": 1000, "tp_pct": 2.0, **mb()})
     s3 = c.get("/api/manual/state", params={"symbol": "XRPUSD", "include_candles": False}).json()
     eth, xrp = pos_of(s3, "ETHUSD"), pos_of(s3, "XRPUSD")
     dtk = c.get("/api/manual/state", params={"symbol": "DOGEUSD", "include_candles": False}).json()["ticker"]
     doge_lim = round(dtk["best_ask"] * 1.01, 6)
     r_lim = c.post("/api/manual/order", json={"symbol": "DOGEUSD", "side": "SHORT", "order_type": "limit",
-                                               "limit_price": doge_lim, "leverage": 10, "contracts": 3})
+                                               "limit_price": doge_lim, "leverage": 10, "contracts": 3, **mb()})
     r_lim2 = c.post("/api/manual/order", json={"symbol": "SOLUSD", "side": "LONG", "order_type": "limit",
-                                                "limit_price": round(sol2["entry_price"] * 0.8, 4), "leverage": 20, "contracts": 1})
+                                                "limit_price": round(sol2["entry_price"] * 0.8, 4), "leverage": 20, "contracts": 1, **mb()})
     pend = c.get("/api/manual/state", params={"symbol": "SOLUSD", "include_candles": False}).json()["pending_orders"]
-    r_cancel = c.delete(f"/api/manual/order/{r_lim2.json().get('intent_id')}")
+    r_cancel = c.delete(f"/api/manual/order/{r_lim2.json().get('intent_id')}", params=mb())
     check("4 trade", "resting limit orders journalled (ACKNOWLEDGED); cancel works",
           r_lim.json().get("result") == "resting" and r_lim2.json().get("result") == "resting" and len(pend) == 2
           and r_cancel.status_code == 200, f"{[(o['symbol'], o['side'], o['limit_price']) for o in pend]}")
@@ -265,10 +273,10 @@ def test_trading(c: TestClient) -> None:
 
     # closes
     sol_n = pos_of(s4, "SOLUSD")["contracts"]
-    rp = c.post("/api/manual/position/SOLUSD/close", json={"contracts": 3})
-    rf = c.post("/api/manual/position/SOLUSD/close")
-    rb = c.post("/api/manual/position/BTCUSD/close")
-    rx = c.post("/api/manual/position/DOGEUSD/close")
+    rp = c.post("/api/manual/position/SOLUSD/close", json=mb(contracts=3))
+    rf = c.post("/api/manual/position/SOLUSD/close", json=mb())
+    rb = c.post("/api/manual/position/BTCUSD/close", json=mb())
+    rx = c.post("/api/manual/position/DOGEUSD/close", json=mb())
     s5 = c.get("/api/manual/state", params={"symbol": "BTCUSD", "include_candles": False}).json()
     check("4 trade", "POST .../close: SOL partial (3) then rest, BTC and DOGE full — MANUAL_CLOSE, nothing left open",
           rp.json().get("result") == "partial_exit" and rp.json().get("remaining") == sol_n - 3 and rf.json().get("result") == "exit"

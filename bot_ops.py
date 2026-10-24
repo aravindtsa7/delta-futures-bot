@@ -47,7 +47,7 @@ _proc: subprocess.Popen | None = None
 _proc_log: Path | None = None
 _proc_bot_pid: int | None = None  # pid holding the lock (the venv launcher spawns the real interpreter as a child)
 _op_lock = threading.Lock()
-_notifier: TelegramNotifier | None = None
+_notifiers: dict[str, TelegramNotifier] = {}
 _cache: dict[str, Any] = {}
 
 
@@ -70,22 +70,30 @@ def mode_db(mode: str) -> Path:
     return base if mode == "paper" else base.with_name(f"{base.stem}_{mode}{base.suffix}")
 
 
-def active_mode() -> str:
-    """Manual Trade's selected mode (persisted); paper unless switched."""
+def mode_state() -> tuple[str, int]:
+    """Manual Trade's selected mode (persisted; paper unless switched) and its monotonic mode_generation."""
     f = PATHS["manual_mode"]
     try:
-        m = json.loads(f.read_text(encoding="utf-8")).get("mode", "paper")
+        d = json.loads(f.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return "paper"
-    return m if m in EXEC_MODES else "paper"
+        return "paper", 0
+    m = d.get("mode", "paper")
+    return (m if m in EXEC_MODES else "paper"), int(d.get("mode_generation") or 0)
 
 
-def set_active_mode(mode: str) -> None:
+def active_mode() -> str:
+    return mode_state()[0]
+
+
+def set_active_mode(mode: str) -> int:
+    """Persist ``mode`` and bump mode_generation (every accepted switch invalidates tickets bound to the old one)."""
     f = PATHS["manual_mode"]
     f.parent.mkdir(parents=True, exist_ok=True)
+    gen = mode_state()[1] + 1
     tmp = f.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"mode": mode, "at": time.time()}), encoding="utf-8")
+    tmp.write_text(json.dumps({"mode": mode, "mode_generation": gen, "at": time.time()}), encoding="utf-8")
     os.replace(tmp, f)
+    return gen
 
 
 def status_mode() -> str:
@@ -96,11 +104,12 @@ def status_mode() -> str:
     return active_mode()
 
 
-def notifier() -> TelegramNotifier:
-    global _notifier
-    if _notifier is None:
-        _notifier = TelegramNotifier.from_settings("paper")
-    return _notifier
+def notifier(mode: str | None = None) -> TelegramNotifier:
+    """One notifier per execution mode, so alerts carry [PAPER] / [TESTNET] / [LIVE] (default: the shown journal's mode)."""
+    m = mode if mode in EXEC_MODES else status_mode()
+    if m not in _notifiers:
+        _notifiers[m] = TelegramNotifier.from_settings(m)
+    return _notifiers[m]
 
 
 def _clean(o: Any) -> Any:
@@ -316,7 +325,7 @@ def bot_status() -> dict[str, Any]:
 def _runner(mode: str) -> lb.LiveBotRunner:
     try:
         return lb.LiveBotRunner(mode, profiles=ee.bot_profiles(), store_path=mode_db(mode), lock_path=PATHS["lock"],
-                                control_dir=PATHS["control"], notifier=notifier())
+                                control_dir=PATHS["control"], notifier=notifier(mode))
     except lb.BotAlreadyRunningError as exc:
         raise HTTPException(409, f"a bot runner is active: {exc}") from exc
     except RuntimeError as exc:  # e.g. journal bound to another mode
@@ -394,7 +403,7 @@ def bot_start(req: StartRequest | None = None) -> dict[str, Any]:
                 tail = _proc_log.read_text(encoding="utf-8", errors="replace")[-1500:]
                 raise HTTPException(500, f"bot exited immediately (code {_proc.returncode}): {tail}")
             time.sleep(0.1)
-    notifier().notify_bot_lifecycle("Start requested", mode, "BOOTING", {"pid": _proc.pid})
+    notifier(mode).notify_bot_lifecycle("Start requested", mode, "BOOTING", {"pid": _proc.pid})
     return {"started": True, "pid": _proc_bot_pid or _proc.pid, "launcher_pid": _proc.pid, "mode": mode,
             "log_file": str(_proc_log), "command": " ".join(cmd[1:])}
 
@@ -462,8 +471,8 @@ def _toggle_pause(paused: bool) -> dict[str, Any]:
             raise HTTPException(409, str(exc)) from exc
         finally:
             store.close()
-    notifier().notify_bot_lifecycle("Pause" if paused else "Resume", None, "STOPPED",
-                                    "new entries paused" if paused else "new entries allowed")
+    notifier(m).notify_bot_lifecycle("Pause" if paused else "Resume", None, "STOPPED",
+                                     "new entries paused" if paused else "new entries allowed")
     return {"via": "journal", "ok": True, "entries_paused": paused}
 
 

@@ -7,6 +7,9 @@ Modes (POST /api/manual/mode, persisted in data/manual_mode.json) each use their
                                       the live API key/secret and an explicit {"mode": "live", "confirm": "LIVE"} switch
 
 * Single-writer rule: manual mutations are refused (409) while the 24/7 auto-bot holds data/live_bot.lock.
+* Step 9 (F01): every mutation (order, close, protection, cancel) carries expected_mode + mode_generation, checked under
+  the same lock as mode switches: a ticket prepared in another mode / generation is refused with 409 before anything is
+  sent, and in LIVE each request itself must carry confirm="LIVE". A client_request_id makes a repeated click a no-op.
 * Paper fills: market BUY at best ask / SELL at best bid + slippage, taker fee + 18% GST; a marketable limit fills like
   a market order; otherwise it rests and fills at its limit (maker fee) when the last price touches it. A 2 s
   watcher in the dashboard process runs SL / TP / trailing / liquidation / funding / limit fills while the bot is stopped.
@@ -132,14 +135,17 @@ class AddSymbolRequest(BaseModel):
     symbol: str
     backfill: bool = True
     days: int = Field(90, ge=1, le=400)
+    enable_auto_bot: bool = False  # newly added coins do not auto-trade unless explicitly opted in
 
 
 @router.post("/api/manual/symbols")
 def add_symbol(req: AddSymbolRequest) -> dict[str, Any]:
-    """Add a coin everywhere: metadata now, coin list now, 1m history for the Backtest Lab in the background."""
+    """Add a coin everywhere: metadata now, coin list now, 1m history for the Backtest Lab in the background.
+    Its data/bot_profiles.json entry defaults to {"variant": "C_costgate", "enabled": false} (opt-in auto-trading)."""
     sym = check_symbol(req.symbol)
     info = product_info(sym)
     dm.add_app_symbol(sym)
+    ee.set_bot_profile_default(sym, req.enable_auto_bot)
     backfill = None
     if req.backfill:
         import app as webapp  # lazy: app.py mounts this router
@@ -150,7 +156,7 @@ def add_symbol(req: AddSymbolRequest) -> dict[str, Any]:
             backfill = f"not started: {exc.detail}"
     prof = ee.bot_profiles().get(sym)
     return {"symbol": sym, "product": info, "app_symbols": dm.app_symbols(), "backfill": backfill,
-            "auto_bot_profile": prof.variant if prof else "disabled (data/bot_profiles.json)"}
+            "auto_bot_profile": prof.variant if prof else "disabled (opt in: enable_auto_bot or data/bot_profiles.json)"}
 
 
 # --------------------------------------------------------------------------- #
@@ -224,22 +230,25 @@ class _Session:
         try:
             if mode == "paper":
                 self.client = None
-                self.engine = ee.ExecutionEngine(self.store, mode, None, profiles=ee.bot_profiles(), notifier=bot_ops.notifier())
+                self.engine = ee.ExecutionEngine(self.store, mode, None, profiles=ee.bot_profiles(), notifier=bot_ops.notifier(mode))
             else:
                 self.client = client_for(mode)
                 self.engine = ee.ExecutionEngine(self.store, mode, self.client, profiles={}, products={},
-                                                 notifier=bot_ops.notifier())
+                                                 notifier=bot_ops.notifier(mode))
         except BaseException:
             self.store.close()
             raise
 
     def ensure_margin(self) -> None:
+        """Isolated margin before the first exchange entry; only a verified success is cached (F09)."""
         if not _margin_ok.get(self.mode):
             try:
                 self.engine.ensure_isolated_margin()
             except DeltaAPIError as exc:
                 raise HTTPException(409, f"could not set isolated margin on Delta ({exc.status}): {exc.error}; "
                                          "no order was placed") from exc
+            except ExchangeError as exc:
+                raise HTTPException(409, f"isolated margin not confirmed on Delta: {exc}; no order was placed") from exc
             _margin_ok[self.mode] = True
 
     def __enter__(self) -> "_Session":
@@ -284,15 +293,18 @@ def exchange_snapshot(mode: str, ttl: float = SNAPSHOT_TTL_S) -> dict[str, Any]:
 
 
 def sync_journal(mode: str) -> dict[str, Any]:
-    """Advance resting limit orders and book exits the exchange made (SL/TP legs) into the mode's journal."""
+    """Resolve unknown order outcomes, advance resting / partially filled orders, and book exits the exchange made
+    (SL/TP legs, external changes) into the mode's journal."""
     actions: list[dict[str, Any]] = []
     with _Session(mode) as s:
+        for r in s.engine.reconcile_unknown_intents():  # F02: Manual Sync uses the shared recovery
+            actions.append({"kind": "unknown_intent", **{k: r.get(k) for k in ("intent_id", "symbol", "result", "action")}})
         for r in s.engine.refresh_resting_orders():
             actions.append({"kind": "resting_order", **r})
         for p in s.store.positions(mode):
             r = s.engine.sync_exchange_position(p["symbol"])
             if r:
-                actions.append({"kind": "exchange_exit", "symbol": p["symbol"], **{k: r.get(k) for k in ("action", "reason", "net_pnl_inr")}})
+                actions.append({"kind": "exchange_sync", "symbol": p["symbol"], **{k: r.get(k) for k in ("action", "reason", "net_pnl_inr")}})
     return {"actions": actions}
 
 
@@ -326,18 +338,40 @@ class ModeRequest(BaseModel):
 
 @router.post("/api/manual/mode")
 def set_mode(req: ModeRequest) -> dict[str, Any]:
-    run, info = bot_ops.runner()
-    if run:
-        raise HTTPException(409, f"the 24/7 auto-bot is running (pid {(info or {}).get('pid')}); stop it before switching modes")
-    if req.mode != "paper":
-        mode_gate(req.mode)
-    if req.mode == "live" and req.confirm != "LIVE":
-        raise HTTPException(422, 'switching to LIVE needs {"mode": "live", "confirm": "LIVE"} — real money on Delta Exchange India')
-    bot_ops.set_active_mode(req.mode)
+    with bot_ops._op_lock:  # the same lock every manual mutation binds its expected mode under (F01)
+        run, info = bot_ops.runner()
+        if run:
+            raise HTTPException(409, f"the 24/7 auto-bot is running (pid {(info or {}).get('pid')}); stop it before switching modes")
+        if req.mode != "paper":
+            mode_gate(req.mode)
+        if req.mode == "live" and req.confirm != "LIVE":
+            raise HTTPException(422, 'switching to LIVE needs {"mode": "live", "confirm": "LIVE"} — real money on Delta Exchange India')
+        gen = bot_ops.set_active_mode(req.mode)
     _cache.pop(f"snap:{req.mode}", None)
-    bot_ops.notifier().notify_bot_lifecycle(f"Manual mode {req.mode.upper()}", req.mode, None,
-                                            "REAL MONEY manual orders enabled" if req.mode == "live" else None)
-    return {"mode": req.mode, "journal": str(bot_ops.mode_db(req.mode))}
+    bot_ops.notifier(req.mode).notify_bot_lifecycle(f"Manual mode {req.mode.upper()}", req.mode, None,
+                                                    "REAL MONEY manual orders enabled" if req.mode == "live" else None)
+    return {"mode": req.mode, "mode_generation": gen, "journal": str(bot_ops.mode_db(req.mode))}
+
+
+class ActionBinding(BaseModel):
+    """Binds a mutation to the mode the user saw (F01). expected_mode + mode_generation come from /state or /preview."""
+    expected_mode: Literal["paper", "testnet", "live"] | None = None
+    mode_generation: int | None = Field(None, ge=0)
+    confirm: str | None = None
+
+
+def bind_action(b: ActionBinding | None, what: str) -> str:
+    """Call while holding bot_ops._op_lock (the mode-switch lock). 422 without a binding, 409 when the mode or its
+    generation moved since the ticket was prepared, 422 when LIVE lacks confirm='LIVE'. Returns the current mode."""
+    mode, gen = bot_ops.mode_state()
+    if b is None or b.expected_mode is None or b.mode_generation is None:
+        raise HTTPException(422, f"the {what} needs expected_mode and mode_generation (reload the Manual Trade tab); nothing was sent")
+    if b.expected_mode != mode or b.mode_generation != gen:
+        raise HTTPException(409, f"stale {what}: prepared for {b.expected_mode.upper()} (mode generation {b.mode_generation}) but "
+                                 f"Manual Trade is now {mode.upper()} (generation {gen}); nothing was sent — review it again")
+    if mode == "live" and b.confirm != "LIVE":
+        raise HTTPException(422, f"a LIVE {what} needs confirm='LIVE' on the request (real money on Delta Exchange India); nothing was sent")
+    return mode
 
 
 def _diagnose(exc: Exception) -> str:
@@ -384,9 +418,11 @@ def connection_status(verify: bool = False) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Sizing / preview
 # --------------------------------------------------------------------------- #
-class ManualOrder(BaseModel):
+class ManualOrder(ActionBinding):
+    """Ticket for /preview (binding optional) and /order (binding required)."""
     symbol: str
     side: Literal["LONG", "SHORT"]
+    client_request_id: str | None = Field(None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
     order_type: Literal["market", "limit"] = "market"
     limit_price: float | None = Field(None, gt=0)
     leverage: float = Field(10, ge=1)
@@ -423,7 +459,7 @@ def account_view(mode: str) -> dict[str, Any]:
 
 
 def build_preview(req: ManualOrder) -> dict[str, Any]:
-    mode = journal_mode()
+    mode, gen = bot_ops.mode_state()
     sym = check_symbol(req.symbol)
     info = product_info(sym)
     if info["trading_status"] != "operational":
@@ -509,7 +545,7 @@ def build_preview(req: ManualOrder) -> dict[str, Any]:
     tp_gain = None if tp is None else n * cv * abs(tp - entry) * rate - (fee + n * cv * tp * exit_fee_rate) * rate
     eq = w["realized_equity_inr"]
     return {
-        "mode": mode, "real_money": mode == "live",
+        "mode": mode, "mode_generation": gen, "real_money": mode == "live",
         "symbol": sym, "side": req.side, "order_type": req.order_type, "resting_limit": resting, "effect": effect,
         "leverage": req.leverage, "max_leverage": max_lev, "contracts": n, "contract_value": cv, "tick_size": tick,
         "reference_price": raw, "est_entry_price": entry, "best_bid": bid, "best_ask": ask, "mark_price": mark,
@@ -532,6 +568,7 @@ def preview(req: ManualOrder) -> dict[str, Any]:
 @router.post("/api/manual/order")
 def place_order(req: ManualOrder) -> dict[str, Any]:
     with bot_ops._op_lock:
+        bind_action(req, "order")
         mode = guard_writable()
         pv = build_preview(req)
         if pv["problems"]:
@@ -541,13 +578,18 @@ def place_order(req: ManualOrder) -> dict[str, Any]:
             return bot_ops._clean(_place_exchange(mode, req, pv, d))
         with _Session(mode) as s:
             eng = s.engine
+            try:
+                eng.manual_entry_gate(pv["symbol"], req.client_request_id)  # paper: duplicate request ids only
+            except ee.EntryBlockedError as exc:
+                raise HTTPException(409, str(exc)) from exc
             if pv["resting_limit"]:
                 it = s.store.create_intent(
                     intent_id=f"mn-{ee.secrets.token_hex(8)}", client_order_id=eng.new_client_oid(pv["symbol"], "L"),
                     mode=mode, symbol=pv["symbol"], product_id=eng.ensure_product(pv["symbol"]).product_id, role="ENTRY",
                     side="buy" if d == 1 else "sell", size=pv["contracts"], order_type="limit_order",
                     entry_price=req.limit_price, sl_price=pv["sl_price"], tp_price=pv["tp_price"],
-                    trail_amount=float(req.trail_amount or 0), leverage=req.leverage, source="manual")
+                    trail_amount=float(req.trail_amount or 0), leverage=req.leverage, source="manual",
+                    client_request_id=req.client_request_id)
                 s.store.transition(it["intent_id"], "ACKNOWLEDGED", "paper limit resting")
                 _ensure_watcher()
                 return bot_ops._clean({"result": "resting", "intent_id": it["intent_id"], "preview": pv})
@@ -558,16 +600,18 @@ def place_order(req: ManualOrder) -> dict[str, Any]:
                 side="buy" if d == 1 else "sell", size=pv["contracts"], order_type="market_order",
                 entry_price=pv["est_entry_price"], sl_price=pv["sl_price"], tp_price=pv["tp_price"],
                 trail_amount=float(req.trail_amount or 0), leverage=req.leverage, source="manual",
-                reduce_only=int(pv["effect"] in ("reduce", "close")))
+                reduce_only=int(pv["effect"] in ("reduce", "close")), client_request_id=req.client_request_id)
             try:
-                r = eng.manual_fill(pv["symbol"], d, pv["contracts"], pv["reference_price"], req.leverage,
-                                    sl=pv["sl_price"], tp=pv["tp_price"], trail=req.trail_amount, intent_id=it["intent_id"])
+                with s.store.tx():  # position / trade + intent FILLED: one transaction (Source #1)
+                    r = eng.manual_fill(pv["symbol"], d, pv["contracts"], pv["reference_price"], req.leverage,
+                                        sl=pv["sl_price"], tp=pv["tp_price"], trail=req.trail_amount, intent_id=it["intent_id"])
+                    fill = r.get("price") or (r.get("close") or {}).get("exit_price")
+                    s.store.transition(it["intent_id"], "FILLED", "paper manual fill", filled_size=pv["contracts"],
+                                       avg_fill_price=fill, exchange_order_id=f"paper-{it['intent_id']}",
+                                       filled_size_booked=pv["contracts"])
             except ValueError as exc:
                 s.store.transition(it["intent_id"], "REJECTED", str(exc), error=str(exc))
                 raise HTTPException(422, str(exc)) from exc
-            fill = r.get("price") or (r.get("close") or {}).get("exit_price")
-            s.store.transition(it["intent_id"], "FILLED", "paper manual fill", filled_size=pv["contracts"], avg_fill_price=fill,
-                               exchange_order_id=f"paper-{it['intent_id']}")
             _ensure_watcher()
             return bot_ops._clean({"result": r["action"], "intent_id": it["intent_id"], "fill": r, "preview": pv})
 
@@ -577,17 +621,17 @@ def _place_exchange(mode: str, req: ManualOrder, pv: dict[str, Any], d: int) -> 
         eng = s.engine
         try:
             if pv["effect"] in ("reduce", "close"):
-                r = eng.exchange_reduce(pv["symbol"], pv["contracts"])
+                r = eng.exchange_reduce(pv["symbol"], pv["contracts"], client_request_id=req.client_request_id)
                 return {"result": r["action"], "mode": mode, "fill": r, "preview": pv}
-            s.ensure_margin()
             r = eng.manual_exchange_entry(pv["symbol"], d, pv["contracts"], req.leverage, order_type=req.order_type,
                                           ref_price=pv["reference_price"], limit_price=req.limit_price,
-                                          sl=pv["sl_price"], tp=pv["tp_price"], trigger=req.trigger_source)
+                                          sl=pv["sl_price"], tp=pv["tp_price"], trigger=req.trigger_source,
+                                          client_request_id=req.client_request_id, prepare=s.ensure_margin)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         except DeltaAPIError as exc:
             raise HTTPException(422 if exc.status < 500 else 502, f"Delta rejected the order: {_diagnose(exc)} — {exc.error}") from exc
-        except ExchangeError as exc:
+        except ExchangeError as exc:  # incl. EntryBlockedError (unresolved intent on the symbol / duplicate request)
             raise HTTPException(409, str(exc)) from exc
         result = {"filled": "opened" if pv["effect"] == "open" else "added", "acknowledged": "resting",
                   "partially_filled": "partially_filled", "added": "added"}.get(r.get("action"), r.get("action"))
@@ -595,9 +639,12 @@ def _place_exchange(mode: str, req: ManualOrder, pv: dict[str, Any], d: int) -> 
 
 
 @router.delete("/api/manual/order/{order_id}")
-def cancel_order(order_id: str) -> dict[str, Any]:
-    """Cancel a resting limit: a journal intent id (paper or exchange) or a raw Delta order id (exchange)."""
+def cancel_order(order_id: str, expected_mode: Literal["paper", "testnet", "live"] | None = None,
+                 mode_generation: int | None = Query(None, ge=0), confirm: str | None = None) -> dict[str, Any]:
+    """Cancel a resting limit: a journal intent id (paper or exchange) or a raw Delta order id (exchange).
+    The mode binding travels as query parameters (?expected_mode=&mode_generation=&confirm=)."""
     with bot_ops._op_lock:
+        bind_action(ActionBinding(expected_mode=expected_mode, mode_generation=mode_generation, confirm=confirm), "cancel")
         mode = guard_writable()
         with _Session(mode) as s:
             it = s.store.intent(order_id) or s.store.one(
@@ -619,15 +666,12 @@ def cancel_order(order_id: str) -> dict[str, Any]:
             except DeltaAPIError as exc:
                 raise HTTPException(409, f"Delta refused the cancel: {_diagnose(exc)}") from exc
             if it is not None and it["state"] in ("ACKNOWLEDGED", "PARTIALLY_FILLED"):
-                filled = int(r.get("size") or it["size"]) - int(r.get("unfilled_size") or 0)
-                if filled > 0:
-                    s.engine._apply_order(it["intent_id"], r)
-                else:
-                    s.store.transition(it["intent_id"], "CANCELLED", "cancelled from the manual terminal", raw_response=str(r)[:2000])
+                # books any fill quantity not booked yet (a partial fill before the cancel), then CANCELLED / FILLED
+                s.engine._apply_order(it["intent_id"], {**r, "state": r.get("state") or "cancelled"})
             return {"cancelled": str(oid), "intent_id": it["intent_id"] if it else None, "mode": mode, "exchange_state": r.get("state")}
 
 
-class ProtectionRequest(BaseModel):
+class ProtectionRequest(ActionBinding):
     sl_price: float | None = Field(None, gt=0)
     tp_price: float | None = Field(None, gt=0)
     trail_amount: float | None = Field(None, ge=0)
@@ -641,6 +685,7 @@ class ProtectionRequest(BaseModel):
 def set_protection(symbol: str, req: ProtectionRequest) -> dict[str, Any]:
     sym = check_symbol(symbol)
     with bot_ops._op_lock:
+        bind_action(req, "protection change")
         mode = guard_writable()
         if mode in EXCHANGE_MODES and req.trail_amount:
             raise HTTPException(422, "trailing stops are paper-only for manual exchange positions")
@@ -680,14 +725,16 @@ def set_protection(symbol: str, req: ProtectionRequest) -> dict[str, Any]:
             return bot_ops._clean({"symbol": sym, "mode": mode, "position": pos, "changed": fields})
 
 
-class CloseRequest(BaseModel):
+class CloseRequest(ActionBinding):
     contracts: int | None = Field(None, ge=1)
+    client_request_id: str | None = Field(None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @router.post("/api/manual/position/{symbol}/close")
 def close_position(symbol: str, req: CloseRequest | None = None) -> dict[str, Any]:
     sym = check_symbol(symbol)
     with bot_ops._op_lock:
+        bind_action(req, "close")
         mode = guard_writable()
         n = req.contracts if req else None
         with _Session(mode) as s:
@@ -714,7 +761,7 @@ def close_position(symbol: str, req: CloseRequest | None = None) -> dict[str, An
                 raise HTTPException(422, f"position has {p['contracts']} contracts")
             try:
                 if mode in EXCHANGE_MODES:
-                    r = s.engine.exchange_reduce(sym, n)
+                    r = s.engine.exchange_reduce(sym, n, client_request_id=req.client_request_id)
                 else:
                     tk = ticker(sym, ttl=0)
                     raw = tk["best_bid"] if p["side"] == "LONG" else tk["best_ask"]
@@ -762,7 +809,7 @@ def state(symbol: str = Query("BTCUSD"), resolution: Literal["1m", "5m", "15m", 
           include_candles: bool = True) -> dict[str, Any]:
     sym = check_symbol(symbol)
     info = product_info(sym)
-    mode = journal_mode()
+    mode, gen = bot_ops.mode_state()
     if mode == "paper":
         _ensure_watcher()
     st = bot_ops.read_status(with_market=True, with_signals=False, mode=mode)
@@ -826,7 +873,7 @@ def state(symbol: str = Query("BTCUSD"), resolution: Literal["1m", "5m", "15m", 
     return bot_ops._clean({
         "symbol": sym, "product": info, "ticker": tk, "orderbook": ob,
         "candles": {"resolution": resolution, "bars": candles(sym, resolution) if include_candles else []},
-        "mode": mode, "real_money": mode == "live", "exchange": exchange,
+        "mode": mode, "mode_generation": gen, "real_money": mode == "live", "exchange": exchange,
         "journal": {"mode": mode, "exists": st["db_exists"], "path": st["db"]},
         "bot": st["runner"],
         "manual_enabled": (not st["runner"]["running"]) and (mode == "paper" or bool(exchange and exchange.get("connected"))),

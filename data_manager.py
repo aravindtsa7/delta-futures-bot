@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal
@@ -252,18 +253,29 @@ def _merge(existing: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
     return merged.sort_values("time", kind="stable").reset_index(drop=True)
 
 
+def _tmp_path(path: Path) -> Path:
+    """A temp file unique per process and call, so concurrent writers (dashboard sync + bot) never share one."""
+    return path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+
+
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    tmp = _tmp_path(path)
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _atomic_write_parquet(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    df.to_parquet(tmp, engine="pyarrow", index=False, compression="zstd")
-    os.replace(tmp, path)
+    tmp = _tmp_path(path)
+    try:
+        df.to_parquet(tmp, engine="pyarrow", index=False, compression="zstd")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def load_raw_1m(symbol: str, series_type: SeriesType) -> pd.DataFrame:

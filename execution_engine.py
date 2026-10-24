@@ -19,6 +19,9 @@ Safety rules
     until reconcile_unknown_intents() resolves it from the exchange. Nothing is resent.
   * Stop-loss trailing on a filled position edits the SL child order in place (PUT /v2/orders).
   * One writer per DB file (OS file lock), WAL journal, synchronous=FULL.
+  * Step 9: every exchange fill is booked through one path (_apply_order -> _book_fill_delta), by intent role
+    (ENTRY opens/adds, EXIT/reduce-only books a trade), in ONE SQLite transaction with the intent's
+    filled_size_booked and the fill ids (booked_fills), so partial fills, timeouts and restarts book exactly once.
 """
 
 from __future__ import annotations
@@ -84,6 +87,13 @@ TRANSITIONS: dict[str, set[str]] = {
     "FILLED": set(), "CANCELLED": set(), "REJECTED": set(),
 }
 BLOCKING_STATES = ("DISPATCHING", "OUTCOME_UNKNOWN", "ACKNOWLEDGED", "PARTIALLY_FILLED")
+UNRESOLVED_STATES = ("DISPATCHING", "OUTCOME_UNKNOWN")
+# Only these margin-mode rejections are benign, and only after a readback shows isolated (F09).
+BENIGN_MARGIN_CODES = ("margin_mode_already_set", "already_in_isolated_margin_mode", "already_isolated")
+
+
+class EntryBlockedError(ExchangeError):
+    """Refused by the shared order gate: an unresolved intent on the symbol, or a duplicate client_request_id."""
 
 
 @dataclass(frozen=True)
@@ -114,7 +124,9 @@ def make_profile(symbol: str, variant: str = DEFAULT_VARIANT) -> StrategyProfile
 
 def bot_profiles() -> dict[str, StrategyProfile]:
     """Auto-bot universe: BTCUSD (D) + ETHUSD (C) + every coin added in the dashboard (default C_costgate).
-    data/bot_profiles.json overrides per symbol: {"SOLUSD": {"enabled": false}} or {"XRPUSD": {"variant": "D_both"}}."""
+    data/bot_profiles.json overrides per symbol: {"SOLUSD": {"enabled": false}} or {"XRPUSD": {"variant": "D_both"}}.
+    Since Step 9, POST /api/manual/symbols writes {"variant": "C_costgate", "enabled": false} for a new coin
+    (see set_bot_profile_default), so added coins only auto-trade after an explicit opt-in."""
     out = dict(FROZEN_PROFILES)
     for sym in dm.app_symbols():
         if sym not in out and dm.metadata_path(sym).exists():
@@ -126,6 +138,27 @@ def bot_profiles() -> dict[str, StrategyProfile]:
             elif ov.get("variant") in VARIANT_FLAGS and (sym in out or dm.metadata_path(sym).exists()):
                 out[sym] = make_profile(sym, ov["variant"])
     return out
+
+
+def set_bot_profile_default(symbol: str, enable: bool = False, variant: str = DEFAULT_VARIANT) -> dict[str, Any]:
+    """Section 5 guard: a coin added from the dashboard gets {"variant": "C_costgate", "enabled": false} in
+    data/bot_profiles.json, so it never auto-trades unless explicitly enabled. An existing entry is kept (only
+    ``enable=True`` switches it on)."""
+    data = json.loads(BOT_PROFILES_FILE.read_text(encoding="utf-8")) if BOT_PROFILES_FILE.exists() else {}
+    if symbol in FROZEN_PROFILES:
+        return data.get(symbol, {})
+    entry = data.get(symbol)
+    if entry is None:
+        entry = data[symbol] = {"variant": variant, "enabled": bool(enable)}
+    elif enable:
+        entry["enabled"] = True
+    else:
+        return entry
+    BOT_PROFILES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = BOT_PROFILES_FILE.with_name(BOT_PROFILES_FILE.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, BOT_PROFILES_FILE)
+    return entry
 
 
 def liquidation_price(entry: float, side: str, leverage: float, mm_pct: float) -> float:
@@ -313,6 +346,11 @@ CREATE TABLE IF NOT EXISTS symbol_state (
     last_signal_bar_us INTEGER, cooldown_until_us INTEGER,
     PRIMARY KEY (mode, symbol)
 );
+CREATE TABLE IF NOT EXISTS booked_fills (
+    fill_id TEXT PRIMARY KEY, intent_id TEXT, order_id TEXT, symbol TEXT, role TEXT, side TEXT,
+    size INTEGER, price REAL, fee_usd REAL, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS system_meta (key TEXT PRIMARY KEY, value TEXT, updated_at_us INTEGER);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at_us INTEGER NOT NULL, mode TEXT, level TEXT NOT NULL, kind TEXT NOT NULL, symbol TEXT, detail TEXT
@@ -326,8 +364,10 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.clock = clock
         self._lock = _ProcessLock(self.path.with_name(self.path.name + ".lock"))
+        self._tx_depth = 0
         try:
-            self.conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=10)
+            # check_same_thread=False: the runner offloads REST work to worker threads (it serialises access itself)
+            self.conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=10, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
             self.journal_mode = self.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             self.conn.execute("PRAGMA synchronous=FULL")
@@ -367,9 +407,16 @@ class StateStore:
                                  ("trade_history", "source", "TEXT DEFAULT 'bot'"),
                                  ("trade_history", "leverage", "REAL DEFAULT 10"),
                                  ("order_intents", "leverage", "REAL"),
-                                 ("order_intents", "source", "TEXT DEFAULT 'bot'")):
+                                 ("order_intents", "source", "TEXT DEFAULT 'bot'"),
+                                 ("order_intents", "client_request_id", "TEXT"),
+                                 ("order_intents", "exit_reason", "TEXT")):
             if col not in self._cols(table):
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        if "filled_size_booked" not in self._cols("order_intents"):  # Step 9
+            with self.tx():
+                c.execute("ALTER TABLE order_intents ADD COLUMN filled_size_booked INTEGER NOT NULL DEFAULT 0")
+                # earlier code booked FILLED intents in full; PARTIALLY_FILLED ones were never booked (F04)
+                c.execute("UPDATE order_intents SET filled_size_booked = filled_size WHERE state = 'FILLED'")
 
     def close(self) -> None:
         if getattr(self, "conn", None) is not None:
@@ -379,13 +426,25 @@ class StateStore:
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
+        """BEGIN IMMEDIATE ... COMMIT. Re-entrant: a nested tx() joins the outer transaction, so composite
+        bookings (intent + fills + position + trade) commit or roll back as one unit."""
+        if self._tx_depth:
+            self._tx_depth += 1
+            try:
+                yield self.conn
+            finally:
+                self._tx_depth -= 1
+            return
         self.conn.execute("BEGIN IMMEDIATE")
+        self._tx_depth = 1
         try:
             yield self.conn
             self.conn.execute("COMMIT")
         except BaseException:
             self.conn.execute("ROLLBACK")
             raise
+        finally:
+            self._tx_depth = 0
 
     def q(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
         return self.conn.execute(sql, args).fetchall()
@@ -517,6 +576,31 @@ class StateStore:
             c.execute("INSERT INTO symbol_state (mode, symbol, last_signal_bar_us) VALUES (?,?,?) "
                       "ON CONFLICT(mode, symbol) DO UPDATE SET last_signal_bar_us=excluded.last_signal_bar_us",
                       (mode, symbol, bar_us))
+
+    # -- booked fills / metadata (Step 9) --------------------------------------- #
+    def record_fills(self, rows: list[dict[str, Any]]) -> None:
+        with self.tx() as c:
+            for r in rows:
+                c.execute("INSERT INTO booked_fills (fill_id, intent_id, order_id, symbol, role, side, size, price, fee_usd, created_at)"
+                          " VALUES (?,?,?,?,?,?,?,?,?,?)", (r["fill_id"], r.get("intent_id"), r.get("order_id"), r["symbol"],
+                                                            r["role"], r.get("side"), int(r["size"]), float(r["price"]),
+                                                            float(r["fee_usd"]), to_ts(self.clock())))
+
+    def booked_fill_ids(self, symbol: str | None = None) -> set[str]:
+        sql, args = "SELECT fill_id FROM booked_fills", ()
+        if symbol:
+            sql, args = sql + " WHERE symbol=?", (symbol,)
+        return {r["fill_id"] for r in self.q(sql, args)}
+
+    def meta_get(self, key: str) -> str | None:
+        r = self.one("SELECT value FROM system_meta WHERE key=?", (key,))
+        return None if r is None else r["value"]
+
+    def meta_set(self, **kv: Any) -> None:
+        with self.tx() as c:
+            for k, v in kv.items():
+                c.execute("INSERT INTO system_meta (key, value, updated_at_us) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET "
+                          "value=excluded.value, updated_at_us=excluded.updated_at_us", (k, None if v is None else str(v), self.clock()))
 
 
 # --------------------------------------------------------------------------- #
@@ -701,6 +785,7 @@ class ExecutionEngine:
                 info = client.get_product(s)
                 self.products[s] = ProductSpec(s, info.id, float(info.contract_value), float(info.tick_size))
         self._mm: dict[str, float] = {}
+        self.account_policy: dict[str, Any] | None = None  # set by prepare_account() (F07); exchange bot entries need it
         self.tf_us = dm.TIMEFRAME_MINUTES[TIMEFRAME] * 60_000_000
         self.paper_slip = settings.SIZING_SLIPPAGE_BPS / 10_000
         self.fee = settings.TAKER_FEE * (1 + settings.GST_ON_FEES)
@@ -805,6 +890,9 @@ class ExecutionEngine:
         entry_us = signal_bar_us + self.tf_us
         if st is not None and st["cooldown_until_us"] is not None and entry_us < st["cooldown_until_us"]:
             return {"action": "skip", "reason": "cooldown"}
+        if self.mode != "paper" and (why := self.account_policy_refusal(symbol)) is not None:
+            self._event("WARN", "entry_blocked_policy", symbol, why)
+            return {"action": "skip", "reason": f"account policy: {why}"}
         product = self.products[symbol]
         equity, available = self.account_equity_inr()
         fill_ref = ref_price * (1 + direction * self.paper_slip) if self.mode == "paper" else ref_price
@@ -831,16 +919,18 @@ class ExecutionEngine:
         sl, tp = Backtester(cfg).levels(px, d, sl_pct, tp_pct, product)
         qty = intent["size"] * product.contract_value
         t = self.clock()
-        self.store.transition(intent["intent_id"], "FILLED", "paper fill", filled_size=intent["size"], avg_fill_price=px,
-                              exchange_order_id=f"paper-{intent['intent_id']}", sl_price=sl, tp_price=tp,
-                              raw_response=json.dumps({"paper": True, "raw_price": raw_price, "fill_price": px}))
-        self.store.insert_position(
-            mode=self.mode, symbol=sym, product_id=product.product_id, side="LONG" if d == 1 else "SHORT",
-            contracts=intent["size"], contract_value=product.contract_value, entry_price=px, raw_entry_price=raw_price,
-            initial_sl=sl, sl_price=sl, tp_price=tp, trail_amount=lots.trail_amount, sl_order_id=None, tp_order_id=None,
-            highest_fav_price=px, opened_at_us=t, last_bar_us=t - t % 60_000_000 - 60_000_000,
-            realized_funding_usd=0.0, entry_fee_usd=qty * px * self.fee, margin_usd=qty * px / LEVERAGE,
-            atr_at_signal=lots.atr, intent_id=intent["intent_id"])
+        with self.store.tx():  # intent FILLED + position: one transaction
+            self.store.transition(intent["intent_id"], "FILLED", "paper fill", filled_size=intent["size"], avg_fill_price=px,
+                                  exchange_order_id=f"paper-{intent['intent_id']}", sl_price=sl, tp_price=tp,
+                                  raw_response=json.dumps({"paper": True, "raw_price": raw_price, "fill_price": px}),
+                                  filled_size_booked=intent["size"])
+            self.store.insert_position(
+                mode=self.mode, symbol=sym, product_id=product.product_id, side="LONG" if d == 1 else "SHORT",
+                contracts=intent["size"], contract_value=product.contract_value, entry_price=px, raw_entry_price=raw_price,
+                initial_sl=sl, sl_price=sl, tp_price=tp, trail_amount=lots.trail_amount, sl_order_id=None, tp_order_id=None,
+                highest_fav_price=px, opened_at_us=t, last_bar_us=t - t % 60_000_000 - 60_000_000,
+                realized_funding_usd=0.0, entry_fee_usd=qty * px * self.fee, margin_usd=qty * px / LEVERAGE,
+                atr_at_signal=lots.atr, intent_id=intent["intent_id"])
         self._event("INFO", "paper_entry", sym, {"side": "LONG" if d == 1 else "SHORT", "contracts": intent["size"],
                                                   "price": px, "sl": sl, "tp": tp})
         self.notifier.notify_trade_entry(self.store.intent(intent["intent_id"]), self.store.position(self.mode, sym))
@@ -871,90 +961,273 @@ class ExecutionEngine:
             return {"action": "rejected", "intent_id": iid, "reason": str(exc)}
         return self._apply_order(iid, order)
 
+    # -- fill booking (Step 9: one path for responses, recovery, partial fills and resting orders) ---------------- #
+    def _order_fills(self, it: Any, order_id: Any) -> list[dict[str, Any]]:
+        """GET /v2/fills for one order (window: intent creation - 5 s .. now + 1 s)."""
+        start, end = int(it["created_at_us"]) - 5_000_000, self.clock() + 1_000_000
+        return [f for f in self.client.get_fills(it["product_id"], start, end) if str(f.get("order_id")) == str(order_id)]
+
+    @staticmethod
+    def _venue_fee(f: dict[str, Any]) -> float | None:
+        """The exchange's own commission for a fill (paid_commission / commission), when it reports one."""
+        for k in ("paid_commission", "commission"):
+            if f.get(k) not in (None, ""):
+                return float(f[k])
+        return None
+
     def _apply_order(self, intent_id: str, order: dict[str, Any], fills: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        """Map an exchange order snapshot onto the intent; on fill, bind bracket legs and open the position."""
+        """Map an exchange order snapshot onto the intent and book every filled contract not booked yet, by role."""
         it = self.store.intent(intent_id)
         size = int(order.get("size") or it["size"])
-        unfilled = int(order.get("unfilled_size") or 0)
-        filled = size - unfilled
+        booked = int(it["filled_size_booked"] or 0)
+        filled = size - int(order.get("unfilled_size") or 0)
         st = order.get("state")
+        if fills is None and self.mode != "paper" and filled > booked:
+            fills = self._order_fills(it, order.get("id"))
+        fills = fills or []
+        qty = sum(int(f["size"]) for f in fills)
+        filled = max(filled, qty, booked)  # a lagging order view never un-books contracts
         avg = order.get("average_fill_price")
-        if fills:
-            qty = sum(int(f["size"]) for f in fills)
-            avg = sum(float(f["price"]) * int(f["size"]) for f in fills) / qty if qty else avg
-            filled = max(filled, qty)
+        if qty:
+            avg = sum(float(f["price"]) * int(f["size"]) for f in fills) / qty
         common = dict(exchange_order_id=str(order.get("id")), raw_response=json.dumps(order), filled_size=filled,
                       avg_fill_price=float(avg) if avg not in (None, "") else None)
         if st in ("open", "pending"):
             new = "PARTIALLY_FILLED" if filled > 0 else "ACKNOWLEDGED"
-            self.store.transition(intent_id, new, f"exchange state {st}", **common)
-            return {"action": new.lower(), "intent_id": intent_id}
-        if st == "cancelled" and filled == 0:
-            self.store.transition(intent_id, "CANCELLED", order.get("cancellation_reason"), **common)
-            return {"action": "cancelled", "intent_id": intent_id}
-        if st in ("closed", "cancelled") and filled > 0:
+        elif st in ("closed", "cancelled"):
+            if filled == 0:
+                self.store.transition(intent_id, "CANCELLED", order.get("cancellation_reason") or f"exchange state {st}", **common)
+                return {"action": "cancelled", "intent_id": intent_id}
+            new = "FILLED"
+        else:
+            raise ExchangeError(f"unexpected order state {st!r} for {intent_id}")
+        if filled > booked:
             if common["avg_fill_price"] is None:
                 raise ExchangeError(f"order {order.get('id')} filled without a fill price")
-            self.store.transition(intent_id, "FILLED", f"exchange state {st}", **common)
-            return self._bind_and_open(intent_id)
-        raise ExchangeError(f"unexpected order state {st!r} for {intent_id}")
+            return self._book_fill_delta(it, order, fills, new, common)
+        self.store.transition(intent_id, new, f"exchange state {st}", **common)
+        return {"action": new.lower(), "intent_id": intent_id, "contracts": 0}
 
-    def _find_legs(self, product_id: int) -> tuple[dict | None, dict | None]:
-        orders = self.client.get_active_orders(product_id, states="open,pending")
-        sl = [o for o in orders if o.get("stop_order_type") == "stop_loss_order"]
-        tp = [o for o in orders if o.get("stop_order_type") == "take_profit_order"]
+    def _book_fill_delta(self, it: Any, order: dict[str, Any], fills: list[dict[str, Any]], new_state: str,
+                         common: dict[str, Any]) -> dict[str, Any]:
+        """Book filled_size - filled_size_booked contracts: priced from fill records that cover exactly that slice
+        (venue commission when reported), else from the order's cumulative average (taker + GST estimate)."""
+        iid, sym, oid = it["intent_id"], it["symbol"], str(order.get("id"))
+        product = self.ensure_product(sym)
+        filled, booked = int(common["filled_size"]), int(it["filled_size_booked"] or 0)
+        delta = filled - booked
+        known = self.store.q("SELECT * FROM booked_fills WHERE order_id=?", (oid,))
+        known_ids = {r["fill_id"] for r in known}
+        fresh = [f for f in fills if str(f.get("id")) not in known_ids]
+        if fresh and sum(int(f["size"]) for f in fresh) == delta:
+            rows = [{"fill_id": str(f["id"]), "size": int(f["size"]), "price": float(f["price"]), "fee_usd": self._venue_fee(f)}
+                    for f in fresh]
+        else:  # fill records lag the order view: price this slice from the cumulative average
+            done_qty = sum(int(r["size"]) for r in known)
+            done_val = sum(float(r["price"]) * int(r["size"]) for r in known)
+            avg = float(common["avg_fill_price"])
+            px = (avg * filled - done_val) / delta if done_qty and done_qty == booked else avg
+            rows = [{"fill_id": f"ord-{oid}-cum{filled}", "size": delta, "price": px, "fee_usd": None}]
+        for r in rows:
+            if r["fee_usd"] is None:
+                r["fee_usd"] = r["size"] * product.contract_value * r["price"] * self.fee
+            r.update(intent_id=iid, order_id=oid, symbol=sym, side=it["side"], role=it["role"])
+        px = sum(r["price"] * r["size"] for r in rows) / delta
+        fee = sum(r["fee_usd"] for r in rows)
+        upd = {**common, "filled_size_booked": filled}
+        if it["role"] == "EXIT" or it["reduce_only"]:  # F03: an exit is never booked as an entry / scale-in
+            return self._book_exit(it, rows, delta, px, fee, oid, new_state, upd)
+        return self._book_entry(it, rows, delta, px, fee, new_state, upd)
+
+    def _book_entry(self, it: Any, rows: list[dict[str, Any]], delta: int, px: float, fee: float, new_state: str,
+                    upd: dict[str, Any]) -> dict[str, Any]:
+        """Open the position or add to it by ``delta`` contracts, in one transaction with the intent and its fills."""
+        iid, sym = it["intent_id"], it["symbol"]
+        cv = self.ensure_product(sym).contract_value
+        lev = float(it["leverage"] or LEVERAGE)
+        side = "LONG" if it["side"] == "buy" else "SHORT"
+        t = self.clock()
+        with self.store.tx():
+            p = self.store.position(self.mode, sym)
+            if p is None:
+                sl = None if it["sl_price"] is None else float(it["sl_price"])
+                tp = None if it["tp_price"] is None else float(it["tp_price"])
+                self.store.insert_position(
+                    mode=self.mode, symbol=sym, product_id=it["product_id"], side=side, contracts=delta, contract_value=cv,
+                    entry_price=px, raw_entry_price=px, initial_sl=sl, sl_price=sl, tp_price=tp,
+                    trail_amount=float(it["trail_amount"] or 0), sl_order_id=None, tp_order_id=None, highest_fav_price=px,
+                    opened_at_us=t, last_bar_us=t - t % 60_000_000 - 60_000_000, realized_funding_usd=0.0, entry_fee_usd=fee,
+                    margin_usd=delta * cv * px / lev, atr_at_signal=float(it["atr"] or 0), intent_id=iid, leverage=lev,
+                    source=it["source"] or "bot")
+                opened, n = True, delta
+            elif p["side"] == side:
+                n0 = int(p["contracts"])
+                n = n0 + delta
+                avg = (n0 * float(p["entry_price"]) + delta * px) / n
+                raw = (n0 * float(p["raw_entry_price"]) + delta * px) / n
+                self.store.update_position(self.mode, sym, contracts=n, entry_price=avg, raw_entry_price=raw,
+                                           entry_fee_usd=float(p["entry_fee_usd"]) + fee,
+                                           margin_usd=n * cv * avg / float(p["leverage"] or lev))
+                opened = False
+            else:
+                raise ExchangeError(f"{sym}: {side} entry fill against the open {p['side']} position; not booked")
+            self.store.record_fills(rows)
+            self.store.transition(iid, new_state, f"booked {delta} contract(s) @ {px:g}", **upd)
+        legs = self._protect(sym, iid, opened=opened)
+        pos = self.store.position(self.mode, sym)
+        self._event("INFO", "entry_filled" if opened else "entry_added", sym,
+                    {"intent_id": iid, "price": px, "contracts": delta, "position": n, "fee_usd": fee, "state": new_state, **legs})
+        self.notifier.notify_trade_entry(self.store.intent(iid), pos)
+        action = "partially_filled" if new_state == "PARTIALLY_FILLED" else ("filled" if opened else "added")
+        return {"action": action, "intent_id": iid, "price": px, "contracts": delta, "position_size": n,
+                "avg_entry": float(pos["entry_price"]) if pos is not None else px, "state": new_state, **legs}
+
+    def _book_exit(self, it: Any, rows: list[dict[str, Any]], delta: int, px: float, fee: float, oid: str, new_state: str,
+                   upd: dict[str, Any]) -> dict[str, Any]:
+        """Book a reduce-only fill as a closed trade (fees, realized PnL) and shrink / remove the position."""
+        iid, sym = it["intent_id"], it["symbol"]
+        reason = it["exit_reason"] or "MANUAL_CLOSE"
+        t = self.clock()
+        row, tid, n_all, q = None, None, 0, 0
+        with self.store.tx():
+            p = self.store.position(self.mode, sym)
+            if p is not None:
+                n_all = int(p["contracts"])
+                q = min(delta, n_all)
+                if q < n_all:
+                    f = q / n_all
+                    part = {**dict(p), "contracts": q, "entry_fee_usd": p["entry_fee_usd"] * f,
+                            "realized_funding_usd": p["realized_funding_usd"] * f}
+                    row = self._trade_row(_Row(part), px, px, reason, t, fee, oid)
+                    tid = self.store.reduce_position(self.mode, sym, row, {
+                        "contracts": n_all - q, "entry_fee_usd": p["entry_fee_usd"] * (1 - f),
+                        "realized_funding_usd": p["realized_funding_usd"] * (1 - f), "margin_usd": p["margin_usd"] * (1 - f)})
+                else:
+                    row = self._trade_row(p, px, px, reason, t, fee, oid)
+                    tid = self.store.close_position(self.mode, sym, row, self._cooldown_until(t))
+            self.store.record_fills(rows)
+            self.store.transition(iid, new_state, reason if p is not None else "exit fill without a journal position", **upd)
+        if row is None:
+            self._event("CRITICAL", "exit_fill_without_position", sym, {"intent_id": iid, "contracts": delta, "price": px})
+            return {"action": "exit_unmatched", "intent_id": iid, "contracts": delta}
+        legs = self._resize_legs(sym) if q < n_all else self._cancel_legs(int(p["product_id"]))
+        action = "partial_exit" if q < n_all else "exit"
+        self._event("INFO", f"exchange_{action}", sym, {"reason": reason, "contracts": q, "price": px,
+                                                         "net_inr": row["net_pnl_inr"], "intent_id": iid})
+        self.notifier.notify_trade_exit({**row, "trade_id": tid})
+        return {"action": action, "intent_id": iid, "trade_id": tid, "contracts": q, "remaining": n_all - q,
+                "exit_order_id": oid, "legs": legs, **row}
+
+    # -- protective legs ------------------------------------------------------------------- #
+    @staticmethod
+    def _match_legs(orders: list[dict[str, Any]], product_id: int, pos_side: str,
+                    ref_price: float | None = None) -> tuple[dict | None, dict | None]:
+        """Newest SL / TP child orders that can protect a ``pos_side`` position: same product, opposite side,
+        reduce-only, open/pending, stop on the correct side of ``ref_price`` (if given). Size is checked by callers."""
+        exit_side = "sell" if pos_side == "LONG" else "buy"
+        d = 1 if pos_side == "LONG" else -1
+
+        def ok(o: dict[str, Any], kind: str) -> bool:
+            if o.get("stop_order_type") != kind or o.get("side") != exit_side or not o.get("reduce_only"):
+                return False
+            if int(o.get("product_id") or product_id) != int(product_id) or o.get("state") not in (None, "open", "pending"):
+                return False
+            if ref_price is not None and o.get("stop_price") not in (None, ""):
+                sp = float(o["stop_price"])
+                return (sp - ref_price) * d < 0 if kind == "stop_loss_order" else (sp - ref_price) * d > 0
+            return True
+        sl = [o for o in orders if ok(o, "stop_loss_order")]
+        tp = [o for o in orders if ok(o, "take_profit_order")]
         key = lambda o: int(o["id"])  # noqa: E731
         return (max(sl, key=key) if sl else None), (max(tp, key=key) if tp else None)
 
-    def _bind_and_open(self, intent_id: str) -> dict[str, Any]:
-        it = self.store.intent(intent_id)
-        sym, pid = it["symbol"], it["product_id"]
-        if self.store.position(self.mode, sym) is not None:
-            return self._exchange_scale_in(intent_id)
-        want_legs = it["sl_price"] is not None or it["tp_price"] is not None  # manual entries may be unprotected
-        sl_o, tp_o = self._find_legs(pid) if want_legs else (None, None)
-        if want_legs and (sl_o is None and it["sl_price"] is not None or tp_o is None and it["tp_price"] is not None):
-            # Entry filled but a protective leg is missing: attach a position bracket (never resend the entry).
-            self._event("WARN", "bracket_legs_missing", sym, {"sl": bool(sl_o), "tp": bool(tp_o)})
+    def _protect(self, symbol: str, intent_id: str | None = None, opened: bool = False) -> dict[str, Any]:
+        """Bind the position's SL/TP child orders (attach a position bracket if one is missing; never resend the
+        entry) and size them to the filled contracts. Missing protection after the readback halts new entries."""
+        p = self.store.position(self.mode, symbol)
+        if p is None or self.mode == "paper":
+            return {}
+        want_sl, want_tp = p["sl_price"] is not None, p["tp_price"] is not None
+        if not (want_sl or want_tp):
+            return {"sl_leg_order_id": None, "tp_leg_order_id": None, "legs_resized": []}
+        pid, n = int(p["product_id"]), int(p["contracts"])
+        ref = float(p["entry_price"]) if opened else None  # an edited / trailed stop may sit beyond the average entry
+
+        def legs() -> tuple[dict | None, dict | None]:
+            return self._match_legs(self.client.get_active_orders(pid, states="open,pending"), pid, p["side"], ref)
+        sl_o, tp_o = legs()
+        if (want_sl and sl_o is None) or (want_tp and tp_o is None):
+            self._event("WARN", "bracket_legs_missing", symbol, {"sl": bool(sl_o), "tp": bool(tp_o)})
             try:
                 self.client.place_position_bracket(
-                    pid, None if sl_o or it["sl_price"] is None else {"order_type": "market_order", "stop_price": it["sl_price"]},
-                    None if tp_o or it["tp_price"] is None else {"order_type": "market_order", "stop_price": it["tp_price"]},
+                    pid, {"order_type": "market_order", "stop_price": p["sl_price"]} if want_sl and sl_o is None else None,
+                    {"order_type": "market_order", "stop_price": p["tp_price"]} if want_tp and tp_o is None else None,
                     TRIGGER_METHOD)
             except ExchangeError as exc:
-                self._event("CRITICAL", "bracket_attach_failed", sym, str(exc))
-            sl_o, tp_o = self._find_legs(pid)
-        if want_legs and (sl_o is None and it["sl_price"] is not None or tp_o is None and it["tp_price"] is not None):
-            self.store.set_halt(True, f"{sym}: filled position without protective legs")
-            self._event("CRITICAL", "unprotected_position", sym, intent_id)
-        self.store.update_intent(intent_id, sl_leg_order_id=str(sl_o["id"]) if sl_o else None,
-                                 tp_leg_order_id=str(tp_o["id"]) if tp_o else None)
-        it = self.store.intent(intent_id)
-        d = 1 if it["side"] == "buy" else -1
-        product = self.ensure_product(sym)
-        px = float(it["avg_fill_price"])
-        qty = it["filled_size"] * product.contract_value
-        sl = float(sl_o["stop_price"]) if sl_o else (None if it["sl_price"] is None else float(it["sl_price"]))
-        tp = float(tp_o["stop_price"]) if tp_o else (None if it["tp_price"] is None else float(it["tp_price"]))
-        lev = float(it["leverage"] or LEVERAGE)
-        t = self.clock()
-        self.store.insert_position(
-            mode=self.mode, symbol=sym, product_id=pid, side="LONG" if d == 1 else "SHORT", contracts=it["filled_size"],
-            contract_value=product.contract_value, entry_price=px, raw_entry_price=px, initial_sl=sl, sl_price=sl,
-            tp_price=tp, trail_amount=float(it["trail_amount"] or 0), sl_order_id=it["sl_leg_order_id"],
-            tp_order_id=it["tp_leg_order_id"], highest_fav_price=px, opened_at_us=t,
-            last_bar_us=t - t % 60_000_000 - 60_000_000, realized_funding_usd=0.0, entry_fee_usd=qty * px * self.fee,
-            margin_usd=qty * px / lev, atr_at_signal=float(it["atr"] or 0), intent_id=intent_id, leverage=lev,
-            source=it["source"] or "bot")
-        self._event("INFO", "entry_filled", sym, {"price": px, "contracts": it["filled_size"],
-                                                   "sl_leg": it["sl_leg_order_id"], "tp_leg": it["tp_leg_order_id"]})
-        self.notifier.notify_trade_entry(it, self.store.position(self.mode, sym))
-        return {"action": "filled", "intent_id": intent_id, "price": px, "contracts": it["filled_size"],
-                "sl_leg_order_id": it["sl_leg_order_id"], "tp_leg_order_id": it["tp_leg_order_id"]}
+                self._event("CRITICAL", "bracket_attach_failed", symbol, str(exc))
+            sl_o, tp_o = legs()
+        if (want_sl and sl_o is None) or (want_tp and tp_o is None):
+            self.store.set_halt(True, f"{symbol}: filled position without protective legs")
+            self._event("CRITICAL", "unprotected_position", symbol, intent_id)
+        upd: dict[str, Any] = {"sl_order_id": str(sl_o["id"]) if sl_o else p["sl_order_id"],
+                               "tp_order_id": str(tp_o["id"]) if tp_o else p["tp_order_id"]}
+        if sl_o is not None and sl_o.get("stop_price") not in (None, ""):
+            upd["sl_price"] = float(sl_o["stop_price"])
+            if opened:
+                upd["initial_sl"] = upd["sl_price"]
+        if tp_o is not None and tp_o.get("stop_price") not in (None, ""):
+            upd["tp_price"] = float(tp_o["stop_price"])
+        self.store.update_position(self.mode, symbol, **upd)
+        if intent_id is not None:
+            self.store.update_intent(intent_id, sl_leg_order_id=upd["sl_order_id"], tp_leg_order_id=upd["tp_order_id"])
+        stale = {str(o["id"]) for o in (sl_o, tp_o) if o is not None and int(o.get("size") or 0) != n}
+        return {"sl_leg_order_id": upd["sl_order_id"], "tp_leg_order_id": upd["tp_order_id"],
+                "legs_resized": self._resize_legs(symbol, only=stale) if stale else []}
 
     # -- ambiguous-outcome recovery ----------------------------------------------- #
+    def _known_order_ids(self) -> set[str]:
+        """Exchange order ids this journal already accounts for: intent orders, SL/TP legs, booked fills."""
+        ids: set[str] = set()
+        for r in self.store.q("SELECT exchange_order_id, sl_leg_order_id, tp_leg_order_id FROM order_intents WHERE mode=?", (self.mode,)):
+            ids |= {str(x) for x in r if x}
+        for r in self.store.q("SELECT sl_order_id, tp_order_id FROM open_positions WHERE mode=?", (self.mode,)):
+            ids |= {str(x) for x in r if x}
+        ids |= {r[0] for r in self.store.q("SELECT DISTINCT order_id FROM booked_fills WHERE order_id IS NOT NULL")}
+        return ids
+
+    def _orphan_fills_for(self, it: Any, fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fills of one order nothing in the journal owns, on the intent's side, fitting its size (F08 evidence).
+        A fill carrying this client_order_id wins; otherwise exactly one candidate order is required."""
+        known, booked, coid = self._known_order_ids(), self.store.booked_fill_ids(), it["client_order_id"]
+        by_order: dict[str, list[dict[str, Any]]] = {}
+        for f in fills:
+            if (str(f.get("order_id")) not in known and str(f.get("id")) not in booked and f.get("side") == it["side"]
+                    and f.get("client_order_id") in (None, "", coid)):
+                by_order.setdefault(str(f.get("order_id")), []).append(f)
+        fits = [fs for fs in by_order.values() if sum(int(f["size"]) for f in fs) <= int(it["size"])]
+        exact = [fs for fs in fits if any(f.get("client_order_id") == coid for f in fs)]
+        return exact[0] if exact else (fits[0] if len(fits) == 1 else [])
+
+    @staticmethod
+    def _order_from_fills(it: Any, order_id: str, fills: list[dict[str, Any]]) -> dict[str, Any]:
+        qty = sum(int(f["size"]) for f in fills)
+        vwap = sum(float(f["price"]) * int(f["size"]) for f in fills) / qty
+        market = it["order_type"] == "market_order"
+        return {"id": order_id, "size": int(it["size"]), "unfilled_size": max(int(it["size"]) - qty, 0),
+                "client_order_id": it["client_order_id"], "state": "closed" if market or qty >= int(it["size"]) else "open",
+                "average_fill_price": str(vwap), "synthesized_from_fills": True}
+
+    def _exchange_vs_journal(self, symbol: str, product_id: int) -> tuple[int, int]:
+        """Signed contracts: Delta's position (GET /v2/positions/margined) vs the journal's."""
+        ex = sum(int(x.get("size") or 0) for x in self.client.get_margined_positions([product_id])
+                 if int(x.get("product_id") or 0) == int(product_id))
+        p = self.store.position(self.mode, symbol)
+        return ex, 0 if p is None else (1 if p["side"] == "LONG" else -1) * int(p["contracts"])
+
     def reconcile_unknown_intents(self) -> list[dict[str, Any]]:
-        """Resolve OUTCOME_UNKNOWN intents from exchange state only. Never resends anything."""
+        """Resolve OUTCOME_UNKNOWN intents from exchange evidence only; never resends anything. Order lookups
+        (client_order_id, active, history), then fills and the real position: negative order lookups alone never
+        clear the blocker (F08). Finally books fills a crash left unbooked (filled_size > filled_size_booked)."""
         out = []
         for it in self.store.q("SELECT * FROM order_intents WHERE mode=? AND state='OUTCOME_UNKNOWN' ORDER BY created_at_us",
                                (self.mode,)):
@@ -972,18 +1245,56 @@ class ExecutionEngine:
             if order is None:                                                     # 3) history
                 order = next((o for o in self.client.get_order_history(pid, start, end) if o.get("client_order_id") == coid), None)
                 steps.append(f"history:{'found' if order else 'none'}")
+            all_fills = self.client.get_fills(pid, start, end)                    # 4) fills
+            if order is None and (mine := self._orphan_fills_for(it, all_fills)):
+                oid = str(mine[0]["order_id"])
+                steps.append(f"fills:{len(mine)} for unowned order {oid}")
+                try:
+                    order = self.client.get_order_by_id(oid)
+                except ExchangeError:
+                    order = None
+                if not order or order.get("client_order_id") not in (None, "", coid):
+                    order = self._order_from_fills(it, oid, mine)
             if order is None:
-                if self.clock() - int(it["updated_at_us"]) >= UNKNOWN_GRACE_US:
-                    self.store.transition(iid, "REJECTED", "not found at exchange after grace period; " + ",".join(steps))
-                    out.append({"intent_id": iid, "result": "REJECTED", "steps": steps})
-                else:
-                    out.append({"intent_id": iid, "result": "STILL_UNKNOWN", "steps": steps})
+                if self.clock() - int(it["updated_at_us"]) < UNKNOWN_GRACE_US:
+                    out.append({"intent_id": iid, "symbol": it["symbol"], "result": "STILL_UNKNOWN", "steps": steps})
+                    continue
+                ex, j = self._exchange_vs_journal(it["symbol"], pid)                # 5) real position
+                steps.append(f"position:exchange {ex} journal {j}")
+                if ex != j:  # something moved the position: keep the symbol blocked, never call it REJECTED
+                    if not str(it["error"] or "").startswith("unresolved_position_delta"):
+                        self.store.update_intent(iid, error=f"unresolved_position_delta: exchange {ex} != journal {j}")
+                        self._event("CRITICAL", "unresolved_position_delta", it["symbol"],
+                                    {"intent_id": iid, "exchange": ex, "journal": j, "steps": steps})
+                    out.append({"intent_id": iid, "symbol": it["symbol"], "result": "UNRESOLVED_POSITION_DELTA", "steps": steps})
+                    continue
+                self.store.transition(iid, "REJECTED", "not found at exchange after grace period; " + ",".join(steps))
+                out.append({"intent_id": iid, "symbol": it["symbol"], "result": "REJECTED", "steps": steps})
                 continue
-            fills = [f for f in self.client.get_fills(pid, start, end) if str(f.get("order_id")) == str(order.get("id"))]
+            fills = [f for f in all_fills if str(f.get("order_id")) == str(order.get("id"))]
             steps.append(f"fills:{len(fills)}")
             res = self._apply_order(iid, order, fills)
             self._event("WARN", "intent_reconciled", it["symbol"], {"intent_id": iid, "steps": steps, "result": res["action"]})
-            out.append({"intent_id": iid, "result": self.store.intent(iid)["state"], "steps": steps, **res})
+            out.append({**res, "intent_id": iid, "symbol": it["symbol"], "result": self.store.intent(iid)["state"], "steps": steps})
+        return out + self.book_unbooked_fills()
+
+    def book_unbooked_fills(self) -> list[dict[str, Any]]:
+        """Crash recovery: FILLED / PARTIALLY_FILLED intents whose fills were not (fully) booked."""
+        if self.mode == "paper":
+            return []
+        out = []
+        for it in self.store.q("SELECT * FROM order_intents WHERE mode=? AND state IN ('FILLED','PARTIALLY_FILLED') "
+                               "AND filled_size > filled_size_booked AND exchange_order_id IS NOT NULL", (self.mode,)):
+            try:
+                order = self.client.get_order_by_id(it["exchange_order_id"])
+            except ExchangeError:
+                order = None
+            if not order:
+                order = {"id": it["exchange_order_id"], "size": it["size"], "unfilled_size": it["size"] - it["filled_size"],
+                         "state": "closed" if it["state"] == "FILLED" else "open", "average_fill_price": it["avg_fill_price"]}
+            res = self._apply_order(it["intent_id"], order)
+            self._event("WARN", "fill_booking_recovered", it["symbol"], {"intent_id": it["intent_id"], "result": res.get("action")})
+            out.append({**res, "intent_id": it["intent_id"], "symbol": it["symbol"], "result": "BOOKED_RECOVERY"})
         return out
 
     # -- position management ---------------------------------------------------- #
@@ -1228,7 +1539,7 @@ class ExecutionEngine:
                     self.client.place_position_bracket(pid, {"order_type": "market_order", "stop_price": upd[key]} if kind == "stop_loss_order" else None,
                                                        {"order_type": "market_order", "stop_price": upd[key]} if kind == "take_profit_order" else None,
                                                        TRIGGER_METHOD)
-                    sl_o, tp_o = self._find_legs(pid)
+                    sl_o, tp_o = self._match_legs(self.client.get_active_orders(pid, states="open,pending"), pid, p["side"])
                     upd["sl_order_id"] = str(sl_o["id"]) if sl_o else p["sl_order_id"]
                     upd["tp_order_id"] = str(tp_o["id"]) if tp_o else p["tp_order_id"]
         self.store.update_position(self.mode, symbol, **upd)
@@ -1251,10 +1562,11 @@ class ExecutionEngine:
             lim = float(it["entry_price"])
             if (d == 1 and low <= lim) or (d == -1 and high >= lim):
                 try:
-                    r = self.manual_fill(symbol, d, int(it["size"]), lim, float(it["leverage"] or LEVERAGE), sl=it["sl_price"],
-                                         tp=it["tp_price"], trail=it["trail_amount"], maker=True, intent_id=it["intent_id"])
-                    self.store.transition(it["intent_id"], "FILLED", "paper limit touched", filled_size=it["size"],
-                                          avg_fill_price=lim)
+                    with self.store.tx():  # position + intent FILLED: one transaction
+                        r = self.manual_fill(symbol, d, int(it["size"]), lim, float(it["leverage"] or LEVERAGE), sl=it["sl_price"],
+                                             tp=it["tp_price"], trail=it["trail_amount"], maker=True, intent_id=it["intent_id"])
+                        self.store.transition(it["intent_id"], "FILLED", "paper limit touched", filled_size=it["size"],
+                                              avg_fill_price=lim, filled_size_booked=it["size"])
                     out.append({"intent_id": it["intent_id"], **r})
                 except (ValueError, ExchangeError) as exc:
                     self.store.transition(it["intent_id"], "CANCELLED", f"fill refused: {exc}", error=str(exc))
@@ -1276,23 +1588,58 @@ class ExecutionEngine:
             trail_amount=float(trail or 0), leverage=float(leverage), source="manual")
         return self._dispatch_entry(intent)
 
-    # -- exchange-backed manual trading (Step 8B) ----------------------------------------------- #
+    # -- exchange-backed manual trading (Step 8B; Step 9 gates) ---------------------------------------- #
+    def read_margin_mode(self) -> str | None:
+        """Account margin mode from GET /v2/users/trading_preferences (None when the venue does not report it)."""
+        mm = (self.client.get_trading_preferences() or {}).get("margin_mode")
+        return None if mm in (None, "") else str(mm)
+
     def ensure_isolated_margin(self) -> dict[str, Any]:
-        """PUT /v2/users/margin_mode isolated. Raises unless the exchange accepts it (or says it already is)."""
+        """PUT /v2/users/margin_mode isolated. Only an 'already isolated' rejection that a readback confirms is benign;
+        every other rejection propagates (F09), so callers never cache a failed switch as success."""
         try:
             r = self.client.set_margin_mode("isolated")
-            return {"margin_mode": (r or {}).get("margin_mode", "isolated"), "changed": True}
         except DeltaAPIError as exc:
-            if "already" in json.dumps(exc.error).lower() or "isolated" in json.dumps(exc.error).lower():
-                return {"margin_mode": "isolated", "changed": False, "note": str(exc.error)}
-            raise
+            text = json.dumps(exc.error).lower()
+            if not (str(exc.code or "").lower() in BENIGN_MARGIN_CODES or "already in isolated" in text
+                    or any(c in text for c in BENIGN_MARGIN_CODES)):
+                raise
+            mode = self.read_margin_mode()
+            if mode != "isolated":
+                raise ExchangeError(f"margin mode switch refused ({exc.error}) and the readback shows {mode!r}, not isolated") from exc
+            return {"margin_mode": "isolated", "changed": False, "verified_by": "readback", "note": str(exc.error)}
+        got = (r or {}).get("margin_mode")
+        if got not in (None, "", "isolated"):
+            raise ExchangeError(f"margin mode switch answered {got!r}, not isolated")
+        return {"margin_mode": "isolated", "changed": True}
+
+    def _duplicate_request(self, client_request_id: str | None) -> sqlite3.Row | None:
+        if not client_request_id:
+            return None
+        return self.store.one("SELECT intent_id, state, symbol FROM order_intents WHERE mode=? AND client_request_id=? "
+                              "AND state != 'REJECTED' ORDER BY created_at_us LIMIT 1", (self.mode, client_request_id))
+
+    def manual_entry_gate(self, symbol: str, client_request_id: str | None = None) -> None:
+        """Shared manual entry gate (F02): a repeated client_request_id never creates a second intent; on the exchange,
+        unknown outcomes are reconciled first and no entry is sent while the symbol has an unresolved/resting intent."""
+        if (dup := self._duplicate_request(client_request_id)) is not None:
+            raise EntryBlockedError(f"duplicate request {client_request_id}: already submitted as intent {dup['intent_id']} "
+                                    f"({dup['state']}); nothing was sent")
+        if self.mode == "paper":
+            return
+        self.reconcile_unknown_intents()
+        if (b := self.symbol_blocked(symbol)) is not None:
+            raise EntryBlockedError(f"{symbol}: {b} — resolve it first (Sync Exchange, or cancel the resting order); nothing was sent")
 
     def manual_exchange_entry(self, symbol: str, direction: int, contracts: int, leverage: float, *, order_type: str = "market",
                               ref_price: float, limit_price: float | None = None, sl: float | None = None,
-                              tp: float | None = None, trigger: str = TRIGGER_METHOD) -> dict[str, Any]:
-        """Open or scale in on the exchange (market or limit). SL/TP ride along as a bracket on a NEW position."""
+                              tp: float | None = None, trigger: str = TRIGGER_METHOD, client_request_id: str | None = None,
+                              prepare: Callable[[], Any] | None = None) -> dict[str, Any]:
+        """Open or scale in on the exchange (market or limit) behind the shared entry gate. ``prepare`` (isolated
+        margin) runs after the gate and before any order. SL/TP ride along as a bracket on a NEW position."""
         if self.mode == "paper":
             raise ExchangeError("paper mode uses manual_fill")
+        self.manual_entry_gate(symbol, client_request_id)
         product = self.ensure_product(symbol)
         p = self.store.position(self.mode, symbol)
         side = "LONG" if direction == 1 else "SHORT"
@@ -1300,6 +1647,8 @@ class ExecutionEngine:
             raise ExchangeError(f"{symbol}: an opposite-side order would reduce the {p['side']} position; use Close / Close part")
         if p is not None and abs(float(p["leverage"]) - float(leverage)) > 1e-9:
             raise ValueError(f"{symbol} position is {float(p['leverage']):g}x; scale in at the same leverage")
+        if prepare is not None:
+            prepare()
         lev = int(leverage) if float(leverage).is_integer() else leverage
         self.client.set_order_leverage(product.product_id, lev)
         bracket = p is None and (sl is not None or tp is not None)
@@ -1309,7 +1658,7 @@ class ExecutionEngine:
             symbol=symbol, product_id=product.product_id, role="ENTRY", side="buy" if direction == 1 else "sell",
             size=int(contracts), order_type=ot, entry_price=limit_price if ot == "limit_order" else ref_price,
             sl_price=sl if bracket else None, tp_price=tp if bracket else None, trail_amount=0.0,
-            leverage=float(leverage), source="manual")
+            leverage=float(leverage), source="manual", client_request_id=client_request_id)
         iid = intent["intent_id"]
         self.store.transition(iid, "DISPATCHING")
         try:
@@ -1330,34 +1679,13 @@ class ExecutionEngine:
         r["exchange_order_id"] = str(order.get("id"))
         return r
 
-    def _exchange_scale_in(self, intent_id: str) -> dict[str, Any]:
-        """A fill on an open position: take size / average entry from the exchange, resize the SL/TP legs."""
-        it = self.store.intent(intent_id)
-        sym = it["symbol"]
-        p = self.store.position(self.mode, sym)
-        product = self.ensure_product(sym)
-        pos = self.client.get_position(p["product_id"])
-        size = abs(int(pos["size"]))
-        entry = float(pos.get("entry_price") or p["entry_price"])
-        px = float(it["avg_fill_price"] or entry)
-        add_fee = it["filled_size"] * product.contract_value * px * self.fee
-        lev = float(p["leverage"])
-        self.store.update_position(self.mode, sym, contracts=size, entry_price=entry, raw_entry_price=entry,
-                                   entry_fee_usd=float(p["entry_fee_usd"]) + add_fee,
-                                   margin_usd=size * product.contract_value * entry / lev)
-        legs = self._resize_legs(sym)
-        self._event("INFO", "manual_scale_in", sym, {"added": it["filled_size"], "size": size, "avg_entry": entry, "legs": legs})
-        self.notifier.notify_trade_entry({"intent_id": intent_id}, self.store.position(self.mode, sym))
-        return {"action": "added", "intent_id": intent_id, "contracts": it["filled_size"], "position_size": size,
-                "avg_entry": entry, "legs_resized": legs}
-
-    def _resize_legs(self, symbol: str) -> list[str]:
-        """Resize live SL/TP child orders to the journal's current contracts (PUT /v2/orders)."""
+    def _resize_legs(self, symbol: str, only: set[str] | None = None) -> list[str]:
+        """Resize live SL/TP child orders (all, or the ids in ``only``) to the journal's contracts (PUT /v2/orders)."""
         p = self.store.position(self.mode, symbol)
         self.ensure_product(symbol)
         done = []
         for leg, price in (("sl_order_id", "sl_price"), ("tp_order_id", "tp_price")):
-            if p[leg] and p[price] is not None:
+            if p[leg] and p[price] is not None and (only is None or str(p[leg]) in only):
                 try:
                     self.client.edit_order(order_id=p[leg], product_id=p["product_id"], size=int(p["contracts"]),
                                            stop_price=p[price])
@@ -1377,12 +1705,27 @@ class ExecutionEngine:
                     self._event("WARN", "leg_cancel_failed", None, str(exc))
         return out
 
-    def exchange_reduce(self, symbol: str, contracts: int | None = None, reason: str = "MANUAL_CLOSE") -> dict[str, Any]:
-        """Reduce-only market order for part or all of a journalled exchange position, booked from its own fills."""
+    def _unresolved_exit(self, symbol: str) -> str | None:
+        r = self.store.one("SELECT intent_id, state FROM order_intents WHERE mode=? AND symbol=? AND (role='EXIT' OR reduce_only=1) "
+                           f"AND state IN ({','.join('?' * len(BLOCKING_STATES))}) LIMIT 1", (self.mode, symbol, *BLOCKING_STATES))
+        return None if r is None else f"close intent {r['intent_id']} is {r['state']}"
+
+    def exchange_reduce(self, symbol: str, contracts: int | None = None, reason: str = "MANUAL_CLOSE",
+                        client_request_id: str | None = None) -> dict[str, Any]:
+        """Reduce-only market order for part or all of a journalled exchange position, booked by the unified exit
+        path (F03). Unknown outcomes are reconciled first; no second close is sent while one is unresolved."""
+        if self.store.position(self.mode, symbol) is None:
+            raise ExchangeError(f"no open {symbol} position in the {self.mode} journal")
+        if (dup := self._duplicate_request(client_request_id)) is not None:
+            raise EntryBlockedError(f"duplicate request {client_request_id}: already submitted as intent {dup['intent_id']} "
+                                    f"({dup['state']}); nothing was sent")
+        self.ensure_product(symbol)  # tick size registered in the client before any leg edit
+        self.reconcile_unknown_intents()
+        if (b := self._unresolved_exit(symbol)) is not None:
+            raise EntryBlockedError(f"{symbol}: {b}; not resent — press Sync Exchange to reconcile it")
         p = self.store.position(self.mode, symbol)
         if p is None:
-            raise ExchangeError(f"no open {symbol} position in the {self.mode} journal")
-        self.ensure_product(symbol)  # tick size registered in the client before any leg edit
+            raise ExchangeError(f"{symbol}: the position was closed while reconciling; nothing was sent")
         n_all = int(p["contracts"])
         n = n_all if contracts is None else int(contracts)
         if not 1 <= n <= n_all:
@@ -1391,7 +1734,8 @@ class ExecutionEngine:
         intent = self.store.create_intent(
             intent_id=f"mx-{secrets.token_hex(8)}", client_order_id=self.new_client_oid(symbol, "C"), mode=self.mode,
             symbol=symbol, product_id=p["product_id"], role="EXIT", side="sell" if d == 1 else "buy", size=n,
-            order_type="market_order", reduce_only=1, leverage=p["leverage"], source="manual")
+            order_type="market_order", reduce_only=1, leverage=p["leverage"], source="manual", exit_reason=reason,
+            client_request_id=client_request_id)
         iid = intent["intent_id"]
         self.store.transition(iid, "DISPATCHING")
         try:
@@ -1404,91 +1748,122 @@ class ExecutionEngine:
         except (DeltaAPIError, RateLimitedError) as exc:
             self.store.transition(iid, "REJECTED", str(exc), error=str(exc))
             raise
-        start, end = int(intent["created_at_us"]) - 5_000_000, self.clock() + 1_000_000
-        fills = [f for f in self.client.get_fills(p["product_id"], start, end) if str(f.get("order_id")) == str(order.get("id"))]
-        qty = sum(int(f["size"]) for f in fills) or (int(order.get("size") or n) - int(order.get("unfilled_size") or 0))
-        if qty <= 0:
-            self.store.transition(iid, "CANCELLED", "reduce-only order did not fill", raw_response=json.dumps(order))
+        r = self._apply_order(iid, order)
+        if r["action"] == "cancelled":
             raise ExchangeError(f"{symbol}: reduce-only close did not fill (state {order.get('state')})")
-        px = (sum(float(f["price"]) * int(f["size"]) for f in fills) / qty) if fills else float(order["average_fill_price"])
-        fee = sum(float(f.get("commission") or 0) for f in fills) if fills else qty * p["contract_value"] * px * self.fee
-        self.store.transition(iid, "FILLED", reason, filled_size=qty, avg_fill_price=px, exchange_order_id=str(order.get("id")),
-                              raw_response=json.dumps(order))
-        oid = str(order.get("id"))
-        if qty < n_all:
-            f = qty / n_all
-            part = {**dict(p), "contracts": qty, "entry_fee_usd": p["entry_fee_usd"] * f,
-                    "realized_funding_usd": p["realized_funding_usd"] * f}
-            row = self._trade_row(_Row(part), px, px, reason, self.clock(), fee, oid)
-            tid = self.store.reduce_position(self.mode, symbol, row, {
-                "contracts": n_all - qty, "entry_fee_usd": p["entry_fee_usd"] * (1 - f),
-                "realized_funding_usd": p["realized_funding_usd"] * (1 - f), "margin_usd": p["margin_usd"] * (1 - f)})
-            legs = self._resize_legs(symbol)
-            action = "partial_exit"
-        else:
-            row = self._trade_row(p, px, px, reason, self.clock(), fee, oid)
-            tid = self.store.close_position(self.mode, symbol, row, self._cooldown_until(self.clock()))
-            legs = self._cancel_legs(p["product_id"])
-            action = "exit"
-        self._event("INFO", f"exchange_{action}", symbol, {"reason": reason, "contracts": qty, "price": px, "net_inr": row["net_pnl_inr"]})
-        self.notifier.notify_trade_exit({**row, "trade_id": tid})
-        return {"action": action, "trade_id": tid, "contracts": qty, "remaining": n_all - qty, "exit_order_id": oid,
-                "legs": legs, **row}
+        return r
 
     def refresh_resting_orders(self) -> list[dict[str, Any]]:
-        """Advance manual exchange limit orders (ACKNOWLEDGED / PARTIALLY_FILLED) from the exchange's order state."""
+        """Advance ACKNOWLEDGED / PARTIALLY_FILLED exchange intents (manual limits and asynchronously acknowledged bot
+        entries) from Delta's order state, booking each new partial fill as soon as it is seen (F04)."""
+        if self.mode == "paper":
+            return []
         out = []
-        for it in self.store.q("SELECT * FROM order_intents WHERE mode=? AND source='manual' AND state IN "
-                               "('ACKNOWLEDGED','PARTIALLY_FILLED') AND exchange_order_id IS NOT NULL", (self.mode,)):
+        for it in self.store.q("SELECT * FROM order_intents WHERE mode=? AND state IN ('ACKNOWLEDGED','PARTIALLY_FILLED') "
+                               "AND exchange_order_id IS NOT NULL ORDER BY created_at_us", (self.mode,)):
             o = self.client.get_order_by_id(it["exchange_order_id"])
-            if o.get("state") in ("open", "pending") and int(o.get("unfilled_size") or 0) == int(o.get("size") or 0):
+            filled = int(o.get("size") or it["size"]) - int(o.get("unfilled_size") or 0)
+            if o.get("state") in ("open", "pending") and filled <= int(it["filled_size_booked"] or 0):
                 continue
-            fills = None
-            if o.get("state") in ("closed", "cancelled"):
-                start, end = int(it["created_at_us"]) - 5_000_000, self.clock() + 1_000_000
-                fills = [f for f in self.client.get_fills(it["product_id"], start, end) if str(f.get("order_id")) == str(o.get("id"))]
             try:
-                out.append({"intent_id": it["intent_id"], **self._apply_order(it["intent_id"], o, fills)})
+                out.append({"intent_id": it["intent_id"], **self._apply_order(it["intent_id"], o)})
             except (RuntimeError, ExchangeError) as exc:
                 out.append({"intent_id": it["intent_id"], "error": str(exc)})
         return out
 
     def sync_exchange_position(self, symbol: str) -> dict[str, Any] | None:
-        """testnet/live: if the exchange is flat but we hold a position, an SL/TP leg filled -> journal the trade."""
+        """testnet/live: bring the journal position in line with Delta's real-time position (Source #3).
+        flat -> book the exit (SL/TP leg or external fills); smaller -> book the external partial close; larger -> adopt
+        the external add (size, average entry); side flipped -> close the journal position (the new side shows as an
+        unjournalled exchange position). The journal's own orders and already-booked fills are never counted twice."""
         p = self.store.position(self.mode, symbol)
         if p is None or self.mode == "paper":
             return None
+        if self.symbol_blocked(symbol) is not None:  # an in-flight / resting intent may explain a difference: book it first
+            self.reconcile_unknown_intents()
+            self.refresh_resting_orders()
+            p = self.store.position(self.mode, symbol)
+            if p is None:
+                return None
+            if self.store.one(f"SELECT 1 FROM order_intents WHERE mode=? AND symbol=? AND state IN "
+                              f"({','.join('?' * len(UNRESOLVED_STATES))})", (self.mode, symbol, *UNRESOLVED_STATES)):
+                return {"action": "deferred", "reason": "an unresolved intent may explain the exchange position"}
         pos = self.client.get_position(p["product_id"])
-        if pos["size"] != 0:
+        d = 1 if p["side"] == "LONG" else -1
+        ex, j = int(pos["size"]), d * int(p["contracts"])
+        if ex == j:
             return None
         start, end = int(p["opened_at_us"]) - 5_000_000, self.clock() + 1_000_000
-        d = 1 if p["side"] == "LONG" else -1
-        exit_side = "sell" if d == 1 else "buy"
-        booked = {r["exit_order_id"] for r in self.store.q(
-            "SELECT exit_order_id FROM trade_history WHERE mode=? AND symbol=? AND opened_at_us=? AND exit_order_id IS NOT NULL",
-            (self.mode, symbol, p["opened_at_us"]))}
+        own = {str(r[0]) for r in self.store.q("SELECT exchange_order_id FROM order_intents WHERE mode=? AND symbol=? AND "
+                                               "exchange_order_id IS NOT NULL", (self.mode, symbol))}
+        own |= {r[0] for r in self.store.q("SELECT exit_order_id FROM trade_history WHERE mode=? AND symbol=? AND opened_at_us=? "
+                                           "AND exit_order_id IS NOT NULL", (self.mode, symbol, p["opened_at_us"]))}
+        booked = self.store.booked_fill_ids(symbol)
         fills = [f for f in self.client.get_fills(p["product_id"], start, end)
-                 if f.get("side") == exit_side and str(f.get("order_id")) not in booked]
-        qty = sum(int(f["size"]) for f in fills)
+                 if str(f.get("id")) not in booked and str(f.get("order_id")) not in own]
+        exit_side = "sell" if d == 1 else "buy"
+        if ex * j <= 0 or abs(ex) < abs(j):
+            q = abs(j) if ex * j <= 0 else abs(j) - abs(ex)
+            return self._book_external_exit(p, [f for f in fills if f.get("side") == exit_side], q, end, flipped=ex * j < 0)
+        return self._book_external_add(p, [f for f in fills if f.get("side") != exit_side], abs(ex) - abs(j), pos)
+
+    def _fill_rows(self, fills: list[dict[str, Any]], symbol: str, role: str, cv: float) -> list[dict[str, Any]]:
+        return [{"fill_id": str(f["id"]), "intent_id": None, "order_id": str(f.get("order_id")), "symbol": symbol, "role": role,
+                 "side": f.get("side"), "size": int(f["size"]), "price": float(f["price"]),
+                 "fee_usd": self._venue_fee(f) if self._venue_fee(f) is not None
+                 else int(f["size"]) * cv * float(f["price"]) * self.fee} for f in fills]
+
+    def _book_external_exit(self, p: Any, xf: list[dict[str, Any]], q: int, end: int, flipped: bool) -> dict[str, Any]:
+        sym, n_all = p["symbol"], int(p["contracts"])
+        qty = sum(int(f["size"]) for f in xf)
         if qty == 0:
-            self._event("CRITICAL", "flat_without_exit_fill", symbol)
-            self.store.set_halt(True, f"{symbol}: exchange flat but no exit fill found")
+            self._event("CRITICAL", "flat_without_exit_fill" if q == n_all else "reduced_without_exit_fill", symbol=sym,
+                        detail={"journal": n_all, "closed_outside": q})
+            self.store.set_halt(True, f"{sym}: exchange position changed by {q} contracts but no exit fill was found")
             return {"action": "halted"}
-        px = sum(float(f["price"]) * int(f["size"]) for f in fills) / qty
-        fee = sum(float(f.get("commission") or 0) for f in fills)
-        oid = str(fills[-1].get("order_id"))
+        if qty != q:
+            self._event("WARN", "exit_fills_mismatch", sym, {"exit_fill_contracts": qty, "booked_contracts": q, "flipped": flipped})
+        rows = self._fill_rows(xf, sym, "EXT_EXIT", float(p["contract_value"]))
+        px = sum(r["price"] * r["size"] for r in rows) / qty
+        fee = sum(r["fee_usd"] for r in rows) * min(1.0, q / qty)
+        oid = str(xf[-1].get("order_id"))
         reason = {p["sl_order_id"]: "TSL" if p["sl_price"] != p["initial_sl"] else "SL", p["tp_order_id"]: "TP"}.get(oid, "EXT")
-        row = self._trade_row(p, px, px, reason, end, fee, oid)
-        tid = self.store.close_position(self.mode, symbol, row, self._cooldown_until(end))
-        for o in self.client.get_active_orders(p["product_id"]):  # cancel the surviving leg
-            if o.get("stop_order_type") in ("stop_loss_order", "take_profit_order"):
-                try:
-                    self.client.cancel_order(p["product_id"], order_id=o["id"])
-                except ExchangeError as exc:
-                    self._event("WARN", "leg_cancel_failed", symbol, str(exc))
-        self._event("INFO", "exchange_exit", symbol, {"reason": reason, "price": px, "net_inr": row["net_pnl_inr"]})
+        with self.store.tx():
+            if q < n_all:
+                f = q / n_all
+                part = {**dict(p), "contracts": q, "entry_fee_usd": p["entry_fee_usd"] * f,
+                        "realized_funding_usd": p["realized_funding_usd"] * f}
+                row = self._trade_row(_Row(part), px, px, reason, end, fee, oid)
+                tid = self.store.reduce_position(self.mode, sym, row, {
+                    "contracts": n_all - q, "entry_fee_usd": p["entry_fee_usd"] * (1 - f),
+                    "realized_funding_usd": p["realized_funding_usd"] * (1 - f), "margin_usd": p["margin_usd"] * (1 - f)})
+            else:
+                row = self._trade_row(p, px, px, reason, end, fee, oid)
+                tid = self.store.close_position(self.mode, sym, row, self._cooldown_until(end))
+            self.store.record_fills(rows)
+        legs = self._resize_legs(sym) if q < n_all else self._cancel_legs(int(p["product_id"]))  # surviving legs
+        action = "partial_exit" if q < n_all else "exit"
+        self._event("INFO" if reason != "EXT" else "WARN", f"exchange_{action}", sym,
+                    {"reason": reason, "contracts": q, "price": px, "net_inr": row["net_pnl_inr"], "flipped": flipped, "legs": legs})
         self.notifier.notify_trade_exit({**row, "trade_id": tid})
-        return {"action": "exit", "trade_id": tid, "reason": reason, **row}
+        return {"action": action, "trade_id": tid, "reason": reason, "contracts": q, "remaining": n_all - q,
+                "flipped": flipped, **row}
+
+    def _book_external_add(self, p: Any, ef: list[dict[str, Any]], q: int, pos: dict[str, Any]) -> dict[str, Any]:
+        sym, n0 = p["symbol"], int(p["contracts"])
+        cv, n = float(p["contract_value"]), n0 + q
+        rows = self._fill_rows(ef, sym, "EXT_ENTRY", cv)
+        qty = sum(r["size"] for r in rows)
+        add_px = sum(r["price"] * r["size"] for r in rows) / qty if qty else float(p["entry_price"])
+        avg = float(pos.get("entry_price") or 0) or (n0 * float(p["entry_price"]) + q * add_px) / n
+        fee = sum(r["fee_usd"] for r in rows) if rows else q * cv * add_px * self.fee
+        with self.store.tx():
+            self.store.update_position(self.mode, sym, contracts=n, entry_price=avg, raw_entry_price=avg,
+                                       entry_fee_usd=float(p["entry_fee_usd"]) + fee, margin_usd=n * cv * avg / float(p["leverage"]))
+            self.store.record_fills(rows)
+        legs = self._resize_legs(sym)
+        self._event("WARN", "external_add", sym, {"added": q, "position": n, "avg_entry": avg, "fills": qty, "legs_resized": legs})
+        return {"action": "external_add", "contracts": q, "position_size": n, "avg_entry": avg, "legs_resized": legs}
 
     def close_position(self, symbol: str, reason: str, price: float | None = None, bar_us: int | None = None) -> dict[str, Any] | None:
         """Protective close of one tracked position: paper at ``price``; testnet/live via a reduce-only market order."""
@@ -1560,12 +1935,44 @@ class ExecutionEngine:
             raise ExchangeError(f"credentials belong to user {uid}, but this DB is bound to user {bound}")
         return uid
 
-    def prepare_account(self) -> dict[str, Any]:
-        """testnet/live: bind account, isolated margin, 10x order leverage on each traded product."""
+    def prepare_account(self, exchange_sizes: dict[str, int] | None = None) -> dict[str, Any]:
+        """testnet/live (F07): bind the account, isolated margin (strict, F09) and 10x order leverage confirmed by
+        Delta's answer on every flat product. A product holding a position at another leverage is NOT changed: it
+        stays blocked for bot entries until flat. ``exchange_sizes`` (signed contracts per symbol) avoids re-reading."""
+        self.account_policy = None
         uid = self.bind_account()
-        mm = self.client.set_margin_mode("isolated")
-        lev = {s: self.client.set_order_leverage(p.product_id, LEVERAGE) for s, p in self.products.items()}
-        return {"user_id": uid, "margin_mode": mm, "leverage": lev}
+        mm = self.ensure_isolated_margin()
+        lev: dict[str, Any] = {}
+        blocked: dict[str, str] = {}
+        for s, prod in self.products.items():
+            size = (exchange_sizes or {}).get(s)
+            try:
+                if size is None:
+                    size = self.client.get_position(prod.product_id)["size"]
+                if size:
+                    have = (self.client.get_order_leverage(prod.product_id) or {}).get("leverage")
+                    lev[s] = {"leverage": have, "changed": False, "open_size": size}
+                    if have in (None, "") or float(have) != float(LEVERAGE):
+                        blocked[s] = (f"open exchange position ({size}) at {have}x, policy {LEVERAGE}x: left unchanged; "
+                                      "bot entries blocked until it is flat")
+                else:
+                    lev[s] = self.client.set_order_leverage(prod.product_id, LEVERAGE)  # raises unless Delta echoes 10x
+            except ExchangeError as exc:
+                blocked[s] = f"leverage policy failed: {exc}"
+        self.account_policy = {"user_id": uid, "margin_mode": mm, "leverage": lev, "blocked": blocked,
+                               "verified_at_us": self.clock()}
+        if blocked:
+            self._event("WARN", "account_policy_blocked", None, blocked)
+        return self.account_policy
+
+    def account_policy_refusal(self, symbol: str) -> str | None:
+        """Why a testnet/live bot entry on ``symbol`` must not be sent under the margin/leverage policy (F07)."""
+        if self.account_policy is None:
+            try:
+                self.prepare_account()
+            except ExchangeError as exc:
+                return f"isolated margin / {LEVERAGE}x leverage could not be verified: {exc}"
+        return self.account_policy["blocked"].get(symbol)
 
     # -- paper runner ------------------------------------------------------------- #
     def run_paper_cycle(self, sync: bool = True) -> dict[str, Any]:

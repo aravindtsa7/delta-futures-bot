@@ -8,6 +8,12 @@ States
 New entries only when state == OBSERVED_READY and no halt is active. Protective actions (in-place SL
 trailing, reduce-only closes, emergency flatten) run in every state.
 
+Step 9: reconciliation also applies the account policy (isolated margin + 10x, verified; a product holding a
+position at another leverage stays blocked for bot entries), confirms each position's SL/TP legs strictly (else
+missing_confirmed_protection -> DEGRADED), books partial / resting fills, and treats missing private streams as
+DEGRADED. Emergency flatten cancels entry orders before closing and reports FLAT only when nothing can reopen
+exposure. Socket frames, the REST poller and control commands run in worker threads, serialised by one lock.
+
 Usage
   .venv\\Scripts\\python.exe live_bot.py --mode paper --once           # one reconciliation + evaluation cycle
   .venv\\Scripts\\python.exe live_bot.py --mode paper --duration 3600  # WebSocket + REST-poll runner for 1h
@@ -18,10 +24,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -33,7 +41,7 @@ from rich.table import Table
 import data_manager as dm
 import execution_engine as ee
 from config import get_mode_db_path, settings
-from exchange_client import DeltaRestClientAdapter, LiveTradingDisabledError
+from exchange_client import DeltaRestClientAdapter, ExchangeError, LiveTradingDisabledError
 from ws_manager import DeltaWebSocketManager, default_connector, rest_backfill
 
 log = logging.getLogger(__name__)
@@ -46,6 +54,7 @@ ENTRY_MAX_DELAY_S = 300         # act on a 1h signal only within 5 min of the ba
 QUOTE_MAX_AGE_S = 30
 POLL_INTERVAL_S = 15
 POLL_GRACE_S = 75               # REST-poll a minute the socket has not delivered 75 s after it closed
+BRACKET_RETRY_S = 300           # re-attach missing protection at most every 5 min; in between only read it back
 
 STATES = ("BOOTING", "CONNECTING", "AUTHENTICATING", "SUBSCRIBING", "SNAPSHOTTING", "RECONCILING",
           "OBSERVED_READY", "DEGRADED", "HALTED")
@@ -53,6 +62,15 @@ STATES = ("BOOTING", "CONNECTING", "AUTHENTICATING", "SUBSCRIBING", "SNAPSHOTTIN
 
 class BotAlreadyRunningError(RuntimeError):
     pass
+
+
+def _locked(fn: Callable) -> Callable:
+    """Serialise a runner entry point: socket frames, the REST poller and control commands run in worker threads."""
+    @functools.wraps(fn)
+    def wrapper(self: "LiveBotRunner", *a: Any, **kw: Any) -> Any:
+        with self._work:
+            return fn(self, *a, **kw)
+    return wrapper
 
 
 def auto_bot_live_refusal(mode: str) -> str | None:
@@ -260,6 +278,8 @@ class LiveBotRunner:
                  max_consecutive_losses: int = MAX_CONSECUTIVE_LOSSES, control_dir=None, notifier: Any = None):
         if mode == "live" and not settings.is_live:
             raise LiveTradingDisabledError("live bot needs MODE='live' AND LIVE_TRADING_ENABLED=True")
+        self._work = threading.RLock()
+        self._bracket_attempts: dict[str, float] = {}
         self.lock = InstanceLock(lock_path, mode)
         self.store = None
         try:
@@ -284,7 +304,7 @@ class LiveBotRunner:
             backfill_client = self.client if mode != "paper" else DeltaRestClientAdapter("paper")
             self.ws = DeltaWebSocketManager(mode, self.symbols, self, api_key=ws_api_key, api_secret=ws_api_secret,
                                             connector=ws_connector, backfill=rest_backfill(backfill_client),
-                                            watchdog_s=watchdog_s)
+                                            watchdog_s=watchdog_s, offload=True)
         except BaseException:
             if self.store is not None:
                 self.store.close()
@@ -315,6 +335,7 @@ class LiveBotRunner:
         self.lock.release()
 
     # -- state machine --------------------------------------------------------------- #
+    @_locked
     def transition(self, new: str, reason: str = "") -> None:
         if new not in STATES:
             raise ValueError(new)
@@ -336,14 +357,24 @@ class LiveBotRunner:
     def can_enter(self) -> bool:
         return self.state == "OBSERVED_READY" and not self.daily_halted and not self.engine.entries_paused()
 
-    # -- WebSocket handler callbacks -------------------------------------------------- #
+    # -- WebSocket handler callbacks (worker threads; one lock) ------------------------ #
+    @_locked
     def on_ws_phase(self, phase: str, generation: int) -> None:
         if phase in ("CONNECTING", "AUTHENTICATING", "SUBSCRIBING", "SNAPSHOTTING"):
             self.transition(phase, f"ws generation {generation}")
 
+    @_locked
     def on_ws_ready(self, generation: int) -> None:
         self.run_reconciliation(f"ws generation {generation} ready")
 
+    @_locked
+    def on_ws_degraded(self, generation: int, problems: dict[str, list[dict[str, Any]]]) -> None:
+        """F10: some required subscriptions were rejected / never acknowledged. Public -> REST fallback (recorded);
+        private (testnet/live) -> the next reconciliation reports private_stream_unavailable -> DEGRADED."""
+        self.engine._event("CRITICAL" if problems.get("private") and self.mode != "paper" else "WARN", "ws_rest_fallback", None,
+                           {"generation": generation, **problems}, notify=True)
+
+    @_locked
     def on_ws_disconnect(self, generation: int, reason: str) -> None:
         self.disconnects_since_ready += 1
         if self.disconnects_since_ready >= 3:
@@ -351,11 +382,13 @@ class LiveBotRunner:
         else:
             self.transition("RECONCILING", f"socket drop (generation {generation}): {reason}")
 
+    @_locked
     def on_sequence_anomaly(self, a: dict[str, Any]) -> None:
         self.engine._event("WARN", "sequence_anomaly", a.get("symbol"), a, notify=True)
         self.transition("RECONCILING", f"{a['kind']} on {a['channel']} {a['symbol']}: {a['prev_seq']} -> {a['seq']}")
         self.ws.invalidate(f"sequence {a['kind']} on {a['channel']}")
 
+    @_locked
     def on_subscription_error(self, socket: str, ch: dict[str, Any]) -> None:
         self.store.event("WARN", "subscription_error", None, {"socket": socket, **ch}, self.mode)
 
@@ -363,16 +396,48 @@ class LiveBotRunner:
         if c.symbol in self.symbols:
             self.on_minute_close(c.symbol, c.start, c.open, c.high, c.low, c.close, c.source)
 
+    def _private_update(self, sym: str, oid: str, closed: bool, source: str) -> None:
+        """An order / fill event: book fills of our own resting or partially filled orders now (F04), and the exit
+        when one of a position's SL/TP legs is done."""
+        if oid and self.store.one("SELECT 1 FROM order_intents WHERE mode=? AND exchange_order_id=? AND state IN "
+                                  "('ACKNOWLEDGED','PARTIALLY_FILLED')", (self.mode, oid)):
+            for r in self.engine.refresh_resting_orders():
+                self.actions.append({"symbol": sym, "source": source, **r})
+        p = self.store.position(self.mode, sym) if sym else None
+        if p is not None and oid in (p["sl_order_id"], p["tp_order_id"]) and closed:
+            r = self.engine.sync_exchange_position(sym)
+            if r:
+                self.actions.append({"symbol": sym, "source": source, **r})
+
+    @_locked
     def on_order(self, m: dict[str, Any]) -> None:
+        """Private 'orders' item, normalized by ws_manager (id == order_id; snapshot envelopes unpacked)."""
         if self.mode == "paper":
             return
-        p = self.store.position(self.mode, message_sym := str(m.get("product_symbol") or m.get("symbol") or ""))
-        if p is not None and str(m.get("id")) in (p["sl_order_id"], p["tp_order_id"]) and m.get("state") == "closed":
-            r = self.engine.sync_exchange_position(message_sym)
+        self._private_update(str(m.get("product_symbol") or ""), str(m.get("id") or m.get("order_id") or ""),
+                             m.get("state") == "closed", "ws_orders")
+
+    @_locked
+    def on_user_trade(self, m: dict[str, Any]) -> None:
+        """Private 'v2/user_trades' item: a fill on one of our orders."""
+        if self.mode == "paper":
+            return
+        self._private_update(str(m.get("product_symbol") or ""), str(m.get("order_id") or ""), True, "ws_user_trades")
+
+    @_locked
+    def on_position(self, m: dict[str, Any]) -> None:
+        """Private 'positions' item: a size that differs from the journal is reconciled at once (Source #2/#3)."""
+        if self.mode == "paper" or m.get("snapshot"):
+            return  # snapshots arrive during the handshake; the REST reconciliation covers them
+        sym = str(m.get("product_symbol") or "")
+        p = self.store.position(self.mode, sym) if sym else None
+        if p is not None and int(m.get("size") or 0) != (1 if p["side"] == "LONG" else -1) * int(p["contracts"]):
+            r = self.engine.sync_exchange_position(sym)
             if r:
-                self.actions.append({"symbol": message_sym, **r})
+                self.actions.append({"symbol": sym, "source": "ws_positions", **r})
 
     # -- reconciliation ---------------------------------------------------------------- #
+    @_locked
     def run_reconciliation(self, reason: str) -> dict[str, Any]:
         self.transition("RECONCILING", reason)
         now = int(self.clock())
@@ -381,16 +446,25 @@ class LiveBotRunner:
         summary["unknown_intents"] = self.engine.reconcile_unknown_intents()
         if any(r.get("result") == "STILL_UNKNOWN" for r in summary["unknown_intents"]):
             issues.append("OUTCOME_UNKNOWN intent unresolved")
+        issues.extend(f"unresolved_position_delta:{r.get('symbol')}" for r in summary["unknown_intents"]
+                      if r.get("result") == "UNRESOLVED_POSITION_DELTA")
+        degraded = self.ws.degraded or {}
+        summary["ws_feed"] = "REST_FALLBACK" if degraded.get("public") else "WEBSOCKET"
         if self.mode != "paper":
+            if degraded.get("private"):  # F10: account updates are not streaming -> no new entries
+                issues.append("private_stream_unavailable: " + ", ".join(p["channel"] for p in degraded["private"]))
             summary["user_id"] = self.engine.bind_account()
+            summary["resting_orders"] = self.engine.refresh_resting_orders()
             bals = self.client.get_wallet_balances()
             usd = next((b for b in bals if b.get("asset_symbol") == "USD"), {})
             summary["wallet_usd_available"] = float(usd.get("available_balance") or 0)
             orders = self.client.get_active_orders()
             summary["open_orders"] = len(orders)
             summary["positions"] = {}
+            sizes: dict[str, int] = {}
             for sym, spec in self.engine.products.items():
                 pos = self.client.get_position(spec.product_id)
+                sizes[sym] = pos["size"]
                 local = self.store.position(self.mode, sym)
                 info = {"exchange_size": pos["size"], "journal": None if local is None else
                         (1 if local["side"] == "LONG" else -1) * local["contracts"]}
@@ -399,10 +473,20 @@ class LiveBotRunner:
                 elif pos["size"] != 0 and local is None:
                     issues.append(f"{sym}: untracked exchange position {pos['size']}")
                 elif pos["size"] != 0:
-                    if pos["size"] != info["journal"]:
-                        issues.append(f"{sym}: exchange size {pos['size']} != journal {info['journal']}")
-                    info.update(self._ensure_protection(sym, spec.product_id, local, orders))
+                    if pos["size"] != info["journal"]:  # Source #3: adopt / book the external change first
+                        info["synced"] = (self.engine.sync_exchange_position(sym) or {}).get("action")
+                        local = self.store.position(self.mode, sym)
+                        j = None if local is None else (1 if local["side"] == "LONG" else -1) * local["contracts"]
+                        if j != pos["size"]:
+                            issues.append(f"{sym}: exchange size {pos['size']} != journal {j}")
+                    if local is not None:
+                        info.update(self._ensure_protection(sym, spec.product_id, local, orders, issues))
                 summary["positions"][sym] = info
+            try:  # F07: isolated margin + 10x verified before bot entries; open positions keep their leverage
+                pol = self.engine.prepare_account(sizes)
+                summary["account_policy"] = {"margin_mode": pol["margin_mode"], "blocked": pol["blocked"]}
+            except ExchangeError as exc:
+                issues.append(f"account_policy_failed: {exc}")
         cov = self.market.sync(self.symbols)
         summary["data"] = cov
         latest_closed = now - now % 60 - 60
@@ -434,22 +518,59 @@ class LiveBotRunner:
             "data": {s: {"last_1m": to_utc(c["last_1m"]), "gaps": c["gaps"]} for s, c in cov.items()}}, self.mode)
         return summary
 
-    def _ensure_protection(self, sym: str, pid: int, local: Any, orders: list[dict[str, Any]]) -> dict[str, Any]:
-        sl = [o for o in orders if o.get("product_id") == pid and o.get("stop_order_type") == "stop_loss_order"]
-        tp = [o for o in orders if o.get("product_id") == pid and o.get("stop_order_type") == "take_profit_order"]
-        out: dict[str, Any] = {"sl_leg": sl[0]["id"] if sl else None, "tp_leg": tp[0]["id"] if tp else None}
-        if not sl or not tp:
+    def _ref_mark(self, sym: str) -> float | None:
+        t = self.ws.last_ticker.get(sym) or {}
+        return t.get("mark_price") or self.last_close.get(sym)
+
+    def _ensure_protection(self, sym: str, pid: int, local: Any, orders: list[dict[str, Any]],
+                           issues: list[str]) -> dict[str, Any]:
+        """F06: a leg counts only if it matches the position: product, opposite side, reduce-only, size == contracts,
+        stop on the correct side of the price. A missing leg is attached at most every BRACKET_RETRY_S (an ACK is
+        never proof: the readback decides); a leg differing only in size is resized. Unconfirmed protection adds
+        'missing_confirmed_protection:{sym}' so the runner stays DEGRADED (no entries)."""
+        n = int(local["contracts"])
+        ref = self._ref_mark(sym) or float(local["entry_price"])
+        want_sl, want_tp = local["sl_price"] is not None, local["tp_price"] is not None
+
+        def match(rows: list[dict[str, Any]]) -> tuple[dict | None, dict | None]:
+            return self.engine._match_legs([o for o in rows if int(o.get("product_id") or 0) == int(pid)], pid, local["side"], ref)
+        sl, tp = match(orders)
+        out: dict[str, Any] = {"sl_leg": sl["id"] if sl else None, "tp_leg": tp["id"] if tp else None}
+        reread = False
+        if (want_sl and sl is None) or (want_tp and tp is None):
             self.store.event("CRITICAL", "unprotected_position", sym, out, self.mode)
-            self.client.place_position_bracket(
-                pid, None if sl else {"order_type": "market_order", "stop_price": local["sl_price"]},
-                None if tp else {"order_type": "market_order", "stop_price": local["tp_price"]}, ee.TRIGGER_METHOD)
-            orders = self.client.get_active_orders(pid)
-            sl = [o for o in orders if o.get("stop_order_type") == "stop_loss_order"]
-            tp = [o for o in orders if o.get("stop_order_type") == "take_profit_order"]
-            out.update(bracket_attached=True, sl_leg=sl[0]["id"] if sl else None, tp_leg=tp[0]["id"] if tp else None)
-        if out["sl_leg"] is not None and str(out["sl_leg"]) != local["sl_order_id"] or \
-                out["tp_leg"] is not None and str(out["tp_leg"]) != local["tp_order_id"]:
-            self.store.update_position(self.mode, sym, sl_order_id=str(out["sl_leg"]), tp_order_id=str(out["tp_leg"]))
+            key = f"{sym}:{local['opened_at_us']}"
+            last = self._bracket_attempts.get(key)
+            if last is None or self.clock() - last >= BRACKET_RETRY_S:
+                self._bracket_attempts[key] = self.clock()
+                try:
+                    self.client.place_position_bracket(
+                        pid, {"order_type": "market_order", "stop_price": local["sl_price"]} if want_sl and sl is None else None,
+                        {"order_type": "market_order", "stop_price": local["tp_price"]} if want_tp and tp is None else None,
+                        ee.TRIGGER_METHOD)
+                    out["bracket_attached"] = True
+                except ExchangeError as exc:
+                    out["bracket_error"] = str(exc)
+            else:
+                out["bracket_attach"] = "awaiting readback (not resent)"
+            reread = True
+        legs = {"sl_order_id": str(sl["id"]) if sl else local["sl_order_id"], "tp_order_id": str(tp["id"]) if tp else local["tp_order_id"]}
+        if legs != {"sl_order_id": local["sl_order_id"], "tp_order_id": local["tp_order_id"]}:
+            self.store.update_position(self.mode, sym, **legs)
+        stale = {str(o["id"]) for o in (sl, tp) if o is not None and int(o.get("size") or 0) != n}
+        if stale:
+            out["legs_resized"] = self.engine._resize_legs(sym, only=stale)
+            reread = True
+        if reread:
+            sl, tp = match(self.client.get_active_orders(pid))
+            out.update(sl_leg=sl["id"] if sl else None, tp_leg=tp["id"] if tp else None)
+            found = {k: v for k, v in (("sl_order_id", sl), ("tp_order_id", tp)) if v is not None}
+            if found:
+                self.store.update_position(self.mode, sym, **{k: str(v["id"]) for k, v in found.items()})
+        ok = all(o is not None and int(o.get("size") or 0) == n for want, o in ((want_sl, sl), (want_tp, tp)) if want)
+        out["protection_confirmed"] = ok
+        if not ok:
+            issues.append(f"missing_confirmed_protection:{sym}")
         return out
 
     def _catch_up(self, cov: dict[str, dict[str, Any]]) -> None:
@@ -474,6 +595,7 @@ class LiveBotRunner:
             self.last_minute[sym] = max(self.last_minute.get(sym, 0), c["last_1m"])
 
     # -- minute / hour processing --------------------------------------------------------- #
+    @_locked
     def on_minute_close(self, symbol: str, bar_s: int, o: float, h: float, l: float, c: float, source: str = "ws") -> None:
         if symbol not in self.symbols:
             return
@@ -553,12 +675,26 @@ class LiveBotRunner:
         return self.engine.realized_equity_inr() + self.engine.unrealized_inr(self.last_close)
 
     def _roll_day(self, bar_s: int) -> None:
+        """UTC day anchor of the 5% breaker, persisted in system_meta (Source #5): a restart later the same day keeps
+        the 00:00 baseline, including the mark-to-market of positions held across midnight."""
         day = bar_s // 86_400
+        if day == self.day:
+            return
+        date = to_utc(day * 86_400)[:10]
         if self.day is None:
-            self.day, self.day_start_equity = day, self._day_start_from_journal(day)
-        elif day != self.day:
-            self.day, self.day_start_equity = day, self.equity_inr()
-            self.store.event("INFO", "day_start", None, {"day": to_utc(day * 86_400), "equity_inr": self.day_start_equity}, self.mode)
+            saved_date = self.store.meta_get("utc_day_anchor_date")
+            saved_usd = self.store.meta_get("utc_day_start_equity_usd")
+            if saved_date == date and saved_usd is not None:
+                self.day, self.day_start_equity = day, float(saved_usd) * self.engine.rate
+                return
+            # no anchor for today: a previous day's anchor means we were down at 00:00 -> mark to market now;
+            # no anchor at all (first run) -> realized equity at midnight from the journal
+            start = self.equity_inr() if saved_date is not None else self._day_start_from_journal(day)
+        else:
+            start = self.equity_inr()
+        self.day, self.day_start_equity = day, start
+        self.store.meta_set(utc_day_anchor_date=date, utc_day_start_equity_usd=start / self.engine.rate)
+        self.store.event("INFO", "day_start", None, {"day": to_utc(day * 86_400), "equity_inr": start}, self.mode)
 
     def loss_streak(self) -> int:
         n = 0
@@ -588,6 +724,8 @@ class LiveBotRunner:
         self.engine._event("CRITICAL", "loss_streak_halt" if kind == "LOSS_STREAK" else "daily_loss_halt", None, {"reason": reason})
         if kind == "LOSS_STREAK":
             self.streak_floor_us = now_us
+        cancels: dict[str, Any] = {"cancelled_orders": [], "cancel_errors": []}
+        self._cancel_entry_orders(cancels)  # F05: nothing resting may reopen exposure after the halt
         flattened = []
         for p in self.store.positions(self.mode):
             sym = p["symbol"]
@@ -595,7 +733,7 @@ class LiveBotRunner:
             flattened.append({"symbol": sym, "result": (r or {}).get("action")})
         if self.mode != "paper" and self.store.positions(self.mode):
             self.engine.emergency_flatten()
-        self.actions.append({"action": "halt", "kind": kind, "reason": reason, "flattened": flattened})
+        self.actions.append({"action": "halt", "kind": kind, "reason": reason, "flattened": flattened, **cancels})
         self.transition("HALTED", reason)
 
     # -- runners ------------------------------------------------------------------------------ #
@@ -627,18 +765,24 @@ class LiveBotRunner:
                 pass
             if not self.reconciliations:
                 continue
-            now = self.clock()
-            latest = int(now) - int(now) % 60 - 60
-            for sym in self.symbols:
-                last = self.last_minute.get(sym)
-                if last is None or last >= latest or now - (last + 120) < POLL_GRACE_S:
-                    continue
-                try:
-                    self.market.sync([sym])
-                    for bar_s, o, h, l, c, _, _ in self.market.minutes_after(sym, last):
+            await asyncio.to_thread(self._poll_once)  # Source #6: REST work off the event loop
+
+    def _poll_once(self) -> None:
+        """One REST-poll pass (worker thread): downloads run outside the runner lock, minute processing inside it."""
+        now = self.clock()
+        latest = int(now) - int(now) % 60 - 60
+        for sym in list(self.symbols):
+            last = self.last_minute.get(sym)
+            if last is None or last >= latest or now - (last + 120) < POLL_GRACE_S:
+                continue
+            try:
+                self.market.sync([sym])
+                rows = self.market.minutes_after(sym, last)
+                with self._work:
+                    for bar_s, o, h, l, c, _, _ in rows:
                         self.on_minute_close(sym, bar_s, o, h, l, c, "rest_poll")
-                except Exception as exc:  # noqa: BLE001 - keep polling
-                    log.warning("REST poll %s failed: %s", sym, exc)
+            except Exception as exc:  # noqa: BLE001 - keep polling
+                log.warning("REST poll %s failed: %s", sym, exc)
 
     async def run_async(self, duration: float | None = None) -> None:
         if (why := auto_bot_live_refusal(self.mode)) is not None:
@@ -666,19 +810,26 @@ class LiveBotRunner:
 
     async def _control_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
-            for cmd in self.control.pending():
-                try:
-                    res = self.handle_command(cmd["cmd"], cmd.get("args") or {})
-                except Exception as exc:  # noqa: BLE001 - report, keep running
-                    res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-                self.control.complete(cmd["id"], res)
-                if cmd["cmd"] == "stop":
-                    stop.set()
+            if await asyncio.to_thread(self._process_commands):  # e.g. a flatten never blocks the socket loop
+                stop.set()
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
 
+    def _process_commands(self) -> bool:
+        """Execute pending control files (worker thread). True when a stop was requested."""
+        stop = False
+        for cmd in self.control.pending():
+            try:
+                res = self.handle_command(cmd["cmd"], cmd.get("args") or {})
+            except Exception as exc:  # noqa: BLE001 - report, keep running
+                res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            self.control.complete(cmd["id"], res)
+            stop |= cmd["cmd"] == "stop"
+        return stop
+
+    @_locked
     def handle_command(self, cmd: str, args: dict[str, Any]) -> dict[str, Any]:
         """Operator commands (dashboard / control files). Protective logic keeps running in every case."""
         if cmd == "pause":
@@ -698,12 +849,60 @@ class LiveBotRunner:
             return {"ok": True, "stopping": True, "pid": os.getpid()}
         raise ValueError(f"unknown command {cmd!r}")
 
+    def _cancel_entry_orders(self, report: dict[str, Any]) -> None:
+        """Cancel every order that could open exposure: resting / partially filled ENTRY intents (paper and exchange)
+        and, on the exchange, any other open order that is neither reduce-only nor an SL/TP leg. Fills reported by a
+        cancel are booked at once; a refused cancel (already filled) is booked by the reconciliation that follows."""
+        for it in self.store.q("SELECT * FROM order_intents WHERE mode=? AND role='ENTRY' AND reduce_only=0 AND state IN "
+                               "('ACKNOWLEDGED','PARTIALLY_FILLED') ORDER BY created_at_us", (self.mode,)):
+            if self.mode == "paper" or not it["exchange_order_id"]:
+                self.store.transition(it["intent_id"], "CANCELLED", "emergency flatten / risk halt")
+                report["cancelled_orders"].append(it["intent_id"])
+                continue
+            try:
+                r = self.client.cancel_order(it["product_id"], order_id=it["exchange_order_id"])
+                self.engine._apply_order(it["intent_id"], {**r, "state": r.get("state") or "cancelled"})
+                report["cancelled_orders"].append(it["intent_id"])
+            except ExchangeError as exc:
+                report["cancel_errors"].append(f"{it['symbol']} order {it['exchange_order_id']}: {type(exc).__name__}: {exc}")
+        if self.mode != "paper":
+            for o in self.client.get_active_orders():
+                if o.get("reduce_only") or o.get("stop_order_type"):
+                    continue
+                try:
+                    self.client.cancel_order(int(o["product_id"]), order_id=o["id"])
+                    report["cancelled_orders"].append(str(o["id"]))
+                except ExchangeError as exc:
+                    report["cancel_errors"].append(f"{o.get('product_symbol')} order {o['id']}: {type(exc).__name__}: {exc}")
+
+    def _open_entry_orders(self) -> list[dict[str, Any]]:
+        out = [{"symbol": i["symbol"], "intent_id": i["intent_id"], "state": i["state"]} for i in self.store.q(
+            "SELECT symbol, intent_id, state FROM order_intents WHERE mode=? AND role='ENTRY' AND reduce_only=0 AND state IN "
+            "('ACKNOWLEDGED','PARTIALLY_FILLED','DISPATCHING','OUTCOME_UNKNOWN')", (self.mode,))]
+        if self.mode != "paper":
+            out += [{"symbol": o.get("product_symbol"), "order_id": o.get("id"), "side": o.get("side"),
+                     "size": o.get("unfilled_size") or o.get("size")}
+                    for o in self.client.get_active_orders() if not o.get("reduce_only") and not o.get("stop_order_type")]
+        return out
+
+    @_locked
     def emergency_flatten_all(self, reason: str = "MANUAL_FLATTEN") -> dict[str, Any]:
-        """Close every tracked position (paper at the touch; exchange via reduce-only, escalating to close_all),
-        then pause new entries. Reports residual exposure instead of claiming FLAT."""
-        report: dict[str, Any] = {"reason": reason, "closed": [], "errors": [], "residual": [], "close_all": None}
+        """F05: 1) pause new entries, 2) cancel every order that could open exposure, 3) reconcile fills that landed
+        before the cancels, 4) close journalled and unjournalled positions (reduce-only, escalating to close_all),
+        5) report FLAT only when open positions AND open entry orders are verifiably zero, else FLATTEN_INCOMPLETE."""
+        report: dict[str, Any] = {"reason": reason, "closed": [], "errors": [], "residual": [], "close_all": None,
+                                  "cancelled_orders": [], "cancel_errors": [], "open_entry_orders": []}
         now_us = int(self.clock() * 1_000_000)
-        for p in self.store.positions(self.mode):
+        self.store.set_entries_paused(True)                                   # 1
+        report["entries_paused"] = True
+        self._cancel_entry_orders(report)                                     # 2
+        if self.mode != "paper":                                              # 3
+            try:
+                report["reconciled"] = [r.get("result") or r.get("action") for r in
+                                        self.engine.reconcile_unknown_intents() + self.engine.refresh_resting_orders()]
+            except ExchangeError as exc:
+                report["errors"].append(f"reconcile: {type(exc).__name__}: {exc}")
+        for p in self.store.positions(self.mode):                             # 4
             sym = p["symbol"]
             try:
                 price = None
@@ -717,19 +916,32 @@ class LiveBotRunner:
             except Exception as exc:  # noqa: BLE001 - keep closing the others
                 report["errors"].append(f"{sym}: {type(exc).__name__}: {exc}")
         if self.mode != "paper":
-            r = self.engine.emergency_flatten() if (self.store.positions(self.mode) or report["errors"]) else None
-            report["close_all"] = r
-            if r and r.get("status") != "FLAT":
-                report["residual"].extend(r.get("residual") or [])
+            try:  # unjournalled exchange positions count too
+                open_ex = [x for x in self.client.get_margined_positions() if int(x.get("size") or 0)]
+            except ExchangeError as exc:
+                open_ex = []
+                report["errors"].append(f"positions: {type(exc).__name__}: {exc}")
+            if open_ex or self.store.positions(self.mode) or report["errors"]:
+                r = self.engine.emergency_flatten()
+                report["close_all"] = r
+                if r.get("status") != "FLAT":
+                    report["residual"].extend(r.get("residual") or [])
+                for p in self.store.positions(self.mode):  # book what close_all did into the journal
+                    self.engine.sync_exchange_position(p["symbol"])
         report["residual"].extend({"symbol": p["symbol"], "contracts": p["contracts"]} for p in self.store.positions(self.mode))
-        self.store.set_entries_paused(True)
-        report["entries_paused"] = True
-        report["status"] = "FLAT" if not report["residual"] and not report["errors"] else "RESIDUAL_EXPOSURE"
-        if report["status"] != "FLAT":
-            self.engine._event("CRITICAL", "residual_exposure", None,
-                               {"reason": reason, "residual": report["residual"], "errors": report["errors"]})
+        try:                                                                  # 5
+            report["open_entry_orders"] = self._open_entry_orders()
+        except ExchangeError as exc:
+            report["errors"].append(f"open orders: {type(exc).__name__}: {exc}")
+        done = not report["residual"] and not report["open_entry_orders"] and not report["errors"]
+        report["status"] = "FLAT" if done else "FLATTEN_INCOMPLETE"
+        if not done:
+            self.engine._event("CRITICAL", "flatten_incomplete", None,
+                               {"reason": reason, "residual": report["residual"], "open_entry_orders": report["open_entry_orders"],
+                                "errors": report["errors"]})
         else:
-            self.engine._event("WARN", "manual_flatten", None, {"closed": len(report["closed"])}, notify=True)
+            self.engine._event("WARN", "manual_flatten", None, {"closed": len(report["closed"]),
+                                                                 "cancelled_orders": len(report["cancelled_orders"])}, notify=True)
         return report
 
     def status(self) -> dict[str, Any]:

@@ -193,6 +193,12 @@ def calls(f: FakeDeltaExchange, method: str, path: str) -> list[dict]:
     return [c for c in f.calls if c["method"] == method and c["path"] == path]
 
 
+def mb(**extra) -> dict:
+    """Step 9 mode binding for manual mutations: expected_mode + mode_generation (+ confirm='LIVE' in live)."""
+    mode, gen = bot_ops.mode_state()
+    return {"expected_mode": mode, "mode_generation": gen, **({"confirm": "LIVE"} if mode == "live" else {}), **extra}
+
+
 def test_mocked() -> None:
     console.rule("[bold]2. Mocked FakeDeltaExchange: exchange-backed manual trading (live + testnet)")
     if T.exists():
@@ -251,14 +257,14 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
     # -- ₹0 wallet
     order = {"symbol": "SOLUSD", "side": "LONG", "leverage": 20, "margin_inr": 5000, "sl_pct": 2.0, "tp_pct": 4.0,
              "trigger_source": "mark_price"}
-    r = c.post("/api/manual/order", json=order)
+    r = c.post("/api/manual/order", json={**order, **mb()})
     check("2 orders", "LIVE wallet ₹0 -> friendly refusal, nothing sent", r.status_code == 422 and "₹0.00" in r.json()["detail"]
           and "add funds" in r.json()["detail"] and not calls(live, "POST", "/v2/orders"), r.json()["detail"][:120])
     live.wallet_usd = 50_000 / RATE
     mtr._cache.pop("snap:live", None)
 
     # -- market long with SL/TP
-    r = c.post("/api/manual/order", json=order)
+    r = c.post("/api/manual/order", json={**order, **mb()})
     o = r.json()
     post = calls(live, "POST", "/v2/orders")[-1]["body"] if calls(live, "POST", "/v2/orders") else {}
     lev = [x["body"] for x in calls(live, "POST", f"/v2/products/{live.meta['SOLUSD']['id']}/orders/leverage")]
@@ -276,7 +282,7 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
           and st["exchange"]["connected"] and sol.get("liq_source") == "delta", f"wallet ₹{st['wallet']['realized_equity_inr']:,.2f}, used ₹{st['wallet']['used_margin_inr']:,.2f}")
 
     # -- market short with SL only
-    r = c.post("/api/manual/order", json={"symbol": "BTCUSD", "side": "SHORT", "leverage": 15, "contracts": 3, "sl_pct": 1.5})
+    r = c.post("/api/manual/order", json={"symbol": "BTCUSD", "side": "SHORT", "leverage": 15, "contracts": 3, "sl_pct": 1.5, **mb()})
     st = c.get("/api/manual/state", params={"symbol": "BTCUSD", "include_candles": False}).json()
     btc = next((p for p in st["positions"] if p["symbol"] == "BTCUSD"), {})
     check("2 orders", "market SHORT BTCUSD 15x with SL only: SL leg bound, no TP leg", r.status_code == 200 and btc.get("side") == "SHORT"
@@ -286,11 +292,11 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
     eth_px = live.prices[3136]
     lim = round(round(eth_px * 0.97 / 0.05) * 0.05, 2)  # on ETHUSD's 0.05 tick
     r1 = c.post("/api/manual/order", json={"symbol": "ETHUSD", "side": "LONG", "order_type": "limit", "limit_price": lim, "leverage": 10,
-                                            "contracts": 5, "sl_pct": 2.0, "tp_pct": 4.0})
+                                            "contracts": 5, "sl_pct": 2.0, "tp_pct": 4.0, **mb()})
     ex1 = r1.json().get("exchange", {})
     st = c.get("/api/manual/state", params={"symbol": "ETHUSD", "include_candles": False}).json()
     pend = [p for p in st["pending_orders"] if p["symbol"] == "ETHUSD"]
-    rc = c.delete(f"/api/manual/order/{r1.json().get('intent_id')}")
+    rc = c.delete(f"/api/manual/order/{r1.json().get('intent_id')}", params=mb())
     dels = calls(live, "DELETE", "/v2/orders")
     check("2 orders", "limit LONG ETHUSD rests on the exchange (tick-snapped), listed, then cancelled via DELETE /v2/orders",
           r1.status_code == 200 and r1.json()["result"] == "resting" and pend and rc.status_code == 200
@@ -298,7 +304,7 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
           and live.orders[int(ex1["exchange_order_id"])]["state"] == "cancelled",
           f"order {ex1.get('exchange_order_id')} @ {lim} -> cancelled")
     r2 = c.post("/api/manual/order", json={"symbol": "ETHUSD", "side": "LONG", "order_type": "limit", "limit_price": lim, "leverage": 10,
-                                            "contracts": 5, "sl_pct": 2.0, "tp_pct": 4.0})
+                                            "contracts": 5, "sl_pct": 2.0, "tp_pct": 4.0, **mb()})
     oid2 = int(r2.json()["exchange"]["exchange_order_id"])
     live.fill_resting(oid2)
     st = c.get("/api/manual/state", params={"symbol": "ETHUSD", "include_candles": False}).json()
@@ -311,7 +317,7 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
     sol = next(p for p in c.get("/api/manual/state", params={"symbol": "SOLUSD", "include_candles": False}).json()["positions"] if p["symbol"] == "SOLUSD")
     new_sl, new_tp = round(sol["entry_price"] * 0.985, 4), round(sol["entry_price"] * 1.03, 4)
     n_put = len(calls(live, "PUT", "/v2/orders"))
-    r = c.put("/api/manual/position/SOLUSD/protection", json={"sl_price": new_sl, "tp_price": new_tp})
+    r = c.put("/api/manual/position/SOLUSD/protection", json={"sl_price": new_sl, "tp_price": new_tp, **mb()})
     puts = calls(live, "PUT", "/v2/orders")[n_put:]
     check("2 protect", "edit SL/TP on SOLUSD modifies the live legs via PUT /v2/orders", r.status_code == 200 and len(puts) == 2
           and {str(p["body"]["id"]) for p in puts} == {str(sol["sl_order_id"]), str(sol["tp_order_id"])}
@@ -320,18 +326,18 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
           f"{[(p['body']['id'], p['body'].get('stop_price')) for p in puts]}")
     n_br = len(calls(live, "POST", "/v2/orders/bracket"))
     btc_tp = round(btc["entry_price"] * 0.97, 1)
-    r = c.put("/api/manual/position/BTCUSD/protection", json={"tp_price": btc_tp})
+    r = c.put("/api/manual/position/BTCUSD/protection", json={"tp_price": btc_tp, **mb()})
     btc2 = r.json().get("position", {})
     check("2 protect", "adding a TP to BTCUSD (opened without one) creates the protective leg (POST /v2/orders/bracket) and saves its id",
           r.status_code == 200 and len(calls(live, "POST", "/v2/orders/bracket")) == n_br + 1 and btc2.get("tp_order_id"),
           f"new TP leg {btc2.get('tp_order_id')} @ {btc_tp}")
-    rt = c.put("/api/manual/position/SOLUSD/protection", json={"trail_amount": 1.0})
+    rt = c.put("/api/manual/position/SOLUSD/protection", json={"trail_amount": 1.0, **mb()})
     check("2 protect", "trailing stop refused for exchange positions (paper-only) — 422", rt.status_code == 422)
 
     # -- scale-in
     n_put = len(calls(live, "PUT", "/v2/orders"))
-    r = c.post("/api/manual/order", json={"symbol": "SOLUSD", "side": "LONG", "leverage": 20, "contracts": 2})
-    rbad = c.post("/api/manual/order", json={"symbol": "SOLUSD", "side": "LONG", "leverage": 10, "contracts": 1})
+    r = c.post("/api/manual/order", json={"symbol": "SOLUSD", "side": "LONG", "leverage": 20, "contracts": 2, **mb()})
+    rbad = c.post("/api/manual/order", json={"symbol": "SOLUSD", "side": "LONG", "leverage": 10, "contracts": 1, **mb()})
     sol2 = next(p for p in c.get("/api/manual/state", params={"symbol": "SOLUSD", "include_candles": False}).json()["positions"] if p["symbol"] == "SOLUSD")
     ex_size = live.positions[int(live.meta["SOLUSD"]["id"])]["size"]
     resized = calls(live, "PUT", "/v2/orders")[n_put:]
@@ -343,7 +349,7 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
 
     # -- partial close
     n_before = sol2["contracts"]
-    r = c.post("/api/manual/position/SOLUSD/close", json={"contracts": 3})
+    r = c.post("/api/manual/position/SOLUSD/close", json=mb(contracts=3))
     pc = r.json()
     ro = [x["body"] for x in calls(live, "POST", "/v2/orders")][-1]
     sol3 = next(p for p in c.get("/api/manual/state", params={"symbol": "SOLUSD", "include_candles": False}).json()["positions"] if p["symbol"] == "SOLUSD")
@@ -367,8 +373,8 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
           f"BTC exit {tb['exit_price'] if tb else '-'} net ₹{tb['net_pnl_inr'] if tb else 0:.2f}; size before {btc_pos}")
 
     # -- full closes
-    rs = c.post("/api/manual/position/SOLUSD/close")
-    re_ = c.post("/api/manual/position/ETHUSD/close")
+    rs = c.post("/api/manual/position/SOLUSD/close", json=mb())
+    re_ = c.post("/api/manual/position/ETHUSD/close", json=mb())
     st = c.get("/api/manual/state", params={"symbol": "ETHUSD", "include_candles": False}).json()
     legs_left = [o for o in live.orders.values() if o.get("stop_order_type") and o["state"] in ("open", "pending")]
     check("2 close", "full close SOL + ETH: reduce-only market, child SL/TP legs cancelled, exchange flat, journal empty",
@@ -381,7 +387,7 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
     mtr._cache.pop("snap:live", None)
     st = c.get("/api/manual/state", params={"symbol": "XRPUSD", "include_candles": False}).json()
     ext = next((p for p in st["positions"] if p["symbol"] == "XRPUSD"), {})
-    rx = c.post("/api/manual/position/XRPUSD/close")
+    rx = c.post("/api/manual/position/XRPUSD/close", json=mb())
     check("2 sync", "position opened outside the terminal shows as 'exchange (not journalled)' and can be closed reduce-only",
           ext.get("journalled") is False and "not journalled" in ext.get("source", "") and rx.json().get("result") == "external_close"
           and live.positions[xrp_id]["size"] == 0)
@@ -420,8 +426,8 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
     settings.TESTNET_API_KEY, settings.TESTNET_API_SECRET = FAKE_KEY, FAKE_SECRET
     tn.wallet_usd = 50_000 / RATE
     r = c.post("/api/manual/mode", json={"mode": "testnet"})
-    ro = c.post("/api/manual/order", json={"symbol": "ETHUSD", "side": "SHORT", "leverage": 5, "contracts": 2, "tp_pct": 3.0})
-    rcl = c.post("/api/manual/position/ETHUSD/close")
+    ro = c.post("/api/manual/order", json={"symbol": "ETHUSD", "side": "SHORT", "leverage": 5, "contracts": 2, "tp_pct": 3.0, **mb()})
+    rcl = c.post("/api/manual/position/ETHUSD/close", json=mb())
     s_tn = ee.StateStore(T / "bot_state_testnet.db")
     try:
         tn_trades, tn_mode = s_tn.trades("testnet"), s_tn.config()["mode"]
@@ -432,7 +438,7 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
           and len(tn_trades) == 1 and len(calls(tn, "POST", "/v2/orders")) == 2 and tn.margin_mode_calls == 1,
           f"testnet trades {len(tn_trades)}")
     c.post("/api/manual/mode", json={"mode": "paper"})
-    rp = c.post("/api/manual/order", json={"symbol": "BTCUSD", "side": "LONG", "leverage": 10, "contracts": 1})
+    rp = c.post("/api/manual/order", json={"symbol": "BTCUSD", "side": "LONG", "leverage": 10, "contracts": 1, **mb()})
     probe = ee.StateStore(T / "bot_state_live.db")
     try:
         probe.init_config("paper", {})

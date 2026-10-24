@@ -7,9 +7,11 @@ Sockets
 
 Connection generation (one integer per attempt, both sockets):
   CONNECTING -> enable_heartbeat on every socket -> AUTHENTICATING (private: key-auth, wait for
-  {"type":"key-auth","success":true,"status":"authenticated"}) -> SUBSCRIBING (wait for the
-  "subscriptions" ack; channels with an "error" field are flagged) -> SNAPSHOTTING (private: first
-  orders/positions snapshot) -> READY (handler.on_ready). Then a read loop with a 35s watchdog
+  {"type":"key-auth","success":true,"status":"authenticated"}) -> SUBSCRIBING (wait until every required
+  channel / symbol is acknowledged or errored) -> SNAPSHOTTING (private: first orders/positions snapshot)
+  -> READY, or DEGRADED_REST_FALLBACK when any required subscription errored / was never acknowledged
+  (handler.on_ws_degraded gets the per-socket problems; the runner then reconciles over REST and, in
+  testnet/live, blocks entries while private channels are missing). Then a read loop with a 35s watchdog
   (server heartbeat every 30s + 5s): silence closes both sockets and a new generation starts.
   Frames tagged with an older generation are dropped.
 
@@ -45,7 +47,7 @@ SYMBOL_MANDATORY = {"orders", "positions", "v2/user_trades", "candlestick_1m", "
 PRIVATE_CHANNELS = {"orders", "positions", "v2/user_trades", "margins"}
 SNAPSHOT_CHANNELS = ("orders", "positions")
 
-PHASES = ("CONNECTING", "AUTHENTICATING", "SUBSCRIBING", "SNAPSHOTTING", "READY")
+PHASES = ("CONNECTING", "AUTHENTICATING", "SUBSCRIBING", "SNAPSHOTTING", "READY", "DEGRADED_REST_FALLBACK")
 
 
 class SubscriptionError(ValueError):
@@ -234,6 +236,32 @@ def message_symbol(m: dict[str, Any]) -> str:
     return str(m.get("symbol") or m.get("product_symbol") or m.get("sy") or "*")
 
 
+def normalize_private(channel: str, m: dict[str, Any]) -> list[dict[str, Any]]:
+    """orders / positions / v2/user_trades frames -> one dict per item. Snapshot envelopes ({"action": "snapshot",
+    "result": [...]}) are unpacked; order ids are exposed as both 'id' and 'order_id' (the docs' wire key is
+    order_id), symbols as 'product_symbol', compact trade keys (sy, p, s/q, oid) as symbol / price / size / order_id."""
+    snapshot = m.get("action") == "snapshot" or str(m.get("type", "")).endswith("snapshot")
+    items = m["result"] if isinstance(m.get("result"), list) else [m]
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        x = {**it, "type": channel, "snapshot": snapshot}
+        x["product_symbol"] = it.get("product_symbol") or it.get("symbol") or it.get("sy") or m.get("symbol") or m.get("sy")
+        if channel == "orders":
+            oid = it.get("order_id") if it.get("order_id") is not None else it.get("id")
+            x["id"] = x["order_id"] = oid
+        elif channel == "positions":
+            x["size"] = int(it.get("size") or 0)
+        else:  # v2/user_trades
+            x["order_id"] = it.get("order_id") or it.get("oid") or it.get("o")
+            x["price"] = _f(it.get("price") if it.get("price") is not None else it.get("p"))
+            sz = next((it.get(k) for k in ("size", "s", "q") if it.get(k) is not None), None)
+            x["size"] = None if sz is None else int(float(sz))
+        out.append(x)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Transport
 # --------------------------------------------------------------------------- #
@@ -252,7 +280,9 @@ class WSStats:
     wire_keys: dict[str, list[str]] = field(default_factory=dict)
     schemas: dict[str, int] = field(default_factory=dict)
     acked: dict[str, list[str]] = field(default_factory=dict)
+    acked_symbols: dict[str, dict[str, list[str]]] = field(default_factory=dict)  # socket -> channel -> symbols
     subscription_errors: list[dict[str, Any]] = field(default_factory=list)
+    subscription_problems: dict[str, list[dict[str, Any]]] = field(default_factory=dict)  # current generation
     dropped_stale_generation: int = 0
     anomalies: list[dict[str, Any]] = field(default_factory=list)
     heartbeats: int = 0
@@ -279,8 +309,13 @@ class DeltaWebSocketManager:
         watchdog_s: float = WATCHDOG_SECONDS,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        offload: bool = False,
     ):
         self.mode = mode
+        # offload=True: frame handling and handler callbacks run in a worker thread (asyncio.to_thread), so the
+        # handler's synchronous REST / SQLite work never blocks the event loop (heartbeats, watchdog, pings).
+        self.offload = offload
+        self.degraded: dict[str, list[dict[str, Any]]] = {}
         self.symbols = list(symbols)
         self.handler = handler
         self.public_url, self.private_url = ws_urls(mode)
@@ -325,9 +360,15 @@ class DeltaWebSocketManager:
         if fn is not None:
             fn(*args)
 
-    def _set_phase(self, phase: str) -> None:
+    async def _aemit(self, name: str, *args: Any) -> None:
+        if self.offload:
+            await asyncio.to_thread(self._emit, name, *args)
+        else:
+            self._emit(name, *args)
+
+    async def _set_phase(self, phase: str) -> None:
         self.phase = phase
-        self._emit("on_ws_phase", phase, self.generation)
+        await self._aemit("on_ws_phase", phase, self.generation)
 
     def invalidate(self, reason: str) -> int:
         """Make every frame of the current connection stale and request a fresh connection generation."""
@@ -353,10 +394,14 @@ class DeltaWebSocketManager:
         elif t == "subscriptions":
             for ch in m.get("channels") or []:
                 if ch.get("error"):
-                    st.subscription_errors.append({"socket": source, **ch})
+                    st.subscription_errors.append({"socket": source, "generation": generation, **ch})
                     self._emit("on_subscription_error", source, ch)
                 else:
                     st.acked.setdefault(source, []).append(ch.get("name"))
+                    got = st.acked_symbols.setdefault(source, {})
+                    # an ack that does not list symbols acknowledges the whole channel ("*")
+                    syms = ch.get("symbols") if ch.get("symbols") is not None else ["*"]
+                    got[ch.get("name")] = sorted(set(got.get(ch.get("name"), [])) | set(syms))
         elif t == "key-auth":
             self.auth_response = m
             self.authenticated = bool(m.get("success")) and m.get("status") == "authenticated"
@@ -383,7 +428,8 @@ class DeltaWebSocketManager:
             if snapshot:
                 self.snapshots.add(t)
             anomaly = self.seq.feed(t, message_symbol(m), message_seq(t, m), snapshot)
-            self._emit({"orders": "on_order", "positions": "on_position"}.get(t, "on_user_trade"), m)
+            for item in normalize_private(t, m):
+                self._emit({"orders": "on_order", "positions": "on_position"}.get(t, "on_user_trade"), item)
             if anomaly is not None:
                 anomaly["generation"] = generation
                 st.anomalies.append(anomaly)
@@ -428,7 +474,10 @@ class DeltaWebSocketManager:
             except (TypeError, ValueError):
                 self.stats.errors.append(f"non-JSON frame on {socket}")
                 continue
-            self.handle_message(msg, gen, socket)
+            if self.offload:  # handler work (REST / SQLite) off the event loop; frames stay strictly ordered
+                await asyncio.to_thread(self.handle_message, msg, gen, socket)
+            else:
+                self.handle_message(msg, gen, socket)
             if self._reconnect_reason is not None and gen != self.generation:
                 return
 
@@ -444,8 +493,10 @@ class DeltaWebSocketManager:
         self.authenticated = False
         self.auth_response = None
         self.stats.acked.clear()
+        self.stats.acked_symbols.clear()
+        self.stats.subscription_problems = {}
         self._queue = asyncio.Queue()
-        self._set_phase("CONNECTING")
+        await self._set_phase("CONNECTING")
         self._conns["public"] = await self.connector(self.public_url)
         if self.use_private:
             self._conns["private"] = await self.connector(self.private_url)
@@ -453,31 +504,66 @@ class DeltaWebSocketManager:
         self._readers = [asyncio.create_task(self._reader(gen, s, c, self._queue)) for s, c in self._conns.items()]
         for s in self._conns:
             await self._send(s, {"type": "enable_heartbeat"})
-        self._set_phase("AUTHENTICATING")
+        await self._set_phase("AUTHENTICATING")
         if self.use_private:
             await self._send("private", key_auth_message(self._key, self._secret, str(int(self.clock()))))
             await self._pump(lambda: self.auth_response is not None, HANDSHAKE_TIMEOUT_SECONDS, "key-auth")
             if not self.authenticated:
                 raise AuthError(f"private socket key-auth failed: {self.auth_response}")
-        self._set_phase("SUBSCRIBING")
+        await self._set_phase("SUBSCRIBING")
         await self._send("public", subscribe_message(self.public_channels))
         if self.use_private:
             await self._send("private", subscribe_message(self.private_channels))
-        await self._pump(lambda: all(s in self.stats.acked or self._acked_with_error(s) for s in self._conns),
-                         HANDSHAKE_TIMEOUT_SECONDS, "subscriptions ack")
-        self._set_phase("SNAPSHOTTING")
+        try:  # every required channel / symbol acknowledged or errored (F10); a timeout leaves the rest missing
+            await self._pump(lambda: not any(p.get("pending") for ps in self.subscription_problems(gen).values() for p in ps),
+                             HANDSHAKE_TIMEOUT_SECONDS, "subscriptions ack")
+        except TimeoutError:
+            self.stats.errors.append("subscription acknowledgement timeout")
+        problems = {s: ps for s, ps in self.subscription_problems(gen).items() if ps}
+        self.stats.subscription_problems = problems
+        await self._set_phase("SNAPSHOTTING")
         if self.use_private:
             try:
                 await self._pump(lambda: all(c in self.snapshots for c in SNAPSHOT_CHANNELS), SNAPSHOT_TIMEOUT_SECONDS,
                                  "private snapshots")
             except TimeoutError:
                 self.stats.errors.append("snapshot timeout (REST reconciliation covers it)")
-        self._set_phase("READY")
-        self._emit("on_ws_ready", gen)
+        self.degraded = problems
+        if problems:  # never report READY for streams that were not confirmed
+            log.warning("ws generation %d subscriptions not confirmed: %s", gen, problems)
+            await self._set_phase("DEGRADED_REST_FALLBACK")
+            await self._aemit("on_ws_degraded", gen, problems)
+        else:
+            await self._set_phase("READY")
+        await self._aemit("on_ws_ready", gen)
         return gen
 
-    def _acked_with_error(self, socket: str) -> bool:
-        return any(e.get("socket") == socket for e in self.stats.subscription_errors)
+    def required_channels(self, socket: str) -> list[dict[str, Any]]:
+        return self.public_channels if socket == "public" else self.private_channels
+
+    def subscription_problems(self, generation: int | None = None) -> dict[str, list[dict[str, Any]]]:
+        """Per socket: required channels that errored, or still lack an acknowledgement for some symbols
+        ('pending': True while the handshake may still deliver it)."""
+        gen = self.generation if generation is None else generation
+        out: dict[str, list[dict[str, Any]]] = {}
+        for socket in self._conns or {"public": None, **({"private": None} if self.use_private else {})}:
+            errs = {e.get("name"): e.get("error") for e in self.stats.subscription_errors
+                    if e.get("socket") == socket and e.get("generation") == gen}
+            got = self.stats.acked_symbols.get(socket, {})
+            acked = set(self.stats.acked.get(socket, []))
+            probs = []
+            for ch in self.required_channels(socket):
+                name = ch["name"]
+                if name in errs:
+                    probs.append({"channel": name, "error": errs[name]})
+                    continue
+                have = set(got.get(name, []))
+                missing = [] if "*" in have else sorted(set(ch.get("symbols") or []) - have)
+                if name not in acked or missing:
+                    probs.append({"channel": name, "missing_symbols": missing if name in acked else ch.get("symbols") or [],
+                                  "pending": True})
+            out[socket] = probs
+        return out
 
     async def read_loop(self, stop: asyncio.Event) -> str:
         """Dispatch frames until stop / reconnect request / watchdog / lost socket. Returns the reason."""
@@ -525,7 +611,7 @@ class DeltaWebSocketManager:
             await self.close_sockets()
             if stop.is_set():
                 break
-            self._emit("on_ws_disconnect", self.generation, reason)
+            await self._aemit("on_ws_disconnect", self.generation, reason)
             delay = RECONNECT_BACKOFF[min(max(failures - 1, 0), len(RECONNECT_BACKOFF) - 1)] if failures else 0.5
             try:
                 await asyncio.wait_for(stop.wait(), timeout=delay)
@@ -533,7 +619,7 @@ class DeltaWebSocketManager:
                 pass
 
     def snapshot(self) -> dict[str, Any]:
-        return {"generation": self.generation, "phase": self.phase, **asdict(self.stats)}
+        return {"generation": self.generation, "phase": self.phase, "degraded": self.degraded, **asdict(self.stats)}
 
 
 def rest_backfill(client: Any) -> Callable[[str, int, int], list[Candle]]:

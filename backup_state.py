@@ -109,17 +109,35 @@ def _held(path: Path) -> bool:
 
 
 def restore(backup_file: Path | str, target: Path | str = DEFAULT_DB, lock_path: Path | str = LOCK_PATH) -> dict[str, Any]:
-    """Atomically replace ``target`` with a verified copy of ``backup_file``. Refused while a runner is active."""
+    """Atomically replace ``target`` with a verified copy of ``backup_file``. Refused while a runner is active.
+    The bot instance lock AND the journal's writer lock are acquired first and held until the replacement is
+    verified, so no runner or writer can start in between (Source #6)."""
+    from execution_engine import StateStoreLockedError, _ProcessLock
+    from live_bot import BotAlreadyRunningError, InstanceLock
     backup_file, target, lock_path = Path(backup_file), Path(target), Path(lock_path)
-    if _held(lock_path):
-        raise RestoreRefusedError(f"{lock_path} is held by an active bot runner; stop it before restoring")
+    try:
+        bot_lock = InstanceLock(lock_path, "restore")
+    except BotAlreadyRunningError as exc:
+        raise RestoreRefusedError(f"{lock_path} is held by an active bot runner; stop it before restoring") from exc
     writer_lock = target.with_name(target.name + ".lock")
-    if _held_writer(writer_lock):
-        raise RestoreRefusedError(f"{writer_lock} is held: another process has {target.name} open as writer")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            journal_lock = _ProcessLock(writer_lock)
+        except StateStoreLockedError as exc:
+            raise RestoreRefusedError(f"{writer_lock} is held: another process has {target.name} open as writer") from exc
+        try:
+            return _replace_verified(backup_file, target)
+        finally:
+            journal_lock.release()
+    finally:
+        bot_lock.release()
+
+
+def _replace_verified(backup_file: Path, target: Path) -> dict[str, Any]:
     v = verify(backup_file)
     if not v["ok"]:
         raise RestoreRefusedError(f"backup failed verification: {v}")
-    target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + ".restore.tmp")
     tmp.unlink(missing_ok=True)
     _copy_online(backup_file, tmp)

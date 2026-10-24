@@ -36,7 +36,9 @@ async function api(path, opts = {}) {
   if (!res.ok) {
     const d = body && body.detail;
     const msg = typeof d === "string" ? d : Array.isArray(d) ? d.map((e) => `${(e.loc || []).slice(-1)[0]}: ${e.msg}`).join("; ") : res.statusText;
-    throw new Error(msg || `HTTP ${res.status}`);
+    const err = new Error(msg || `HTTP ${res.status}`);
+    err.status = res.status;  // the server answered (a network failure has no status)
+    throw err;
   }
   return body;
 }
@@ -896,7 +898,19 @@ function bindBot() {
 
 /* ------------------------------------------------------------------ Step 8: manual trade terminal */
 const mt = { symbol: "BTCUSD", res: "5m", timer: null, chart: null, series: null, lines: [], lastBarTime: null, chartKey: null,
-  catalog: null, product: null, state: null, previewTimer: null, preview: null, busy: false, protectSym: null };
+  catalog: null, product: null, state: null, previewTimer: null, preview: null, busy: false, protectSym: null, requestId: null };
+
+// Every manual mutation is bound to the mode the user saw (Step 9, F01): the server refuses it (409) when the
+// mode or its generation changed since, and in LIVE the typed confirmation travels with the request itself.
+function mtBinding(src, confirmText) {
+  const b = { expected_mode: src.mode, mode_generation: src.mode_generation };
+  if (src.mode === "live") b.confirm = confirmText;
+  return b;
+}
+function mtNewRequestId() { return `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`; }
+function mtLiveConfirm(question) {
+  return prompt(`⚠ REAL MONEY — ${question}\n\nType LIVE to send it:`) === "LIVE" ? "LIVE" : null;
+}
 const LEV_CHIPS = [1, 2, 3, 5, 10, 20, 25, 50, 75, 100, 125, 150, 200];
 
 function fmtPx(x) {
@@ -1009,23 +1023,34 @@ function mtUpdateButtons() {
 async function mtPlace(side) {
   const pv = mt.preview && mt.preview[side];
   if (!pv) return;
+  if (pv.mode !== mt.state.mode || pv.mode_generation !== mt.state.mode_generation) {
+    mtMsg("The trading mode changed after this ticket was priced — review the new preview first", true);
+    mt.preview = null; mtUpdateButtons(); mtSchedulePreview();
+    return;
+  }
   const txt = `${side === "LONG" ? "BUY / LONG" : "SELL / SHORT"} ${pv.contracts} ${pv.symbol} @ ${pv.order_type.toUpperCase()}${pv.resting_limit ? " (resting limit)" : ""}\n` +
     `Leverage ${pv.leverage}x · margin ${inr(pv.required_margin_inr, false)} · value ${inr(pv.notional_inr, false)}\n` +
     `Est. entry ${fmtPx(pv.est_entry_price)} · est. liquidation ${fmtPx(pv.est_liquidation_price)}\n` +
-    `SL ${pv.sl_price ?? "none"} · TP ${pv.tp_price ?? "none"}${pv.trail_amount ? ` · trail ${pv.trail_amount}` : ""}\n\nPlace this ${(mt.state.mode || "paper").toUpperCase()} order?`;
+    `SL ${pv.sl_price ?? "none"} · TP ${pv.tp_price ?? "none"}${pv.trail_amount ? ` · trail ${pv.trail_amount}` : ""}\n\nPlace this ${(pv.mode || "paper").toUpperCase()} order?`;
+  let typed = null;
   if (pv.real_money) {
-    const typed = prompt(`⚠ REAL MONEY ORDER on Delta Exchange India\n\n${txt}\n\nType LIVE to send it:`);
+    typed = prompt(`⚠ REAL MONEY ORDER on Delta Exchange India\n\n${txt}\n\nType LIVE to send it:`);
     if (typed !== "LIVE") { mtMsg("Live order cancelled"); return; }
   } else if (!confirm(txt)) return;
   mt.busy = true; mtUpdateButtons();
+  // one id per ticket submission: a retry after a network error reuses it, so the server never opens it twice
+  mt.requestId = mt.requestId || mtNewRequestId();
   try {
-    const r = await api("/api/manual/order", { method: "POST", body: JSON.stringify(mtReadOrder(side)) });
+    const body = { ...mtReadOrder(side), ...mtBinding(pv, typed), client_request_id: mt.requestId };
+    const r = await api("/api/manual/order", { method: "POST", body: JSON.stringify(body) });
+    mt.requestId = null;
     const f = r.fill || {};
     const ex = r.exchange || {};
     const px = f.price || ex.price;
     mtMsg(`${side} ${pv.symbol} [${(r.mode || mt.state.mode || "paper").toUpperCase()}]: ${r.result}${px ? ` @ ${fmtPx(px)}` : ""}${r.result === "resting" ? ` (limit ${req_limit(pv)})` : ""}${ex.exchange_order_id ? ` · order ${ex.exchange_order_id}` : ""}`);
     toast(`Manual ${side} ${pv.symbol}: ${r.result}`);
   } catch (e) {
+    if (e.status) mt.requestId = null;  // the server answered: the next click is a new request
     mtMsg(`Order failed: ${e.message}`, true);
     toast(`Order failed: ${e.message}`, true);
   } finally {
@@ -1128,8 +1153,10 @@ function mtRender(s, forceChart) {
       <td class="l"><button class="btn btn-xs" data-cancel="${esc(o.intent_id || o.exchange_order_id)}" ${disabled ? "disabled" : ""}>Cancel</button>${o.external ? ' <span class="muted">exchange</span>' : ""}</td></tr>`).join("")
       : `<tr><td class="l muted" colspan="8">No resting limit orders</td></tr>`) + "</tbody>";
   $("mtPending").querySelectorAll("[data-cancel]").forEach((b) => { b.onclick = async () => {
-    if (mt.state.real_money && !confirm(`Cancel LIVE order ${b.dataset.cancel} on Delta Exchange India?`)) return;
-    try { await api(`/api/manual/order/${b.dataset.cancel}`, { method: "DELETE" }); toast("Order cancelled"); } catch (e) { toast(e.message, true); }
+    let typed = null;
+    if (mt.state.real_money && !(typed = mtLiveConfirm(`cancel LIVE order ${b.dataset.cancel} on Delta Exchange India?`))) return;
+    const q = new URLSearchParams(Object.entries(mtBinding(mt.state, typed)).filter(([, v]) => v !== null && v !== undefined));
+    try { await api(`/api/manual/order/${b.dataset.cancel}?${q}`, { method: "DELETE" }); toast("Order cancelled"); } catch (e) { toast(e.message, true); }
     mtLoadState(true);
   }; });
 
@@ -1194,6 +1221,9 @@ async function mtSaveProtect(ev) {
   if ($("mtPClearSl").checked) body.clear_sl = true; else if (sl > 0) body.sl_price = sl;
   if ($("mtPClearTp").checked) body.clear_tp = true; else if (tp > 0) body.tp_price = tp;
   if ($("mtPTrail").value !== "") body.trail_amount = Number($("mtPTrail").value);
+  let typed = null;
+  if (mt.state.real_money && !(typed = mtLiveConfirm(`change SL/TP of the LIVE ${mt.protectSym} position on Delta Exchange India?`))) return;
+  Object.assign(body, mtBinding(mt.state, typed));
   try {
     await api(`/api/manual/position/${mt.protectSym}/protection`, { method: "PUT", body: JSON.stringify(body) });
     $("mtProtectDialog").close();
@@ -1205,11 +1235,14 @@ async function mtSaveProtect(ev) {
 async function mtClose(sym, contracts) {
   const p = mt.state.positions.find((x) => x.symbol === sym);
   const q = `Close ${contracts ?? p.contracts} of ${p.contracts} ${sym} ${p.side} at market (reduce-only)?`;
+  let typed = null;
   if (mt.state.real_money) {
-    if (prompt(`⚠ REAL MONEY — ${q}\n\nType LIVE to send it:`) !== "LIVE") return;
+    if (!(typed = mtLiveConfirm(q))) return;
   } else if (!confirm(q)) return;
+  const body = { ...mtBinding(mt.state, typed), client_request_id: mtNewRequestId() };
+  if (contracts) body.contracts = contracts;
   try {
-    const r = await api(`/api/manual/position/${sym}/close`, { method: "POST", body: JSON.stringify(contracts ? { contracts } : {}) });
+    const r = await api(`/api/manual/position/${sym}/close`, { method: "POST", body: JSON.stringify(body) });
     const t = r.trade || {};
     mtMsg(`${sym}: ${r.result} @ ${fmtPx(t.exit_price)} · net ${inr(t.net_pnl_inr)} · ${r.remaining} left`);
     toast(`${sym} closed: net ${inr(t.net_pnl_inr)}`);
@@ -1238,6 +1271,7 @@ function mtRenderModeBar(s) {
   const tag = mode === "live" ? ["LIVE — REAL MONEY (Delta India)", "badge-live-real"] :
     mode === "testnet" ? ["TESTNET — Delta India demo", "badge-testnet"] : [`PAPER — Virtual ${inr(ee_capital(s), false)}`, "badge-paper-blue"];
   setBadge("mtModeTag", tag[0], tag[1]);
+  $("mtModeGen").textContent = `mode #${s.mode_generation ?? 0}`;
   $("manualView").classList.toggle("real-money", mode === "live");
   $("mtTrail").disabled = mode !== "paper";
   $("mtTrail").placeholder = mode === "paper" ? "e.g. 1.5" : "paper only";
@@ -1255,7 +1289,8 @@ async function mtSwitchMode(mode) {
   try {
     const r = await api("/api/manual/mode", { method: "POST", body: JSON.stringify(body) });
     toast(`Manual mode: ${r.mode.toUpperCase()} (journal ${r.journal.split(/[\\/]/).pop()})`);
-    mt.preview = null;
+    mt.preview = null;  // tickets priced in the old mode are stale (the server would refuse them anyway)
+    mt.requestId = null;
     await mtLoadState(true);
     mtSchedulePreview();
     if (mode !== "paper") mtVerify();

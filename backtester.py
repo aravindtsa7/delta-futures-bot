@@ -66,6 +66,29 @@ MarkFillMode = Literal["trigger", "traded"]
 MARKET_EXITS = {"SL", "BE", "TSL", "OPP", "XSIG", "DAILY", "END"}
 WALLET_FIELDS = ("initial_capital_inr", "usd_inr_rate", "gst_rate", "max_daily_loss_pct")
 
+# Canonical trade-ledger schema (the keys _Sim._close writes), so a zero-trade run still has every column (F11).
+TRADE_COLUMNS: dict[str, str] = {
+    "trade_id": "int64", "symbol": "object", "side": "object", "signal_bar": "datetime64[ns, UTC]",
+    "entry_time": "datetime64[ns, UTC]", "exit_time": "datetime64[ns, UTC]", "minutes_held": "int64", "contracts": "int64",
+    "contract_value": "float64", "entry_price": "float64", "exit_price": "float64", "raw_entry_price": "float64",
+    "raw_exit_price": "float64", "slippage_bps": "float64", "slippage_usd": "float64", "risk_usd": "float64",
+    "risk_pct_of_equity": "float64", "sl_pct": "float64", "atr_at_signal": "float64", "initial_sl": "float64",
+    "final_sl": "float64", "be_price": "float64", "tp_price": "float64", "exit_reason": "object",
+    "notional_entry_usd": "float64", "notional_exit_usd": "float64", "margin_usd": "float64",
+    "equity_at_entry_usd": "float64", "available_at_entry_usd": "float64", "risk_contracts": "int64",
+    "margin_cap_contracts": "int64", "min_lot_floor": "int64", "gross_pnl_usd": "float64", "entry_fee_rate": "float64",
+    "exit_fee_rate": "float64", "entry_fee_usd": "float64", "exit_fee_usd": "float64", "fees_usd": "float64",
+    "gst_usd": "float64", "funding_usd": "float64", "funding_events": "int64", "net_pnl_usd": "float64",
+    "net_pnl_inr": "float64", "equity_after_inr": "float64", "ambiguous_1m": "bool",
+}
+FUNDING_COLUMNS = ["trade_id", "symbol", "time", "side", "contracts", "contract_value", "mark_price", "notional_usd",
+                   "funding_rate", "funding_rate_pct", "cashflow_usd", "cashflow_inr"]
+
+
+def empty_trades() -> pd.DataFrame:
+    """A zero-row trade ledger with the full canonical schema."""
+    return pd.DataFrame({c: pd.Series(dtype=t) for c, t in TRADE_COLUMNS.items()})
+
 
 # --------------------------------------------------------------------------- #
 # Config / product
@@ -416,8 +439,8 @@ class Backtester:
         sim = _Sim(self, states, t, rate)
         sim.loop(entry_idx)
 
-        trades = pd.DataFrame(sim.trades)
-        funding = pd.DataFrame(sim.fund_rows)
+        trades = pd.DataFrame(sim.trades) if sim.trades else empty_trades()
+        funding = pd.DataFrame(sim.fund_rows) if sim.fund_rows else pd.DataFrame(columns=FUNDING_COLUMNS)
         equity = pd.Series(sim.equity, index=index, name="equity_inr")
         n_signals = sum(len(s.entry_map) for s in states)
         summary = _summarise(cfg, trades, funding, equity, sim.counters, n_signals, len(legs))
@@ -773,7 +796,8 @@ def audit_result(r: BacktestResult, tol: float = 1e-9) -> list[str]:
 
     fund_by_trade = r.funding.groupby("trade_id")["cashflow_usd"].sum() if len(r.funding) else pd.Series(dtype=float)
     last_exit: dict[str, pd.Timestamp] = {}
-    for tr in r.trades.sort_values("entry_time").itertuples():
+    rows = () if r.trades.empty else r.trades.sort_values("entry_time").itertuples()  # zero trades: identity only
+    for tr in rows:
         p = r.products[tr.symbol]
         cfg = r.leg_configs.get(tr.symbol, r.config)
         bt = Backtester(cfg)
