@@ -58,7 +58,7 @@ import data_manager as dm
 import strategies
 from config import settings
 
-FeeMode = Literal["taker", "taker_maker_tp", "maker"]
+FeeMode = Literal["taker", "taker_maker_tp", "maker", "maker_maker"]
 TriggerSource = Literal["trade", "mark"]
 StopMode = Literal["pct", "atr"]
 MarkFillMode = Literal["trigger", "traded"]
@@ -129,8 +129,8 @@ class BacktestConfig:
             raise ValueError("slippage_bps must be in [0, 100]")
         if self.mark_fill_mode not in ("trigger", "traded"):
             raise ValueError("mark_fill_mode must be 'trigger' or 'traded'")
-        if self.fee_mode not in ("taker", "taker_maker_tp", "maker"):
-            raise ValueError("fee_mode must be 'taker', 'taker_maker_tp' or 'maker'")
+        if self.fee_mode not in ("taker", "taker_maker_tp", "maker", "maker_maker"):
+            raise ValueError("fee_mode must be 'taker', 'taker_maker_tp', 'maker' or 'maker_maker'")
         if self.trigger_source not in ("trade", "mark"):
             raise ValueError("trigger_source must be 'trade' or 'mark'")
         if self.sl_mode not in ("pct", "atr"):
@@ -151,10 +151,10 @@ class BacktestConfig:
     # -- fees ---------------------------------------------------------------- #
     @property
     def entry_fee_rate(self) -> float:
-        return settings.MAKER_FEE if self.fee_mode == "maker" else settings.TAKER_FEE
+        return settings.MAKER_FEE if self.fee_mode in ("maker", "maker_maker") else settings.TAKER_FEE
 
     def exit_fee_rate(self, reason: str) -> float:
-        if reason == "TP" and self.fee_mode in ("taker_maker_tp", "maker"):
+        if reason == "TP" and self.fee_mode in ("taker_maker_tp", "maker", "maker_maker"):
             return settings.MAKER_FEE
         return settings.TAKER_FEE
 
@@ -491,7 +491,7 @@ class _Sim:
     def _open(self, s: _LegState, i: int, direction: int, sig_t: int) -> None:
         bt, cfg, product = s.bt, s.cfg, s.leg.product
         raw_px = s.o[i]
-        px = cfg.exec_price(raw_px, direction)  # entry buys for longs, sells for shorts
+        px = raw_px if cfg.fee_mode == "maker_maker" else cfg.exec_price(raw_px, direction)  # entry buys for longs, sells for shorts
         atr_v = s.atr_map.get(sig_t, float("nan"))
         pcts = cfg.stop_pcts(px, atr_v)
         if pcts is None or (cfg.trailing_atr_mult > 0 and not atr_v > 0):
@@ -524,7 +524,7 @@ class _Sim:
     def _close(self, s: _LegState, i: int, raw_price: float, reason: str, ambiguous: bool = False) -> None:
         cfg, rate, p = s.cfg, self.rate, s.pos
         qty = p.contracts * s.cv
-        price = cfg.exec_price(raw_price, -p.direction)  # exit sells longs, buys back shorts
+        price = raw_price if (reason == "TP" and cfg.fee_mode == "maker_maker") else cfg.exec_price(raw_price, -p.direction)  # exit sells longs, buys back shorts
         slippage = qty * (abs(p.entry_price - p.raw_entry_price) + abs(raw_price - price))
         exit_rate = cfg.exit_fee_rate(reason)
         gross = p.direction * qty * (price - p.entry_price)

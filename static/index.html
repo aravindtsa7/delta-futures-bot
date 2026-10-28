@@ -9,47 +9,31 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark">Δ</span> Delta Futures Lab</div>
-    <span id="modeBadge" class="badge badge-research">RESEARCH MODE — LIVE TRADING DISABLED</span>
-    <span id="envBadge" class="badge badge-env">…</span>
+    <div class="brand"><span class="brand-mark">D</span> Delta Futures Lab</div>
     <nav class="view-switch" aria-label="View">
-      <button class="vbtn active" data-view="lab">Backtest Lab</button>
+      <button class="vbtn active" data-view="lab">Research Lab</button>
       <button class="vbtn" data-view="bot">Bot Operations</button>
       <button class="vbtn" data-view="manual">Manual Trade</button>
     </nav>
-    <span id="botBadge" class="badge badge-bot-off" title="Bot runner status">BOT STOPPED</span>
-    <div id="coverage" class="coverage"></div>
+    <div id="coverage" class="coverage hidden"></div>
+    <span id="envBadge" class="badge badge-env hidden">…</span>
+    <span id="botBadge" class="badge badge-bot-off hidden" title="Bot runner status">BOT STOPPED</span>
     <div class="spacer"></div>
     <span id="syncStatus" class="sync-status"></span>
-    <button id="syncBtn" class="btn">⟳ Sync Latest Candles</button>
-    <button id="addCoinBtn" class="btn btn-ghost">+ Add Coin</button>
+    <span id="modeBadge" class="status-pill"><span class="dot"></span> Live trading disabled</span>
+    <button id="syncBtn" class="btn btn-sync">↻ Sync data</button>
+    <button id="addCoinBtn" class="btn btn-ghost btn-sm" title="Add another perpetual futures symbol">+ Coin</button>
   </header>
 
   <div class="layout" id="labView">
-    <aside class="panel controls" aria-label="Backtest controls">
-      <div class="field">
-        <label for="presetSelect">Quick Preset</label>
-        <select id="presetSelect"><option value="">— choose a preset —</option></select>
-        <div id="presetNote" class="hint"></div>
-      </div>
-      <div class="field">
-        <label for="presetCapital">Run presets at</label>
-        <select id="presetCapital">
-          <option value="preset">Preset's own capital (legacy Step 3C presets = ₹10,000)</option>
-          <option value="50000">₹50,000 for every preset</option>
-        </select>
-      </div>
-
-      <div class="field">
-        <span class="label">Mode</span>
-        <div class="seg" role="radiogroup">
-          <label><input type="radio" name="runMode" value="single" checked> Single symbol</label>
-          <label><input type="radio" name="runMode" value="portfolio"> Shared wallet</label>
-        </div>
+    <aside class="panel controls" aria-label="Backtest setup">
+      <div class="setup-header">
+        <div class="setup-title">Backtest setup</div>
+        <div class="setup-sub">Configure your research</div>
       </div>
 
       <div class="field" id="singleSymbolField">
-        <label for="symbolSelect">Symbol</label>
+        <label for="symbolSelect">Coin</label>
         <select id="symbolSelect"></select>
       </div>
       <div class="field hidden" id="portfolioSymbolsField">
@@ -57,139 +41,286 @@
         <div id="symbolChecks" class="checks"></div>
       </div>
 
-      <div id="legsNotice" class="legs-notice hidden"></div>
-
-      <div class="row2">
-        <div class="field">
+      <div class="field">
+        <div class="label-row">
           <label for="strategySelect">Strategy</label>
-          <select id="strategySelect"></select>
+          <div class="strat-btn-group">
+            <button type="button" id="newStrategyBtn" class="btn-link">+ New</button>
+            <span class="muted">·</span>
+            <button type="button" id="editStrategyBtn" class="btn-link">Edit Strategy</button>
+          </div>
         </div>
-        <div class="field">
-          <label for="tfSelect">Timeframe</label>
-          <select id="tfSelect"></select>
-        </div>
+        <select id="strategySelect"></select>
+        <div id="strategyRuleHint" class="hint"></div>
       </div>
 
-      <div class="row2">
-        <div class="field">
-          <label for="daysSelect">Period</label>
-          <select id="daysSelect">
-            <option value="30">30 days</option>
-            <option value="60">60 days</option>
-            <option value="90">90 days</option>
-            <option value="180" selected>180 days</option>
-            <option value="365">365 days</option>
-            <option value="custom">Custom range</option>
-          </select>
+      <div class="field">
+        <label>Timeframe</label>
+        <div class="tf-pills" id="tfPills" role="radiogroup" aria-label="Timeframe">
+          <button type="button" class="tf-pill" data-tf="1m">1m</button>
+          <button type="button" class="tf-pill" data-tf="5m">5m</button>
+          <button type="button" class="tf-pill" data-tf="15m">15m</button>
+          <button type="button" class="tf-pill" data-tf="30m">30m</button>
+          <button type="button" class="tf-pill" data-tf="45m">45m</button>
+          <button type="button" class="tf-pill active" data-tf="1h">1h</button>
+          <button type="button" class="tf-pill" data-tf="4h">4h</button>
         </div>
-        <div class="field">
-          <label for="endSelect">Window end</label>
-          <select id="endSelect">
-            <option value="step3c">Step 3C anchor</option>
-            <option value="step4b">Step 4B anchor</option>
-            <option value="latest">Latest candle</option>
-          </select>
-        </div>
+        <select id="tfSelect" class="hidden"></select>
+      </div>
+
+      <div class="field">
+        <label for="daysSelect">Period</label>
+        <select id="daysSelect">
+          <option value="30">30 days</option>
+          <option value="60">60 days</option>
+          <option value="90">90 days</option>
+          <option value="180" selected>180 days</option>
+          <option value="365">365 days</option>
+          <option value="custom">Custom range</option>
+        </select>
       </div>
       <div class="row2 hidden" id="customRange">
         <div class="field"><label for="startDate">Start (UTC)</label><input id="startDate" type="date"></div>
         <div class="field"><label for="endDate">End (UTC)</label><input id="endDate" type="date"></div>
       </div>
 
-      <div class="section-title">Capital &amp; risk</div>
-      <div class="row2">
-        <div class="field"><label for="capital">Capital (₹)</label><input id="capital" type="number" min="100" step="100" value="50000"></div>
-        <div class="field"><label for="leverage">Leverage</label><input id="leverage" type="number" min="1" max="100" step="1" value="10"></div>
-      </div>
-      <div class="row2">
-        <div class="field"><label for="risk">Risk / trade %</label><input id="risk" type="number" min="0.1" max="100" step="0.1" value="2"></div>
-        <div class="field"><label for="dailyLoss">Daily loss stop %</label><input id="dailyLoss" type="number" min="0" max="100" step="0.5" value="5"></div>
-      </div>
-
-      <div class="section-title">Stops &amp; exits</div>
-      <div class="row3">
-        <div class="field">
-          <label for="stopMode">Stop mode</label>
-          <select id="stopMode"><option value="atr">ATR ×</option><option value="pct">Fixed %</option></select>
-        </div>
-        <div class="field"><label for="slValue">SL</label><input id="slValue" type="number" min="0.1" step="0.1" value="2"></div>
-        <div class="field"><label for="tpValue">TP</label><input id="tpValue" type="number" min="0.1" step="0.1" value="5"></div>
-      </div>
-      <div class="row2">
-        <div class="field">
-          <label for="exitMode">Exit mode</label>
-          <select id="exitMode"></select>
-        </div>
-        <div class="field"><label for="trailAtr">Trail ATR ×</label><input id="trailAtr" type="number" min="0" step="0.5" value="2.5"></div>
-      </div>
-      <div class="row2">
-        <div class="field">
-          <label for="feeMode">Fee mode</label>
-          <select id="feeMode"></select>
-        </div>
-        <div class="field">
-          <label for="triggerSource">SL/TP trigger</label>
-          <select id="triggerSource"></select>
-        </div>
-      </div>
-
-      <div class="section-title">Step 4B filters &amp; costs</div>
-      <div class="row2">
-        <div class="field">
-          <label for="slippage">Slippage (bps/fill)</label>
-          <select id="slippage"><option value="0">0</option><option value="2">2</option><option value="5">5</option></select>
-        </div>
-        <div class="field">
-          <span class="label">Lot sizing</span>
-          <label class="inline"><input type="checkbox" id="strictLot"> Strict risk lot cap</label>
-        </div>
-      </div>
       <div class="field">
-        <label class="inline"><input type="checkbox" id="trend4h"> 4h EMA(50/200) trend filter (closed 4h bars)</label>
-        <label class="inline"><input type="checkbox" id="costGate"> Raw ATR ≥ 2× cost gate</label>
+        <label for="capital">Capital (₹)</label>
+        <div class="input-prefix-wrap">
+          <span class="input-prefix">₹</span>
+          <input id="capital" type="number" min="100" step="500" value="50000">
+        </div>
       </div>
 
-      <button id="runBtn" class="btn btn-primary btn-run">▶ Run Backtest</button>
-      <div id="runInfo" class="hint"></div>
+      <div class="field">
+        <div class="label-row">
+          <label for="risk">Risk per trade (%)</label>
+          <div class="risk-Invalid-pills">
+            <button type="button" class="chip-mini" data-risk="1">1%</button>
+            <button type="button" class="chip-mini active" data-risk="2">2%</button>
+            <button type="button" class="chip-mini" data-risk="5">5%</button>
+          </div>
+        </div>
+        <input id="risk" type="number" min="0.1" max="100" step="0.1" value="2">
+      </div>
+
+      <details class="adv-box" id="advBox">
+        <summary class="adv-summary">
+          <span class="adv-icon">⚙</span>
+          <div class="adv-text">
+            <div class="adv-title">Advanced settings</div>
+            <div class="adv-sub">Leverage, exits, fees &amp; filters</div>
+          </div>
+          <span class="adv-chevron">▾</span>
+        </summary>
+        <div class="adv-body">
+          <div class="row2">
+            <div class="field">
+              <label for="leverage">Leverage (1–200x)</label>
+              <input id="leverage" type="number" min="1" max="200" step="1" value="10">
+            </div>
+            <div class="field">
+              <label for="dailyLoss">Daily loss stop %</label>
+              <input id="dailyLoss" type="number" min="0" max="100" step="0.5" value="5">
+            </div>
+          </div>
+
+          <div class="row2">
+            <div class="field">
+              <label for="slType">Stop Loss Type</label>
+              <select id="slType">
+                <option value="atr_mult">ATR Mult</option>
+                <option value="fixed_pct">Fixed %</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="slValue">SL Value</label>
+              <input id="slValue" type="number" min="0.1" step="0.1" value="2.0">
+            </div>
+          </div>
+
+          <div class="row2">
+            <div class="field">
+              <label for="tpType">Take Profit Type</label>
+              <select id="tpType">
+                <option value="atr_mult">ATR Mult</option>
+                <option value="rr_ratio">R:R Ratio</option>
+                <option value="fixed_pct">Fixed %</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="tpValue">TP Value</label>
+              <input id="tpValue" type="number" min="0.1" step="0.1" value="5.0">
+            </div>
+          </div>
+
+          <div class="row2">
+            <div class="field">
+              <label class="inline" style="margin-top:18px"><input type="checkbox" id="trailEnabled" checked> Trailing Stop</label>
+            </div>
+            <div class="field">
+              <label for="trailAtr">Trail ATR Mult</label>
+              <input id="trailAtr" type="number" min="0" step="0.5" value="2.5">
+            </div>
+          </div>
+
+          <div class="row2">
+            <div class="field">
+              <label for="slippage">Slippage (bps)</label>
+              <select id="slippage"><option value="0">0 bps</option><option value="2">2 bps</option><option value="5">5 bps</option></select>
+            </div>
+            <div class="field">
+              <label for="feeMode">Fee mode</label>
+              <select id="feeMode"></select>
+            </div>
+          </div>
+
+          <div class="row2">
+            <div class="field">
+              <label for="endSelect">Window anchor</label>
+              <select id="endSelect">
+                <option value="latest" selected>Latest candle</option>
+                <option value="step3c">Step 3C anchor</option>
+                <option value="step4b">Step 4B anchor</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="triggerSource">SL/TP trigger</label>
+              <select id="triggerSource"></select>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="inline"><input type="checkbox" id="trend4h"> 4h EMA(50/200) trend filter</label>
+            <label class="inline"><input type="checkbox" id="costGate"> Raw ATR ≥ 2× cost gate</label>
+            <label class="inline"><input type="checkbox" id="strictLot"> Strict risk lot cap</label>
+          </div>
+
+          <!-- Hidden legacy compatibility controls -->
+          <div class="hidden">
+            <select id="stopMode"><option value="atr">ATR ×</option><option value="pct">Fixed %</option></select>
+            <select id="exitMode"></select>
+            <select id="presetSelect"><option value="">—</option></select>
+            <select id="presetCapital"><option value="preset">preset</option></select>
+            <div id="presetNote"></div>
+            <input type="radio" name="runMode" value="single" checked>
+            <input type="radio" name="runMode" value="portfolio">
+            <div id="legsNotice"></div>
+          </div>
+        </div>
+      </details>
+
+      <div id="advFootSummary" class="adv-foot-summary">10x leverage · ATR exits · Fees + GST</div>
+
+      <button id="runBtn" class="btn btn-primary btn-run">▶ Run backtest</button>
+      <div class="research-only-note">ⓘ Research only · No orders placed</div>
+      <div id="runInfo" class="hint" style="margin-top:4px"></div>
     </aside>
 
     <main class="main">
-      <section class="kpis" id="kpis" aria-label="Scorecard"></section>
+      <section class="overview-header">
+        <div>
+          <h1 class="overview-title">Research overview</h1>
+          <div id="overviewSubtitle" class="overview-subtitle">ETHUSD · Select strategy &amp; click Run backtest</div>
+        </div>
+        <div class="overview-actions">
+          <span id="unsavedBadge" class="unsaved-badge">No active run — click Run backtest</span>
+          <button id="saveResultBtn" class="btn btn-save" disabled>🔖 Save result</button>
+        </div>
+      </section>
 
-      <section class="panel charts">
-        <div class="chart-toolbar">
+      <section class="kpis kpis-5" id="kpis" aria-label="Scorecard">
+        <div class="kpi"><div class="kpi-top"><span class="kpi-ico ico-green">📊</span><span class="k-label">Net profit</span></div><div class="k-value">–</div><div class="k-sub">Run backtest to preview</div></div>
+        <div class="kpi"><div class="kpi-top"><span class="kpi-ico ico-blue">%</span><span class="k-label">Win rate</span></div><div class="k-value">–</div><div class="k-sub">0 of 0 trades</div></div>
+        <div class="kpi"><div class="kpi-top"><span class="kpi-ico ico-blue">📈</span><span class="k-label">Profit factor</span></div><div class="k-value">–</div><div class="k-sub">gross wins / losses</div></div>
+        <div class="kpi"><div class="kpi-top"><span class="kpi-ico ico-red">↘</span><span class="k-label">Max drawdown</span></div><div class="k-value">–</div><div class="k-sub">peak-to-trough</div></div>
+        <div class="kpi"><div class="kpi-top"><span class="kpi-ico ico-slate">≣</span><span class="k-label">Total trades</span></div><div class="k-value">–</div><div class="k-sub">closed positions</div></div>
+      </section>
+
+      <section class="panel chart-card" id="priceChartCard">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Price &amp; trades</div>
+            <div id="priceChartSubtitle" class="card-sub">ETHUSD · 1h</div>
+          </div>
           <div id="chartTabs" class="tabs small"></div>
           <div id="legend" class="legend"></div>
           <div class="spacer"></div>
-          <span class="muted">Times in UTC</span>
+          <button id="toggleIndicatorsBtn" class="btn btn-sm btn-card-action">📊 Indicators</button>
+          <button id="expandChartBtn" class="btn btn-sm btn-card-action">⛶ Expand</button>
         </div>
         <div class="chart-wrap">
           <div id="priceChart" class="chart chart-price"></div>
+          <div id="emptyRunOverlay" class="empty-run-overlay">
+            <div class="empty-run-box">
+              <div class="empty-run-title">Ready to backtest</div>
+              <div class="empty-run-text">Select a Coin, pick or tune a Custom Strategy on the left, and click <b>▶ Run backtest</b>. Results are previewed in-memory and only saved when you click <b>🔖 Save result</b>.</div>
+            </div>
+          </div>
           <div id="chartLoading" class="loading hidden"><div class="spinner"></div><span>Running backtest…</span></div>
         </div>
-        <div class="chart-label">Equity (₹, mark-to-market) &amp; drawdown (%)</div>
+      </section>
+
+      <section class="panel chart-card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Equity curve</div>
+            <div id="eqStartLabel" class="card-sub">Starting capital ₹50,000</div>
+          </div>
+          <div class="spacer"></div>
+          <div class="eq-end-box">
+            <div class="card-sub">Ending value</div>
+            <div id="eqEndValue" class="eq-end-val">–</div>
+            <div id="eqEndPct" class="eq-end-pct"></div>
+          </div>
+        </div>
         <div id="equityChart" class="chart chart-equity"></div>
         <div class="attribution">
           Charts powered by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a>
-          — Copyright © TradingView, Inc.
         </div>
       </section>
 
       <section class="panel bottom">
-        <div class="tabs" role="tablist">
-          <button class="tab active" data-tab="ledger" role="tab">Trade Ledger</button>
-          <button class="tab" data-tab="wf" role="tab">Walk-Forward W1 / W2 / W3</button>
-          <button class="tab" data-tab="lb" role="tab">180-Day Leaderboard</button>
+        <div class="tabs-bar">
+          <div class="tabs" role="tablist">
+            <button class="tab active" data-tab="ledger" role="tab">Trades</button>
+            <button class="tab" data-tab="results" role="tab">Backtest Results <span id="savedCountBadge" class="tab-count">0</span></button>
+            <button class="tab" data-tab="wf" role="tab">Walk-forward</button>
+          </div>
+          <div class="spacer"></div>
+          <button id="exportCsv" class="btn btn-sm btn-card-action" disabled>⇩ Export CSV</button>
         </div>
 
         <div class="tab-body" id="tab-ledger">
           <div class="tab-toolbar">
-            <span id="ledgerCount" class="muted">No trades yet</span>
+            <span id="ledgerCount" class="muted">No trades in current preview — click Run backtest</span>
             <div class="spacer"></div>
-            <span class="muted">Click a row to inspect it on the chart</span>
-            <button id="exportCsv" class="btn btn-ghost btn-sm" disabled>⇩ Export CSV</button>
+            <span class="muted">Click any trade row to inspect entry/exit on the chart</span>
           </div>
           <div class="table-wrap"><table id="ledgerTable" class="data"></table></div>
+        </div>
+
+        <div class="tab-body hidden" id="tab-results">
+          <div class="tab-toolbar filters results-filter-bar">
+            <select id="resSymbolFilter" title="Filter by Coin"><option value="">All Coins</option></select>
+            <input id="resStratFilter" type="text" placeholder="Search strategy name…" style="width:180px">
+            <select id="resTfFilter" title="Filter by Timeframe">
+              <option value="">All TFs</option>
+              <option value="1m">1m</option>
+              <option value="5m">5m</option>
+              <option value="15m">15m</option>
+              <option value="30m">30m</option>
+              <option value="45m">45m</option>
+              <option value="1h">1h</option>
+              <option value="4h">4h</option>
+            </select>
+            <input id="resMinWrFilter" type="number" min="0" max="100" step="1" placeholder="Min Win %" style="width:105px">
+            <input id="resMinPfFilter" type="number" min="0" step="0.1" placeholder="Min PF" style="width:95px">
+            <button id="resClearFiltersBtn" class="btn btn-sm btn-ghost">Clear filters</button>
+            <div class="spacer"></div>
+            <span id="resCatalogCount" class="muted">0 saved results</span>
+          </div>
+          <div class="table-wrap"><table id="resultsTable" class="data"></table></div>
         </div>
 
         <div class="tab-body hidden" id="tab-wf">
@@ -197,22 +328,145 @@
           <div class="table-wrap"><table id="wfTable" class="data"></table></div>
         </div>
 
+        <!-- Hidden legacy leaderboard container so nothing breaks -->
         <div class="tab-body hidden" id="tab-lb">
-          <div class="tab-toolbar filters">
-            <select id="lbSource"><option value="step3c">Step 3C · 180d walk-forward</option><option value="step3b">Step 3B · 90d train/test</option></select>
-            <select id="lbSymbol"><option value="">All symbols</option></select>
-            <select id="lbStrategy"><option value="">All strategies</option></select>
-            <select id="lbTf"><option value="">All timeframes</option></select>
-            <label class="inline"><input type="checkbox" id="lbPassing"> Passing filter only</label>
-            <span id="lbCount" class="muted"></span>
-            <div class="spacer"></div>
-            <span class="muted">Click a row to load &amp; run it</span>
-          </div>
-          <div class="table-wrap"><table id="lbTable" class="data"></table></div>
+          <select id="lbSource"><option value="step3c">step3c</option></select>
+          <select id="lbSymbol"><option value="">All</option></select>
+          <select id="lbStrategy"><option value="">All</option></select>
+          <select id="lbTf"><option value="">All</option></select>
+          <input type="checkbox" id="lbPassing">
+          <span id="lbCount"></span>
+          <table id="lbTable" class="data"></table>
         </div>
       </section>
     </main>
   </div>
+
+  <!-- Custom Strategy Builder Modal -->
+  <dialog id="strategyDialog" class="strat-dialog">
+    <form method="dialog" id="strategyForm">
+      <div class="dialog-head">
+        <h3 id="stratDialogTitle">Custom Strategy Builder</h3>
+        <p class="hint">Create or tune a custom indicator strategy and assign it to a specific coin or ALL coins.</p>
+      </div>
+      <input type="hidden" id="stratIdInput">
+      <div class="row2">
+        <div class="field">
+          <label for="stratNameInput">Strategy Name</label>
+          <input id="stratNameInput" type="text" required placeholder="e.g. ETH Momentum Scalp">
+        </div>
+        <div class="field">
+          <label for="stratSymbolInput">Assigned Coin</label>
+          <select id="stratSymbolInput">
+            <option value="ALL">ALL (Available on every coin)</option>
+            <option value="ETHUSD">ETHUSD only</option>
+            <option value="BTCUSD">BTCUSD only</option>
+            <option value="BNBUSD">BNBUSD only</option>
+            <option value="SOLUSD">SOLUSD only</option>
+            <option value="DOGEUSD">DOGEUSD only</option>
+            <option value="XRPUSD">XRPUSD only</option>
+            <option value="SUIUSD">SUIUSD only</option>
+            <option value="ADAUSD">ADAUSD only</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row2">
+        <div class="field">
+          <label for="stratRuleInput">Indicator Rule Type</label>
+          <select id="stratRuleInput">
+            <option value="vol_obv_breakout">📊 Volume: OBV Trend &amp; EMA Cross Breakout</option>
+            <option value="vol_climax_reversal">📊 Volume: Climax / Institutional Absorption Reversal</option>
+            <option value="vol_vwap_expansion">📊 Volume: VWAP Value Area Breakout + 2x RVOL Burst</option>
+            <option value="vol_dryup_breakout">📊 Volume: Dry-Up Compression + Volume Impulse Burst</option>
+            <option value="meme_liq_snapback">💎 Meme/Alt: Liquidation Wick / Stop-Hunt Snapback</option>
+            <option value="meme_pump_ignition">💎 Meme/Alt: Dormant Squeeze + Volume Pump Breakout</option>
+            <option value="alt_ema_wave">💎 Meme/Alt: High-Beta EMA 9/21/50 + VWAP Wave Surfer</option>
+            <option value="scalp_vwap_ema">🚀 1m/5m VWAP + EMA9/21 Micro-Pullback Scalp</option>
+            <option value="scalp_rsi4_bb">🚀 1m/5m Fast RSI(4) + BB Snapback Scalp</option>
+            <option value="scalp_vol_burst">🚀 1m/5m Volume Spike + Micro-Range Ignition Scalp</option>
+            <option value="scalp_ema_ribbon">🚀 1m/5m EMA 8/13/21/55 Ribbon Acceleration Scalp</option>
+            <option value="bb_squeeze_quick_tp">⚡ BB Squeeze + Quick Target Harvester</option>
+            <option value="ema_pullback_scalp">⚡ Trend EMA Pullback Bounce Harvester</option>
+            <option value="bb_rsi_snapback">⚡ BB + RSI Extreme Snapback Harvester</option>
+            <option value="vwap_st_burst">⚡ VWAP + Supertrend Micro-Momentum Burst</option>
+            <option value="bb_squeeze_adx">BB Squeeze + ADX Ignition + Cost Gate + 4h Trend</option>
+            <option value="supertrend_ema_pullback">4h Trend + Supertrend &amp; EMA Pullback</option>
+            <option value="donchian_adx_breakout">Donchian Channel Breakout + ADX + 4h Trend</option>
+            <option value="ema_swing_4h">4h Institutional EMA Swing Trend + Cost Gate</option>
+            <option value="keltner_momentum">Keltner Channel Breakout + MACD Impulse + 4h Trend</option>
+            <option value="ema_cross">EMA Crossover (+ Trend &amp; RSI)</option>
+            <option value="supertrend">Supertrend (+ EMA &amp; ADX)</option>
+            <option value="rsi_reversal">RSI Pullback / Reversal</option>
+            <option value="bollinger_breakout">Bollinger Volume Breakout</option>
+            <option value="macd_cross">MACD Histogram Turn</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="stratTfInput">Default Timeframe</label>
+          <select id="stratTfInput">
+            <option value="1m">1m</option>
+            <option value="5m">5m</option>
+            <option value="15m">15m</option>
+            <option value="30m">30m</option>
+            <option value="45m">45m</option>
+            <option value="1h" selected>1h</option>
+            <option value="4h">4h</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="section-title">Indicator Parameters</div>
+      <div id="stratParamsContainer" class="row3"></div>
+
+      <div class="section-title">Default Capital, Leverage &amp; Exits</div>
+      <div class="row3">
+        <div class="field">
+          <label for="stratCapInput">Capital (₹)</label>
+          <input id="stratCapInput" type="number" min="100" step="500" value="50000">
+        </div>
+        <div class="field">
+          <label for="stratLevInput">Leverage (x)</label>
+          <input id="stratLevInput" type="number" min="1" max="200" step="1" value="10">
+        </div>
+        <div class="field">
+          <label for="stratRiskInput">Risk %</label>
+          <input id="stratRiskInput" type="number" min="0.1" max="100" step="0.1" value="2.0">
+        </div>
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label for="stratSlTypeInput">Stop Loss</label>
+          <div class="row2">
+            <select id="stratSlTypeInput">
+              <option value="atr_mult">ATR Mult</option>
+              <option value="fixed_pct">Fixed %</option>
+            </select>
+            <input id="stratSlValInput" type="number" min="0.1" step="0.1" value="2.0">
+          </div>
+        </div>
+        <div class="field">
+          <label for="stratTpTypeInput">Take Profit</label>
+          <div class="row2">
+            <select id="stratTpTypeInput">
+              <option value="atr_mult">ATR Mult</option>
+              <option value="rr_ratio">R:R Ratio</option>
+              <option value="fixed_pct">Fixed %</option>
+            </select>
+            <input id="stratTpValInput" type="number" min="0.1" step="0.1" value="5.0">
+          </div>
+        </div>
+      </div>
+
+      <div id="stratFormMsg" class="hint"></div>
+      <div class="dialog-actions">
+        <button type="button" id="stratDeleteBtn" class="btn btn-danger">Delete Strategy</button>
+        <div class="spacer"></div>
+        <button type="button" id="stratCancelBtn" class="btn btn-ghost">Cancel</button>
+        <button type="submit" id="stratSaveBtn" class="btn btn-primary">Save Strategy</button>
+      </div>
+    </form>
+  </dialog>
 
   <div id="botView" class="bot-view hidden">
     <section class="panel bot-head">

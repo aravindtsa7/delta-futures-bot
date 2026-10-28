@@ -42,6 +42,8 @@ log = logging.getLogger("app")
 STATIC_DIR = PROJECT_ROOT / "static"
 RESULTS_DIR = settings.data_path / "results"
 APP_SYMBOLS_FILE = settings.data_path / "app_symbols.json"
+STRATEGIES_FILE = settings.data_path / "strategies.json"
+SAVED_BACKTESTS_FILE = settings.data_path / "saved_backtests.json"
 STEP3C_CSV = RESULTS_DIR / "step3c_walkforward.csv"
 STEP3C_ANCHOR = RESULTS_DIR / "step3c_windows.json"
 STEP3B_CSV = RESULTS_DIR / "step3b_grid.csv"
@@ -54,10 +56,10 @@ TAG_STEP4B = "[Step 4B Ablation Variant — ₹50,000]"
 STEP4B_VARIANTS = {"A_baseline": (False, False), "B_trend4h": (True, False), "C_costgate": (False, True), "D_both": (True, True)}
 
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
-TIMEFRAMES = ["3m", "5m", "15m", "1h", "2h", "4h"]
-EXIT_MODES = ["fixed", "BE", "trail", "opp", "BE+opp", "trail+opp"]
-OVERLAY_COLS = ["ema9", "ema21", "ema50", "ema55", "ema100", "ema200", "vwap", "bb_upper", "bb_mid", "bb_lower",
-                "kc_upper", "kc_lower", "dc_high", "dc_low"]
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "45m", "1h", "2h", "4h"]
+EXIT_MODES = ["fixed", "BE", "trail", "BE+trail", "opp", "BE+opp", "trail+opp"]
+OVERLAY_COLS = ["ema9", "ema21", "ema50", "ema55", "ema100", "ema200", "ema_fast", "ema_slow", "ema_trend",
+                "vwap", "bb_upper", "bb_mid", "bb_lower", "kc_upper", "kc_lower", "dc_high", "dc_low"]
 MAX_EQUITY_POINTS = 4000
 
 app = FastAPI(title="Delta Futures Lab", version="1.0")
@@ -168,16 +170,18 @@ def get_history(symbol: str, history_start: pd.Timestamp | None = None) -> pd.Da
 
 
 def get_frame(symbol: str, strategy: str, tf: str,
-              history_start: pd.Timestamp | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+              history_start: pd.Timestamp | None = None,
+              custom_def: dict[str, Any] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     """(bars, strategy output, ATR14) from ``history_start``, cached by data version."""
-    key = (symbol, strategy, tf, history_start, mtime_key(symbol))
+    c_key = json.dumps(custom_def, sort_keys=True) if custom_def else None
+    key = (symbol, strategy, tf, history_start, c_key, mtime_key(symbol))
     with _cache_lock:
         if key in _frame_cache:
             _frame_cache.move_to_end(key)
             return _frame_cache[key]
     df = get_history(symbol, history_start)
     bars = dm.resample_candles(df, tf)
-    out = strategies.generate_signals(strategy, bars)
+    out = strategies.generate_signals(strategy, bars, custom_def=custom_def)
     item = (bars, out, strategies.atr(bars, 14))
     with _cache_lock:
         _frame_cache[key] = item
@@ -283,9 +287,10 @@ def status() -> JSONResponse:
         "products": {s: product_info(s) for s in syms},
         "coverage": {s: coverage(s) for s in syms},
         "strategies": [{"name": s.name, "description": s.description} for s in strategies.STRATEGIES.values()],
+        "custom_strategies": _load_custom_strategies(),
         "timeframes": TIMEFRAMES,
         "exit_modes": EXIT_MODES,
-        "fee_modes": ["taker_maker_tp", "taker", "maker"],
+        "fee_modes": ["taker_maker_tp", "maker_maker", "taker", "maker"],
         "trigger_sources": ["trade", "mark"],
         "defaults": {
             "initial_capital_inr": settings.INITIAL_CAPITAL_INR, "leverage": settings.DEFAULT_LEVERAGE,
@@ -440,7 +445,6 @@ def presets() -> JSONResponse:
     wide = step3c_wide()
     anchor = step3c_anchor()
     end = anchor["end"] if anchor else None
-    # Legacy Step 3C presets stay at ₹10,000 / 2% risk and pin both the window and the warm-up start.
     common = {"days": 180, "end": end, "history_start": anchor.get("warmup_start") if anchor else None,
               "anchor": "step3c", "fee_mode": s3c.FEE_MODE, "initial_capital_inr": 10_000.0, "leverage": 10,
               "risk_per_trade_pct": 2.0, "max_daily_loss_pct": settings.MAX_DAILY_LOSS_PCT,
@@ -550,6 +554,227 @@ def leaderboard(
 
 
 # --------------------------------------------------------------------------- #
+# Custom Strategies & Saved Backtests (Step 10)
+# --------------------------------------------------------------------------- #
+_STARTER_STRATEGIES: list[dict[str, Any]] = [
+    {
+        "id": "strat_ema_cross_scalp",
+        "name": "EMA Crossover Scalp",
+        "symbol": "ALL",
+        "timeframe": "15m",
+        "rule_type": "ema_cross",
+        "params": {"fast_ema": 9, "slow_ema": 21, "trend_ema": 50, "rsi_period": 14, "rsi_ob": 70, "rsi_os": 30},
+        "capital_inr": 50000.0,
+        "leverage": 10,
+        "risk_pct": 2.0,
+        "sl_type": "atr_mult",
+        "sl_value": 2.0,
+        "tp_type": "atr_mult",
+        "tp_value": 4.0,
+        "trail_mult": 2.5,
+    },
+    {
+        "id": "strat_supertrend_trend",
+        "name": "Supertrend Trend",
+        "symbol": "ALL",
+        "timeframe": "1h",
+        "rule_type": "supertrend",
+        "params": {"atr_period": 10, "atr_mult": 3.0, "ema_filter": 200, "rsi_period": 14, "adx_min": 18},
+        "capital_inr": 50000.0,
+        "leverage": 10,
+        "risk_pct": 2.0,
+        "sl_type": "atr_mult",
+        "sl_value": 2.0,
+        "tp_type": "atr_mult",
+        "tp_value": 5.0,
+        "trail_mult": 2.5,
+    },
+    {
+        "id": "strat_bb_breakout_custom",
+        "name": "Bollinger Breakout Custom",
+        "symbol": "ALL",
+        "timeframe": "1h",
+        "rule_type": "bollinger_breakout",
+        "params": {"bb_period": 20, "bb_std": 2.0, "vol_mult": 1.3, "ema_filter": 50},
+        "capital_inr": 50000.0,
+        "leverage": 10,
+        "risk_pct": 2.0,
+        "sl_type": "atr_mult",
+        "sl_value": 2.0,
+        "tp_type": "atr_mult",
+        "tp_value": 5.0,
+        "trail_mult": 2.5,
+    },
+]
+
+
+def _load_custom_strategies() -> list[dict[str, Any]]:
+    with _file_lock:
+        if not STRATEGIES_FILE.exists():
+            STRATEGIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            STRATEGIES_FILE.write_text(json.dumps(_STARTER_STRATEGIES, indent=2), encoding="utf-8")
+            return [dict(s) for s in _STARTER_STRATEGIES]
+        try:
+            data = json.loads(STRATEGIES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+        except Exception:  # noqa: BLE001
+            pass
+        return [dict(s) for s in _STARTER_STRATEGIES]
+
+
+def _save_custom_strategies(items: list[dict[str, Any]]) -> None:
+    with _file_lock:
+        STRATEGIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STRATEGIES_FILE.write_text(json.dumps(clean(items), indent=2), encoding="utf-8")
+
+
+def _find_custom_strategy(identifier: str | None) -> dict[str, Any] | None:
+    if not identifier:
+        return None
+    items = _load_custom_strategies()
+    for s in items:
+        if s.get("id") == identifier or s.get("name") == identifier:
+            return s
+    return None
+
+
+def _load_saved_backtests() -> list[dict[str, Any]]:
+    with _file_lock:
+        if not SAVED_BACKTESTS_FILE.exists():
+            SAVED_BACKTESTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SAVED_BACKTESTS_FILE.write_text("[]", encoding="utf-8")
+            return []
+        try:
+            data = json.loads(SAVED_BACKTESTS_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:  # noqa: BLE001
+            return []
+
+
+def _save_saved_backtests(items: list[dict[str, Any]]) -> None:
+    with _file_lock:
+        SAVED_BACKTESTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SAVED_BACKTESTS_FILE.write_text(json.dumps(clean(items), indent=2), encoding="utf-8")
+
+
+class StrategyCreateRequest(BaseModel):
+    id: str | None = None
+    name: str
+    symbol: str = "ALL"
+    timeframe: str = "1h"
+    rule_type: str = "ema_cross"
+    params: dict[str, Any] = Field(default_factory=dict)
+    capital_inr: float = Field(50000.0, gt=0)
+    leverage: int = Field(10, ge=1, le=200)
+    risk_pct: float = Field(2.0, gt=0, le=100)
+    sl_type: Literal["atr_mult", "fixed_pct"] = "atr_mult"
+    sl_value: float = Field(2.0, gt=0)
+    tp_type: Literal["atr_mult", "rr_ratio", "fixed_pct"] = "atr_mult"
+    tp_value: float = Field(5.0, gt=0)
+    trail_mult: float = Field(2.5, ge=0)
+
+
+class StrategyUpdateRequest(BaseModel):
+    name: str | None = None
+    symbol: str | None = None
+    timeframe: str | None = None
+    rule_type: str | None = None
+    params: dict[str, Any] | None = None
+    capital_inr: float | None = Field(None, gt=0)
+    leverage: int | None = Field(None, ge=1, le=200)
+    risk_pct: float | None = Field(None, gt=0, le=100)
+    sl_type: Literal["atr_mult", "fixed_pct"] | None = None
+    sl_value: float | None = Field(None, gt=0)
+    tp_type: Literal["atr_mult", "rr_ratio", "fixed_pct"] | None = None
+    tp_value: float | None = Field(None, gt=0)
+    trail_mult: float | None = Field(None, ge=0)
+
+
+@app.get("/api/strategies")
+def list_strategies(symbol: str | None = None) -> JSONResponse:
+    items = _load_custom_strategies()
+    if symbol and symbol.strip().upper() != "ALL":
+        sym = symbol.strip().upper()
+        items = [s for s in items if str(s.get("symbol", "ALL")).upper() in (sym, "ALL")]
+    return JSONResponse(clean({"strategies": items}))
+
+
+@app.post("/api/strategies")
+def create_strategy(req: StrategyCreateRequest) -> JSONResponse:
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(422, "strategy name is required")
+    sym = req.symbol.strip().upper() or "ALL"
+    if sym != "ALL":
+        sym = check_symbol(sym)
+    if req.timeframe not in TIMEFRAMES:
+        raise HTTPException(422, f"timeframe must be one of {TIMEFRAMES}")
+    if req.rule_type not in strategies.CUSTOM_RULE_TYPES:
+        raise HTTPException(422, f"rule_type must be one of {strategies.CUSTOM_RULE_TYPES}")
+    items = _load_custom_strategies()
+    sid = req.id or f"strat_{uuid.uuid4().hex[:8]}"
+    obj = {
+        "id": sid,
+        "name": name,
+        "symbol": sym,
+        "timeframe": req.timeframe,
+        "rule_type": req.rule_type,
+        "params": req.params or {},
+        "capital_inr": float(req.capital_inr),
+        "leverage": int(req.leverage),
+        "risk_pct": float(req.risk_pct),
+        "sl_type": req.sl_type,
+        "sl_value": float(req.sl_value),
+        "tp_type": req.tp_type,
+        "tp_value": float(req.tp_value),
+        "trail_mult": float(req.trail_mult),
+    }
+    items = [s for s in items if s.get("id") != sid]
+    items.append(obj)
+    _save_custom_strategies(items)
+    return JSONResponse(clean(obj))
+
+
+@app.put("/api/strategies/{strategy_id}")
+def update_strategy(strategy_id: str, req: StrategyUpdateRequest) -> JSONResponse:
+    items = _load_custom_strategies()
+    target = next((s for s in items if s.get("id") == strategy_id), None)
+    if target is None:
+        raise HTTPException(404, f"strategy {strategy_id!r} not found")
+    patch = {k: v for k, v in req.model_dump().items() if v is not None}
+    if "name" in patch:
+        patch["name"] = patch["name"].strip()
+        if not patch["name"]:
+            raise HTTPException(422, "strategy name cannot be empty")
+    if "symbol" in patch:
+        sym = patch["symbol"].strip().upper()
+        patch["symbol"] = sym if sym == "ALL" else check_symbol(sym)
+    if "timeframe" in patch and patch["timeframe"] not in TIMEFRAMES:
+        raise HTTPException(422, f"timeframe must be one of {TIMEFRAMES}")
+    if "rule_type" in patch and patch["rule_type"] not in strategies.CUSTOM_RULE_TYPES:
+        raise HTTPException(422, f"rule_type must be one of {strategies.CUSTOM_RULE_TYPES}")
+    if "params" in patch and isinstance(target.get("params"), dict):
+        patch["params"] = {**target["params"], **patch["params"]}
+    target.update(patch)
+    _save_custom_strategies(items)
+    with _cache_lock:
+        _frame_cache.clear()
+    return JSONResponse(clean(target))
+
+
+@app.delete("/api/strategies/{strategy_id}")
+def delete_strategy(strategy_id: str) -> JSONResponse:
+    items = _load_custom_strategies()
+    before = len(items)
+    items = [s for s in items if s.get("id") != strategy_id]
+    if len(items) == before:
+        raise HTTPException(404, f"strategy {strategy_id!r} not found")
+    _save_custom_strategies(items)
+    return JSONResponse({"deleted": strategy_id, "ok": True})
+
+
+# --------------------------------------------------------------------------- #
 # Backtest
 # --------------------------------------------------------------------------- #
 class LegSpec(BaseModel):
@@ -557,30 +782,44 @@ class LegSpec(BaseModel):
     strategy: str | None = None
     timeframe: str | None = None
     stop_mode: Literal["pct", "atr"] | None = None
+    sl_type: str | None = None
     sl_value: float | None = None
+    tp_type: str | None = None
     tp_value: float | None = None
     exit_mode: str | None = None
 
 
 class BacktestRequest(BaseModel):
+    symbol: str | None = None
     symbols: list[str] = Field(default_factory=lambda: ["ETHUSD"])
     strategy: str = "bollinger_volume_breakout"
+    strategy_id: str | None = None
+    strategy_name: str | None = None
+    rule_type: str | None = None
+    params: dict[str, Any] | None = None
     timeframe: str = "1h"
     legs: list[LegSpec] | None = None  # per-symbol specialist overrides (portfolio)
     days: int | None = Field(180, ge=1, le=1000)
+    period_days: int | None = None
     start: datetime | None = None
     end: datetime | None = None
     history_start: datetime | None = None  # indicator warm-up start; None = all local history
+    capital_inr: float | None = Field(None, gt=0)
     initial_capital_inr: float = Field(settings.INITIAL_CAPITAL_INR, gt=0)
-    leverage: float = Field(10, ge=1, le=100)
+    leverage: float = Field(10, ge=1, le=200)
+    risk_pct: float | None = Field(None, gt=0, le=100)
     risk_per_trade_pct: float = Field(2.0, gt=0, le=100)
     max_daily_loss_pct: float = Field(5.0, ge=0, le=100)
     stop_mode: Literal["pct", "atr"] = "atr"
+    sl_type: Literal["atr_mult", "fixed_pct", "atr", "pct"] | None = None
     sl_value: float = Field(2.0, gt=0)
+    tp_type: Literal["atr_mult", "rr_ratio", "fixed_pct", "atr", "pct"] | None = None
     tp_value: float = Field(5.0, gt=0)
     exit_mode: str = "trail"
+    trailing_stop: bool | None = None
+    trail_mult: float | None = Field(None, ge=0)
     trail_atr_mult: float = Field(2.5, ge=0)
-    fee_mode: Literal["taker_maker_tp", "taker", "maker"] = "taker_maker_tp"
+    fee_mode: Literal["taker_maker_tp", "taker", "maker", "maker_maker"] = "taker_maker_tp"
     trigger_source: Literal["trade", "mark"] = "trade"
     cooldown_bars: int = Field(1, ge=0, le=100)
     walk_forward_windows: int = Field(3, ge=0, le=12)
@@ -591,13 +830,6 @@ class BacktestRequest(BaseModel):
     cost_gate: bool = False
     strict_lot_cap: bool = False
     mark_fill_mode: Literal["trigger", "traded"] = "trigger"
-
-    @field_validator("strategy")
-    @classmethod
-    def _strategy(cls, v: str) -> str:
-        if v not in strategies.STRATEGIES:
-            raise ValueError(f"unknown strategy; choose from {list(strategies.STRATEGIES)}")
-        return v
 
     @field_validator("timeframe")
     @classmethod
@@ -614,10 +846,49 @@ class BacktestRequest(BaseModel):
         return v
 
 
+def _resolve_strategy_def(strategy_key: str, strategy_id: str | None, rule_type: str | None,
+                          params: dict[str, Any] | None) -> tuple[str, str, dict[str, Any] | None]:
+    """Return (strategy_id_or_key, display_name, custom_def_or_None)."""
+    if rule_type and rule_type in strategies.CUSTOM_RULE_TYPES:
+        cdef = _find_custom_strategy(strategy_id or strategy_key)
+        merged_params = {**(cdef.get("params") or {} if cdef else {}), **(params or {})}
+        sid = (cdef["id"] if cdef else strategy_id) or strategy_key
+        sname = (cdef["name"] if cdef else None) or strategy_key
+        return sid, sname, {"rule_type": rule_type, "params": merged_params}
+
+    cdef = _find_custom_strategy(strategy_id or strategy_key)
+    if cdef is not None:
+        merged_params = {**(cdef.get("params") or {}), **(params or {})}
+        return cdef["id"], cdef["name"], {"rule_type": cdef["rule_type"], "params": merged_params}
+
+    if strategy_key in strategies.STRATEGIES:
+        return strategy_key, strategy_key, None
+
+    raise HTTPException(422, f"unknown strategy {strategy_key!r}")
+
+
 def resolve_legs(req: BacktestRequest) -> list[dict[str, Any]]:
-    base = {"strategy": req.strategy, "timeframe": req.timeframe, "stop_mode": req.stop_mode,
-            "sl_value": req.sl_value, "tp_value": req.tp_value, "exit_mode": req.exit_mode}
-    specs = req.legs or [LegSpec(symbol=s) for s in req.symbols]
+    eff_sl_type = req.sl_type or ("fixed_pct" if req.stop_mode == "pct" else "atr_mult")
+    eff_tp_type = req.tp_type or ("fixed_pct" if eff_sl_type in ("fixed_pct", "pct") else "atr_mult")
+    eff_stop_mode = "pct" if eff_sl_type in ("fixed_pct", "pct") else "atr"
+    eff_exit_mode = req.exit_mode
+    if req.trailing_stop is False and "trail" in eff_exit_mode:
+        eff_exit_mode = "fixed"
+    elif req.trailing_stop is True and "trail" not in eff_exit_mode:
+        eff_exit_mode = "trail"
+
+    base = {
+        "strategy": req.strategy_id or req.strategy,
+        "timeframe": req.timeframe,
+        "stop_mode": eff_stop_mode,
+        "sl_type": "fixed_pct" if eff_sl_type in ("fixed_pct", "pct") else "atr_mult",
+        "sl_value": req.sl_value,
+        "tp_type": "fixed_pct" if eff_tp_type in ("fixed_pct", "pct") else ("rr_ratio" if eff_tp_type == "rr_ratio" else "atr_mult"),
+        "tp_value": req.tp_value,
+        "exit_mode": eff_exit_mode,
+    }
+    syms = [req.symbol] if req.symbol else req.symbols
+    specs = req.legs or [LegSpec(symbol=s) for s in syms]
     if not specs:
         raise HTTPException(422, "no symbols selected")
     legs, seen = [], set()
@@ -630,8 +901,10 @@ def resolve_legs(req: BacktestRequest) -> list[dict[str, Any]]:
             raise HTTPException(422, f"{sym} is not in the symbol list; add it with + Add Coin first")
         seen.add(sym)
         leg = {**base, **{k: v for k, v in spec.model_dump().items() if v is not None}, "symbol": sym}
-        if leg["strategy"] not in strategies.STRATEGIES:
-            raise HTTPException(422, f"unknown strategy {leg['strategy']}")
+        sid, sname, cdef = _resolve_strategy_def(leg["strategy"], req.strategy_id, req.rule_type, req.params)
+        leg["strategy_id"] = sid
+        leg["strategy_name"] = req.strategy_name or sname
+        leg["custom_def"] = cdef
         if leg["timeframe"] not in TIMEFRAMES:
             raise HTTPException(422, f"timeframe must be one of {TIMEFRAMES}")
         if leg["exit_mode"] not in EXIT_MODES:
@@ -640,21 +913,51 @@ def resolve_legs(req: BacktestRequest) -> list[dict[str, Any]]:
     return legs
 
 
-def leg_config(req: BacktestRequest, leg: dict[str, Any]) -> BacktestConfig:
-    if leg["stop_mode"] == "pct":
-        stops = dict(sl_mode="pct", stop_loss_pct=leg["sl_value"], take_profit_pct=leg["tp_value"])
+def leg_config(req: BacktestRequest, leg: dict[str, Any], median_atr_pct: float = 1.0) -> BacktestConfig:
+    cap = float(req.capital_inr if req.capital_inr is not None else req.initial_capital_inr)
+    risk = float(req.risk_pct if req.risk_pct is not None else req.risk_per_trade_pct)
+    trail_m = float(req.trail_mult if req.trail_mult is not None else req.trail_atr_mult)
+    sl_type = leg.get("sl_type") or ("fixed_pct" if leg["stop_mode"] == "pct" else "atr_mult")
+    tp_type = leg.get("tp_type") or ("fixed_pct" if sl_type == "fixed_pct" else "atr_mult")
+    sl_val = float(leg["sl_value"])
+    tp_val = float(leg["tp_value"])
+    atr_pct = max(0.05, float(median_atr_pct or 1.0))
+
+    if sl_type in ("fixed_pct", "pct"):
+        if tp_type == "rr_ratio":
+            tp_pct = sl_val * tp_val
+        elif tp_type in ("atr_mult", "atr"):
+            tp_pct = tp_val * atr_pct
+        else:
+            tp_pct = tp_val
+        stops = dict(sl_mode="pct", stop_loss_pct=sl_val, take_profit_pct=max(0.05, tp_pct))
     else:
-        stops = dict(sl_mode="atr", sl_atr_mult=leg["sl_value"], tp_atr_mult=leg["tp_value"])
+        if tp_type == "rr_ratio":
+            tp_atr = sl_val * tp_val
+        elif tp_type in ("fixed_pct", "pct"):
+            tp_atr = tp_val / atr_pct
+        else:
+            tp_atr = tp_val
+        stops = dict(sl_mode="atr", sl_atr_mult=sl_val, tp_atr_mult=max(0.1, tp_atr))
+
     em = leg["exit_mode"]
+    cparams = (leg.get("custom_def") or {}).get("params") or {}
+    be_flag = ("BE" in em) or bool(cparams.get("breakeven_at_1r", False))
+    sl_min = float(cparams.get("atr_sl_min_pct", 0.35 if leg["timeframe"] in ("1m", "3m", "5m") else 0.8))
+    sl_max = float(cparams.get("atr_sl_max_pct", 4.0))
     try:
-        return BacktestConfig(
-            initial_capital_inr=req.initial_capital_inr, leverage=req.leverage, risk_per_trade_pct=req.risk_per_trade_pct,
+        cfg = BacktestConfig(
+            initial_capital_inr=cap, leverage=min(float(req.leverage), 100.0), risk_per_trade_pct=risk,
             max_daily_loss_pct=req.max_daily_loss_pct, fee_mode=req.fee_mode, trigger_source=req.trigger_source,
-            cooldown_bars=req.cooldown_bars, breakeven_at_1r="BE" in em,
-            trailing_atr_mult=req.trail_atr_mult if "trail" in em else 0.0,
+            cooldown_bars=req.cooldown_bars, breakeven_at_1r=be_flag,
+            trailing_atr_mult=trail_m if "trail" in em else 0.0,
             exit_on_opposite_signal="opp" in em, slippage_bps=req.slippage_bps,
-            allow_min_one_lot=not req.strict_lot_cap, mark_fill_mode=req.mark_fill_mode, **stops,
+            allow_min_one_lot=not req.strict_lot_cap, mark_fill_mode=req.mark_fill_mode,
+            atr_sl_min_pct=sl_min, atr_sl_max_pct=sl_max, **stops,
         )
+        if req.leverage > 100.0:
+            object.__setattr__(cfg, "leverage", float(req.leverage))
+        return cfg
     except ValueError as exc:
         raise HTTPException(422, f"{leg['symbol']}: {exc}") from exc
 
@@ -677,14 +980,17 @@ def chart_payload(symbol: str, tf: str, bars: pd.DataFrame, out: pd.DataFrame, t
     tf_sec = dm.TIMEFRAME_MINUTES[tf] * 60
     m = (bars.index >= start) & (bars.index < end)
     b = bars[m]
+    o = out[m]
+    if len(b) > 5000:
+        b = b.iloc[-5000:]
+        o = o.iloc[-5000:]
     t = b.index.as_unit("s").asi8
     t_list = t.tolist()
-    candles = [{"time": a, "open": o, "high": h, "low": l, "close": c}
-               for a, o, h, l, c in zip(t_list, *(b[k].tolist() for k in ("open", "high", "low", "close")))]
-    volume = [{"time": a, "value": v, "up": c >= o}
-              for a, v, o, c in zip(t_list, b["volume"].tolist(), b["open"].tolist(), b["close"].tolist())]
+    candles = [{"time": a, "open": o_, "high": h, "low": l, "close": c}
+               for a, o_, h, l, c in zip(t_list, *(b[k].tolist() for k in ("open", "high", "low", "close")))]
+    volume = [{"time": a, "value": v, "up": c >= o_}
+              for a, v, o_, c in zip(t_list, b["volume"].tolist(), b["open"].tolist(), b["close"].tolist())]
 
-    o = out[m]
     overlays = []
     for col in OVERLAY_COLS:
         if col in o.columns:
@@ -699,10 +1005,13 @@ def chart_payload(symbol: str, tf: str, bars: pd.DataFrame, out: pd.DataFrame, t
 
     markers = []
     if len(trades) and len(t):
+        min_t = b.index[0]
         def snap(x: pd.Timestamp) -> int:
             k = int(np.searchsorted(t, (ts(x) // tf_sec) * tf_sec, side="right")) - 1
             return int(t[max(k, 0)])
         for tr in trades.itertuples():
+            if tr.exit_time < min_t:
+                continue
             long = tr.side == "LONG"
             markers.append({"time": snap(tr.entry_time), "position": "belowBar" if long else "aboveBar",
                             "shape": "arrowUp" if long else "arrowDown", "color": "#2dd4bf" if long else "#f87171",
@@ -750,8 +1059,9 @@ def trades_payload(trades: pd.DataFrame, rate: float) -> list[dict[str, Any]]:
 @app.post("/api/backtest/run")
 def run_backtest(req: BacktestRequest) -> JSONResponse:
     t0 = time.perf_counter()
+    if req.period_days and not req.start:
+        req.days = req.period_days
     legs_spec = resolve_legs(req)
-    configs = {leg["symbol"]: leg_config(req, leg) for leg in legs_spec}
     history_start = parse_utc(req.history_start)
     data = {leg["symbol"]: get_history(leg["symbol"], history_start) for leg in legs_spec}
 
@@ -770,15 +1080,16 @@ def run_backtest(req: BacktestRequest) -> JSONResponse:
     if start >= end:
         raise HTTPException(422, "empty window: start must be before end")
 
-    legs, frames, filter_stats = [], {}, {}
+    legs, frames, filter_stats, configs = [], {}, {}, {}
     for spec in legs_spec:
         sym = spec["symbol"]
-        bars, out, atr14 = get_frame(sym, spec["strategy"], spec["timeframe"], history_start)
+        bars, out, atr14 = get_frame(sym, spec["strategy"], spec["timeframe"], history_start, spec.get("custom_def"))
+        med_atr_pct = float((atr14 / bars["close"] * 100.0).dropna().median() or 1.0)
+        configs[sym] = leg_config(req, spec, med_atr_pct)
         signal = out["signal"]
         if req.trend_filter_4h or req.cost_gate:
             masks = filter_masks(sym, spec["timeframe"], bars, history_start, req.trend_filter_4h, req.cost_gate,
                                  req.slippage_bps)
-            # Entry fills at bar close (t + tf), so count signal bars whose fill lands inside [start, end).
             tf_delta = pd.Timedelta(minutes=dm.TIMEFRAME_MINUTES[spec["timeframe"]])
             in_win = ((bars.index + tf_delta >= start) & (bars.index + tf_delta < end))
             signal, st = strategies.apply_entry_filters(out, masks, count_mask=in_win)
@@ -786,7 +1097,7 @@ def run_backtest(req: BacktestRequest) -> JSONResponse:
         frames[sym] = (spec, bars, out.assign(signal=signal))
         exits = out["exit_signal"] if "exit_signal" in out.columns else None
         legs.append(Leg(ProductSpec.from_metadata(sym), data[sym], signal, spec["timeframe"],
-                        atr14, spec["strategy"], exits, configs[sym]))
+                        atr14, spec["strategy_name"], exits, configs[sym]))
 
     base_cfg = configs[legs_spec[0]["symbol"]]
     result = Backtester(base_cfg).run_portfolio(legs, start, end)
@@ -810,18 +1121,26 @@ def run_backtest(req: BacktestRequest) -> JSONResponse:
             tr = result.trades[result.trades["symbol"] == sym] if len(result.trades) else result.trades
             charts[sym] = chart_payload(sym, spec["timeframe"], bars, out, tr, start, end)
 
+    leg0 = legs_spec[0]
+    cdef0 = leg0.get("custom_def") or {}
+    clean_legs = [{k: v for k, v in sp.items() if k != "custom_def"} for sp in legs_spec]
     anchor = step3c_anchor()
     payload = {
         "window": {"start": start.isoformat(), "end": end.isoformat(),
                    "days": round((end - start) / pd.Timedelta(days=1), 4),
                    "data_end": data_end.isoformat(),
                    "pinned_to_step3c": bool(anchor and parse_utc(anchor["end"]) == end)},
-        "legs": legs_spec,
+        "legs": clean_legs,
         "config": {
-            "initial_capital_inr": req.initial_capital_inr, "leverage": req.leverage,
-            "risk_per_trade_pct": req.risk_per_trade_pct, "max_daily_loss_pct": req.max_daily_loss_pct,
+            "initial_capital_inr": base_cfg.initial_capital_inr, "capital_inr": base_cfg.initial_capital_inr,
+            "leverage": base_cfg.leverage, "risk_per_trade_pct": base_cfg.risk_per_trade_pct,
+            "risk_pct": base_cfg.risk_per_trade_pct, "max_daily_loss_pct": req.max_daily_loss_pct,
+            "sl_type": leg0["sl_type"], "sl_value": leg0["sl_value"],
+            "tp_type": leg0["tp_type"], "tp_value": leg0["tp_value"],
+            "strategy_id": leg0["strategy_id"], "strategy_name": leg0["strategy_name"],
+            "rule_type": cdef0.get("rule_type"), "params": cdef0.get("params") or {},
             "fee_mode": req.fee_mode, "trigger_source": req.trigger_source, "cooldown_bars": req.cooldown_bars,
-            "trail_atr_mult": req.trail_atr_mult, "usd_inr_rate": base_cfg.usd_inr_rate, "gst_rate": base_cfg.gst_rate,
+            "trail_atr_mult": base_cfg.trailing_atr_mult, "usd_inr_rate": base_cfg.usd_inr_rate, "gst_rate": base_cfg.gst_rate,
         },
         "summary": summary_view(result),
         "filters": {"trend_filter_4h": req.trend_filter_4h, "cost_gate": req.cost_gate,
@@ -836,3 +1155,115 @@ def run_backtest(req: BacktestRequest) -> JSONResponse:
         "elapsed_ms": round((time.perf_counter() - t0) * 1000),
     }
     return JSONResponse(clean(payload))
+
+
+class SaveResultRequest(BaseModel):
+    id: str | None = None
+    strategy_id: str | None = None
+    strategy_name: str | None = None
+    symbol: str | None = None
+    timeframe: str | None = None
+    period_days: float | None = None
+    capital_inr: float | None = None
+    leverage: float | None = None
+    risk_pct: float | None = None
+    sl_type: str | None = None
+    sl_value: float | None = None
+    tp_type: str | None = None
+    tp_value: float | None = None
+    trail_mult: float | None = None
+    rule_type: str | None = None
+    params: dict[str, Any] | None = None
+    net_pnl_inr: float | None = None
+    return_pct: float | None = None
+    win_rate_pct: float | None = None
+    profit_factor: float | str | None = None
+    max_dd_pct: float | None = None
+    total_trades: int | None = None
+    trades: list[dict[str, Any]] | None = None
+    summary: dict[str, Any] | None = None
+    config: dict[str, Any] | None = None
+    window: dict[str, Any] | None = None
+
+
+@app.post("/api/backtest/save_result")
+def save_backtest_result(req: SaveResultRequest) -> JSONResponse:
+    s = req.summary or {}
+    c = req.config or {}
+    w = req.window or {}
+    rid = req.id or f"bt_{uuid.uuid4().hex[:10]}"
+    entry = {
+        "id": rid,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "strategy_id": req.strategy_id or c.get("strategy_id") or "custom",
+        "strategy_name": req.strategy_name or c.get("strategy_name") or req.strategy_id or "Custom Strategy",
+        "symbol": (req.symbol or "ETHUSD").strip().upper(),
+        "timeframe": req.timeframe or "1h",
+        "period_days": round(float(req.period_days if req.period_days is not None else (w.get("days") or 180)), 1),
+        "capital_inr": float(req.capital_inr if req.capital_inr is not None else (c.get("capital_inr") or c.get("initial_capital_inr") or 50000.0)),
+        "leverage": float(req.leverage if req.leverage is not None else (c.get("leverage") or 10)),
+        "risk_pct": float(req.risk_pct if req.risk_pct is not None else (c.get("risk_pct") or c.get("risk_per_trade_pct") or 2.0)),
+        "sl_type": req.sl_type or c.get("sl_type") or "atr_mult",
+        "sl_value": float(req.sl_value if req.sl_value is not None else (c.get("sl_value") or 2.0)),
+        "tp_type": req.tp_type or c.get("tp_type") or "atr_mult",
+        "tp_value": float(req.tp_value if req.tp_value is not None else (c.get("tp_value") or 5.0)),
+        "trail_mult": float(req.trail_mult if req.trail_mult is not None else (c.get("trail_atr_mult") or 2.5)),
+        "rule_type": req.rule_type or c.get("rule_type"),
+        "params": req.params if req.params is not None else (c.get("params") or {}),
+        "net_pnl_inr": float(req.net_pnl_inr if req.net_pnl_inr is not None else (s.get("net_pnl_inr") or 0.0)),
+        "return_pct": float(req.return_pct if req.return_pct is not None else (s.get("net_return_pct") or 0.0)),
+        "win_rate_pct": float(req.win_rate_pct if req.win_rate_pct is not None else (s.get("win_rate_pct") or 0.0)),
+        "profit_factor": req.profit_factor if req.profit_factor is not None else (s.get("profit_factor") or 0.0),
+        "max_dd_pct": float(req.max_dd_pct if req.max_dd_pct is not None else (s.get("max_drawdown_pct") or 0.0)),
+        "total_trades": int(req.total_trades if req.total_trades is not None else (s.get("total_trades") or 0)),
+        "summary": s,
+        "trades": (req.trades or [])[:500],
+    }
+    items = _load_saved_backtests()
+    items = [r for r in items if r.get("id") != rid]
+    items.insert(0, entry)
+    _save_saved_backtests(items)
+    return JSONResponse(clean(entry))
+
+
+@app.get("/api/backtest/results")
+def list_backtest_results(
+    symbol: str | None = None,
+    strategy_name: str | None = None,
+    timeframe: str | None = None,
+    min_win_rate: float | None = None,
+    min_pf: float | None = None,
+) -> JSONResponse:
+    items = _load_saved_backtests()
+    out = []
+    for r in items:
+        if symbol and symbol.strip().upper() not in ("", "ALL"):
+            if str(r.get("symbol", "")).upper() != symbol.strip().upper():
+                continue
+        if strategy_name and strategy_name.strip():
+            if strategy_name.strip().lower() not in str(r.get("strategy_name", "")).lower():
+                continue
+        if timeframe and timeframe.strip().lower() not in ("", "all"):
+            if str(r.get("timeframe", "")).lower() != timeframe.strip().lower():
+                continue
+        if min_win_rate is not None:
+            if float(r.get("win_rate_pct") or 0.0) < float(min_win_rate):
+                continue
+        if min_pf is not None:
+            raw_pf = r.get("profit_factor")
+            pf_val = float("inf") if raw_pf == "inf" else float(raw_pf or 0.0)
+            if pf_val < float(min_pf):
+                continue
+        out.append(r)
+    return JSONResponse(clean({"results": out, "total": len(out)}))
+
+
+@app.delete("/api/backtest/results/{result_id}")
+def delete_backtest_result(result_id: str) -> JSONResponse:
+    items = _load_saved_backtests()
+    before = len(items)
+    items = [r for r in items if r.get("id") != result_id]
+    if len(items) == before:
+        raise HTTPException(404, f"saved result {result_id!r} not found")
+    _save_saved_backtests(items)
+    return JSONResponse({"deleted": result_id, "ok": True})

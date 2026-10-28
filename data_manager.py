@@ -42,7 +42,11 @@ CHUNK_SECONDS = CHUNK_MINUTES * MINUTE
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 RAW_COLUMNS = ["time", *OHLCV_COLUMNS]
 
-TIMEFRAME_MINUTES: dict[str, int] = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "1h": 60, "2h": 120, "4h": 240}
+TIMEFRAME_MINUTES: dict[str, int] = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "45m": 45, "1h": 60, "2h": 120, "4h": 240
+}
+TIMEFRAME_RULES: dict[str, str] = {tf: f"{m}min" for tf, m in TIMEFRAME_MINUTES.items()}
+TIMEFRAME_SECONDS: dict[str, int] = {tf: m * 60 for tf, m in TIMEFRAME_MINUTES.items()}
 
 # HTTP pacing / retry policy
 MIN_REQUEST_INTERVAL_SECONDS = 0.25
@@ -513,3 +517,29 @@ def resample_candles(df_1m: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         "dropped_empty_buckets": int((counts == 0).sum()),
     }
     return out
+
+
+def resample_symbol(symbol_or_df: str | pd.DataFrame, timeframe: str, days: int | None = None) -> pd.DataFrame:
+    df = load_unified_1m_dataset(symbol_or_df, days=days) if isinstance(symbol_or_df, str) else symbol_or_df
+    return resample_candles(df, timeframe)
+
+
+get_resampled = resample_symbol
+
+
+_orig_resample_candles = resample_candles
+
+
+def resample_candles(df_1m: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    if timeframe == "1m":
+        if not isinstance(df_1m.index, pd.DatetimeIndex):
+            raise TypeError("df_1m must have a DatetimeIndex (use load_unified_1m_dataset)")
+        out = df_1m.copy(deep=False)
+        out.attrs = {
+            "symbol": df_1m.attrs.get("symbol"),
+            "timeframe": "1m",
+            "dropped_partial_buckets": 0,
+            "dropped_empty_buckets": 0,
+        }
+        return out
+    return _orig_resample_candles(df_1m, timeframe)

@@ -1,13 +1,17 @@
 "use strict";
 
-/* Delta Futures Lab - research & backtesting dashboard (vanilla JS + TradingView Lightweight Charts v4). */
+/* Delta Futures Lab - Step 10 Custom Strategy Builder, Save-Only Results Catalog & Modern Research Lab UI. */
 
 const $ = (id) => document.getElementById(id);
 const state = {
   status: null,
+  customStrategies: [],
+  savedResults: [],
   presets: [],
   anchor: null,
   result: null,
+  resultSaved: false,
+  indicatorsVisible: true,
   chartSymbol: null,
   legsOverride: null,
   selectedTrade: null,
@@ -18,14 +22,210 @@ const state = {
   lb: { source: "step3c", sort: "net", desc: true, columns: [], rows: [], days: 180 },
 };
 
-const COLORS = { up: "#22c58b", down: "#f2555a", accent: "#4f8cff", muted: "#7f8a9c", grid: "#18202b", border: "#232a37", panel: "#10141b" };
+const COLORS = { up: "#10b981", down: "#f43f5e", accent: "#3b82f6", muted: "#94a3b8", grid: "#161f30", border: "#1e293b", panel: "#111827" };
 const OVERLAY_STYLE = {
   ema9: { color: "#f5d76e" }, ema21: { color: "#f59e0b" }, ema50: { color: "#a78bfa" }, ema55: { color: "#c084fc" },
-  ema100: { color: "#60a5fa" }, ema200: { color: "#e879f9", width: 2 }, vwap: { color: "#fbbf24", style: 2 },
-  bb_upper: { color: "#38bdf8" }, bb_mid: { color: "#64748b", style: 2 }, bb_lower: { color: "#38bdf8" },
+  ema100: { color: "#60a5fa" }, ema200: { color: "#e879f9", width: 2 },
+  ema_fast: { color: "#38bdf8", width: 2 }, ema_slow: { color: "#f59e0b", width: 2 }, ema_trend: { color: "#a78bfa", style: 2 },
+  vwap: { color: "#fbbf24", style: 2 },
+  bb_upper: { color: "#38bdf8" }, bb_mid: { color: "#a78bfa", style: 2 }, bb_lower: { color: "#38bdf8" },
   kc_upper: { color: "#f472b6", style: 2 }, kc_lower: { color: "#f472b6", style: 2 },
   dc_high: { color: "#34d399", style: 1 }, dc_low: { color: "#fb7185", style: 1 },
-  supertrend_up: { color: "#22c58b", width: 2 }, supertrend_down: { color: "#f2555a", width: 2 },
+  supertrend_up: { color: "#10b981", width: 2 }, supertrend_down: { color: "#f43f5e", width: 2 },
+};
+
+const RULE_PARAM_DEFS = {
+  vol_obv_breakout: [
+    { key: "obv_span", label: "OBV EMA Span", def: 20, step: 1, min: 5 },
+    { key: "rvol_min", label: "Min RVOL ×", def: 1.3, step: 0.1, min: 0.8 },
+    { key: "dc_period", label: "Breakout Bars (N)", def: 12, step: 1, min: 0 },
+    { key: "ema_filter", label: "Trend EMA", def: 50, step: 5, min: 10 },
+    { key: "adx_min", label: "Min ADX", def: 18, step: 1, min: 5 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  vol_climax_reversal: [
+    { key: "climax_mult", label: "Climax RVOL ×", def: 2.8, step: 0.1, min: 1.5 },
+    { key: "wick_ratio", label: "Min Absorption Wick", def: 0.40, step: 0.05, min: 0.15 },
+    { key: "bb_period", label: "BB Period", def: 20, step: 1, min: 5 },
+    { key: "rsi_os", label: "RSI Oversold", def: 38, step: 1, min: 10 },
+    { key: "rsi_ob", label: "RSI Overbought", def: 62, step: 1, min: 50 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  vol_vwap_expansion: [
+    { key: "rvol_min", label: "Min RVOL Burst ×", def: 2.0, step: 0.1, min: 1.0 },
+    { key: "ema_period", label: "EMA Period", def: 20, step: 1, min: 5 },
+    { key: "body_ratio", label: "Min Body Ratio", def: 0.50, step: 0.05, min: 0.2 },
+    { key: "adx_min", label: "Min ADX", def: 20, step: 1, min: 5 },
+    { key: "dc_period", label: "Breakout Bars (N)", def: 10, step: 1, min: 0 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  vol_dryup_breakout: [
+    { key: "dryup_bars", label: "Dry-Up Bars", def: 3, step: 1, min: 2 },
+    { key: "dryup_max_ratio", label: "Max Dry-Up RVOL", def: 0.65, step: 0.05, min: 0.2 },
+    { key: "burst_mult", label: "Impulse RVOL ×", def: 2.4, step: 0.1, min: 1.2 },
+    { key: "dc_period", label: "Breakout Bars (N)", def: 15, step: 1, min: 4 },
+    { key: "adx_min", label: "Min ADX", def: 18, step: 1, min: 5 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  meme_liq_snapback: [
+    { key: "bb_period", label: "BB Period", def: 20, step: 1, min: 5 },
+    { key: "bb_std", label: "BB StdDev", def: 2.0, step: 0.1, min: 0.5 },
+    { key: "rsi_period", label: "Fast RSI Period", def: 7, step: 1, min: 2 },
+    { key: "rsi_os", label: "RSI Oversold", def: 28, step: 1, min: 5 },
+    { key: "rsi_ob", label: "RSI Overbought", def: 72, step: 1, min: 55 },
+    { key: "wick_ratio", label: "Min Wick Ratio", def: 0.35, step: 0.05, min: 0.1 },
+  ],
+  meme_pump_ignition: [
+    { key: "bb_period", label: "BB Period", def: 20, step: 1, min: 5 },
+    { key: "dc_period", label: "Breakout Bars (N)", def: 15, step: 1, min: 4 },
+    { key: "vol_mult", label: "Volume Pump ×", def: 2.2, step: 0.1, min: 1.0 },
+    { key: "body_ratio", label: "Min Body Ratio", def: 0.50, step: 0.05, min: 0.2 },
+    { key: "adx_min", label: "Min ADX", def: 20, step: 1, min: 5 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  alt_ema_wave: [
+    { key: "fast_ema", label: "Fast EMA", def: 9, step: 1, min: 2 },
+    { key: "mid_ema", label: "Pullback EMA", def: 21, step: 1, min: 5 },
+    { key: "slow_ema", label: "Trend EMA", def: 50, step: 5, min: 10 },
+    { key: "adx_min", label: "Min ADX", def: 18, step: 1, min: 5 },
+    { key: "pullback_tol", label: "Pullback Tol", def: 0.003, step: 0.001, min: 0.0005 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  scalp_vwap_ema: [
+    { key: "fast_ema", label: "Fast EMA", def: 9, step: 1, min: 2 },
+    { key: "slow_ema", label: "Slow EMA", def: 21, step: 1, min: 5 },
+    { key: "trend_ema", label: "Trend EMA", def: 50, step: 5, min: 10 },
+    { key: "rsi_period", label: "RSI Period", def: 7, step: 1, min: 2 },
+    { key: "pullback_tol", label: "Pullback Tol", def: 0.0015, step: 0.0005, min: 0.0005 },
+    { key: "adx_min", label: "Min ADX", def: 16, step: 1, min: 5 },
+  ],
+  scalp_rsi4_bb: [
+    { key: "bb_period", label: "BB Period", def: 20, step: 1, min: 5 },
+    { key: "bb_std", label: "BB StdDev", def: 2.0, step: 0.1, min: 0.5 },
+    { key: "rsi_period", label: "Fast RSI Period", def: 4, step: 1, min: 2 },
+    { key: "rsi_os", label: "RSI Oversold", def: 20, step: 1, min: 5 },
+    { key: "rsi_ob", label: "RSI Overbought", def: 80, step: 1, min: 60 },
+    { key: "ema_filter", label: "Trend EMA", def: 200, step: 10, min: 0 },
+  ],
+  scalp_vol_burst: [
+    { key: "dc_period", label: "Micro Range (N)", def: 15, step: 1, min: 4 },
+    { key: "vol_mult", label: "Volume Spike ×", def: 2.0, step: 0.1, min: 1.0 },
+    { key: "body_ratio", label: "Min Body Ratio", def: 0.55, step: 0.05, min: 0.2 },
+    { key: "adx_min", label: "Min ADX", def: 20, step: 1, min: 5 },
+    { key: "cost_gate_mult", label: "Cost Gate ×", def: 1.5, step: 0.2, min: 0 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  scalp_ema_ribbon: [
+    { key: "ema1", label: "Ribbon EMA 1", def: 8, step: 1, min: 2 },
+    { key: "ema2", label: "Ribbon EMA 2", def: 13, step: 1, min: 5 },
+    { key: "ema3", label: "Ribbon EMA 3", def: 21, step: 1, min: 8 },
+    { key: "ema4", label: "Ribbon EMA 4", def: 55, step: 5, min: 20 },
+    { key: "adx_min", label: "Min ADX", def: 18, step: 1, min: 5 },
+    { key: "vol_mult", label: "Volume Mult", def: 1.25, step: 0.05, min: 0.5 },
+  ],
+  bb_squeeze_quick_tp: [
+    { key: "bb_period", label: "BB Period", def: 20, step: 1, min: 5 },
+    { key: "bb_std", label: "BB StdDev", def: 2.0, step: 0.1, min: 0.5 },
+    { key: "adx_min", label: "Min ADX", def: 18, step: 1, min: 5 },
+    { key: "vol_mult", label: "Volume Mult", def: 1.25, step: 0.05, min: 0.5 },
+    { key: "body_ratio", label: "Min Body Ratio", def: 0.40, step: 0.05, min: 0.1 },
+    { key: "cost_gate_mult", label: "Cost Gate ×", def: 2.0, step: 0.2, min: 0 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  ema_pullback_scalp: [
+    { key: "fast_ema", label: "Pullback EMA", def: 20, step: 1, min: 5 },
+    { key: "slow_ema", label: "Trend EMA", def: 50, step: 5, min: 10 },
+    { key: "adx_min", label: "Min ADX", def: 18, step: 1, min: 5 },
+    { key: "pullback_tol", label: "Pullback Tol", def: 0.002, step: 0.001, min: 0.001 },
+    { key: "cost_gate_mult", label: "Cost Gate ×", def: 1.8, step: 0.2, min: 0 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  bb_rsi_snapback: [
+    { key: "bb_period", label: "BB Period", def: 20, step: 1, min: 5 },
+    { key: "bb_std", label: "BB StdDev", def: 2.0, step: 0.1, min: 0.5 },
+    { key: "rsi_period", label: "RSI Period", def: 14, step: 1, min: 2 },
+    { key: "rsi_os", label: "RSI Oversold", def: 34, step: 1, min: 10 },
+    { key: "rsi_ob", label: "RSI Overbought", def: 66, step: 1, min: 50 },
+    { key: "cost_gate_mult", label: "Cost Gate ×", def: 1.8, step: 0.2, min: 0 },
+  ],
+  vwap_st_burst: [
+    { key: "atr_period", label: "ST ATR Period", def: 10, step: 1, min: 2 },
+    { key: "atr_mult", label: "ST Multiplier", def: 2.5, step: 0.1, min: 0.5 },
+    { key: "ema_period", label: "EMA Period", def: 20, step: 1, min: 5 },
+    { key: "vol_mult", label: "Volume Mult", def: 1.25, step: 0.05, min: 0.5 },
+    { key: "adx_min", label: "Min ADX", def: 18, step: 1, min: 5 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  bb_squeeze_adx: [
+    { key: "bb_period", label: "BB Period", def: 20, step: 1, min: 5 },
+    { key: "bb_std", label: "BB StdDev", def: 2.0, step: 0.1, min: 0.5 },
+    { key: "adx_min", label: "Min ADX (Rising)", def: 20, step: 1, min: 5 },
+    { key: "vol_mult", label: "Volume Mult", def: 1.25, step: 0.05, min: 0.5 },
+    { key: "body_ratio", label: "Min Body Ratio", def: 0.45, step: 0.05, min: 0.1 },
+    { key: "cost_gate_mult", label: "Cost Gate ×", def: 2.0, step: 0.2, min: 0 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  supertrend_ema_pullback: [
+    { key: "atr_period", label: "ST ATR Period", def: 10, step: 1, min: 2 },
+    { key: "atr_mult", label: "ST Multiplier", def: 3.0, step: 0.1, min: 0.5 },
+    { key: "pullback_ema", label: "Pullback EMA", def: 21, step: 1, min: 5 },
+    { key: "ema_4h", label: "4h Macro EMA", def: 100, step: 10, min: 20 },
+    { key: "adx_min", label: "Min ADX", def: 16, step: 1, min: 5 },
+  ],
+  donchian_adx_breakout: [
+    { key: "dc_period", label: "Donchian Bars (N)", def: 20, step: 1, min: 5 },
+    { key: "adx_min", label: "Min ADX", def: 20, step: 1, min: 5 },
+    { key: "vol_mult", label: "Volume Mult", def: 1.2, step: 0.05, min: 0.5 },
+    { key: "ema_filter", label: "Trend EMA", def: 200, step: 10, min: 10 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  ema_swing_4h: [
+    { key: "fast_ema", label: "Fast EMA", def: 21, step: 1, min: 2 },
+    { key: "slow_ema", label: "Slow EMA", def: 55, step: 1, min: 5 },
+    { key: "trend_ema", label: "Trend EMA (0=off)", def: 100, step: 10, min: 0 },
+    { key: "adx_min", label: "Min ADX", def: 18, step: 1, min: 5 },
+    { key: "cost_gate_mult", label: "Cost Gate ×", def: 2.0, step: 0.2, min: 0 },
+  ],
+  keltner_momentum: [
+    { key: "kc_period", label: "KC EMA Period", def: 20, step: 1, min: 5 },
+    { key: "kc_mult", label: "KC ATR Mult", def: 1.5, step: 0.1, min: 0.5 },
+    { key: "adx_min", label: "Min ADX", def: 20, step: 1, min: 5 },
+    { key: "ema_filter", label: "Trend EMA", def: 100, step: 10, min: 10 },
+    { key: "use_4h_trend", label: "4h Trend (1=on,0=off)", def: 1, step: 1, min: 0 },
+  ],
+  ema_cross: [
+    { key: "fast_ema", label: "Fast EMA", def: 9, step: 1, min: 2 },
+    { key: "slow_ema", label: "Slow EMA", def: 21, step: 1, min: 3 },
+    { key: "trend_ema", label: "Trend EMA (0=off)", def: 50, step: 1, min: 0 },
+    { key: "rsi_period", label: "RSI Period", def: 14, step: 1, min: 2 },
+    { key: "rsi_ob", label: "RSI Overbought", def: 70, step: 1, min: 50 },
+    { key: "rsi_os", label: "RSI Oversold", def: 30, step: 1, min: 5 },
+  ],
+  supertrend: [
+    { key: "atr_period", label: "ATR Period", def: 10, step: 1, min: 2 },
+    { key: "atr_mult", label: "ATR Multiplier", def: 3.0, step: 0.1, min: 0.5 },
+    { key: "ema_filter", label: "Trend EMA", def: 200, step: 5, min: 10 },
+    { key: "rsi_period", label: "RSI Period", def: 14, step: 1, min: 2 },
+    { key: "adx_min", label: "Min ADX", def: 18, step: 1, min: 5 },
+  ],
+  rsi_reversal: [
+    { key: "rsi_period", label: "RSI Period", def: 14, step: 1, min: 2 },
+    { key: "rsi_os", label: "RSI Oversold Cross", def: 35, step: 1, min: 5 },
+    { key: "rsi_ob", label: "RSI Overbought Cross", def: 65, step: 1, min: 50 },
+    { key: "ema_filter", label: "Trend EMA", def: 50, step: 5, min: 5 },
+  ],
+  bollinger_breakout: [
+    { key: "bb_period", label: "BB Period", def: 20, step: 1, min: 5 },
+    { key: "bb_std", label: "BB StdDev", def: 2.0, step: 0.1, min: 0.5 },
+    { key: "vol_mult", label: "Volume Mult", def: 1.3, step: 0.1, min: 0.5 },
+    { key: "ema_filter", label: "Trend EMA", def: 50, step: 5, min: 5 },
+  ],
+  macd_cross: [
+    { key: "fast_ema", label: "Fast EMA", def: 12, step: 1, min: 2 },
+    { key: "slow_ema", label: "Slow EMA", def: 26, step: 1, min: 5 },
+    { key: "signal_ema", label: "Signal EMA", def: 9, step: 1, min: 2 },
+    { key: "ema_filter", label: "Trend EMA", def: 200, step: 5, min: 10 },
+  ],
 };
 
 /* ------------------------------------------------------------------ utils */
@@ -37,7 +237,7 @@ async function api(path, opts = {}) {
     const d = body && body.detail;
     const msg = typeof d === "string" ? d : Array.isArray(d) ? d.map((e) => `${(e.loc || []).slice(-1)[0]}: ${e.msg}`).join("; ") : res.statusText;
     const err = new Error(msg || `HTTP ${res.status}`);
-    err.status = res.status;  // the server answered (a network failure has no status)
+    err.status = res.status;
     throw err;
   }
   return body;
@@ -65,7 +265,7 @@ function fmtTime(x) {
   return d.toISOString().slice(0, 16).replace("T", " ");
 }
 function decimals(step) { const s = String(step); return s.includes(".") ? s.split(".")[1].length : 0; }
-function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 
 function toast(msg, isError = false) {
   const t = $("toast");
@@ -76,6 +276,7 @@ function toast(msg, isError = false) {
   toast._h = setTimeout(() => t.classList.add("hidden"), isError ? 7000 : 4000);
 }
 function setOptions(sel, items, keep = true) {
+  if (!sel) return;
   const prev = sel.value;
   sel.innerHTML = items.map((it) => {
     const [v, l] = Array.isArray(it) ? it : [it, it];
@@ -90,7 +291,7 @@ let priceChart, equityChart, candleSeries, volumeSeries, equitySeries, ddSeries;
 function baseChartOptions() {
   return {
     autoSize: true,
-    layout: { background: { type: "solid", color: COLORS.panel }, textColor: "#8b96a8", fontFamily: "ui-monospace, Consolas, monospace", fontSize: 11, attributionLogo: true },
+    layout: { background: { type: "solid", color: COLORS.panel }, textColor: "#94a3b8", fontFamily: "ui-monospace, Consolas, monospace", fontSize: 11, attributionLogo: true },
     grid: { vertLines: { color: COLORS.grid }, horzLines: { color: COLORS.grid } },
     rightPriceScale: { borderColor: COLORS.border },
     leftPriceScale: { borderColor: COLORS.border },
@@ -109,26 +310,24 @@ function initCharts() {
 
   equityChart = LightweightCharts.createChart($("equityChart"), { ...baseChartOptions(), leftPriceScale: { visible: true, borderColor: COLORS.border } });
   equitySeries = equityChart.addAreaSeries({
-    lineColor: COLORS.accent, topColor: "rgba(79,140,255,0.28)", bottomColor: "rgba(79,140,255,0.02)", lineWidth: 2,
+    lineColor: COLORS.accent, topColor: "rgba(59,130,246,0.32)", bottomColor: "rgba(59,130,246,0.02)", lineWidth: 2,
     priceFormat: { type: "custom", formatter: (v) => `₹${nf0.format(v)}`, minMove: 0.01 },
   });
   ddSeries = equityChart.addHistogramSeries({
-    priceScaleId: "left", color: "rgba(242,85,90,0.55)", lastValueVisible: false, priceLineVisible: false,
+    priceScaleId: "left", color: "rgba(244,63,94,0.45)", lastValueVisible: false, priceLineVisible: false,
     priceFormat: { type: "custom", formatter: (v) => `${v.toFixed(1)}%`, minMove: 0.01 },
   });
 
-  // keep both charts on the same time window
   let syncing = false;
   const link = (a, b) => a.timeScale().subscribeVisibleTimeRangeChange((r) => {
     if (!r || syncing) return;
     syncing = true;
-    try { b.timeScale().setVisibleRange(r); } catch (_) { /* other chart empty */ }
+    try { b.timeScale().setVisibleRange(r); } catch (_) { /* empty */ }
     syncing = false;
   });
   link(priceChart, equityChart);
   link(equityChart, priceChart);
 
-  // click a trade marker -> select its ledger row
   priceChart.subscribeClick((p) => {
     if (p && p.hoveredObjectId && state.result) {
       const tr = state.result.trades.find((t) => String(t.trade_id) === String(p.hoveredObjectId));
@@ -142,26 +341,29 @@ function renderChart(sym) {
   const ch = r && r.charts[sym];
   if (!ch) return;
   state.chartSymbol = sym;
-  const tick = state.status.products[sym] && state.status.products[sym].tick_size;
+  $("priceChartSubtitle").textContent = `${sym} · ${ch.timeframe}`;
+  const tick = state.status && state.status.products[sym] && state.status.products[sym].tick_size;
   if (tick) candleSeries.applyOptions({ priceFormat: { type: "price", precision: decimals(tick), minMove: Number(tick) } });
   candleSeries.setData(ch.candles);
-  volumeSeries.setData(ch.volume.map((v) => ({ time: v.time, value: v.value, color: v.up ? "rgba(34,197,139,0.30)" : "rgba(242,85,90,0.30)" })));
+  volumeSeries.setData(ch.volume.map((v) => ({ time: v.time, value: v.value, color: v.up ? "rgba(16,185,129,0.28)" : "rgba(244,63,94,0.28)" })));
 
   state.overlaySeries.forEach((s) => priceChart.removeSeries(s));
   state.overlaySeries = [];
   clearTradeLines();
   const legend = [];
-  for (const ov of ch.overlays) {
-    const st = OVERLAY_STYLE[ov.name] || { color: "#94a3b8" };
-    const s = priceChart.addLineSeries({
-      color: st.color, lineWidth: st.width || 1, lineStyle: st.style || 0,
-      priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
-    });
-    s.setData(ov.data);
-    state.overlaySeries.push(s);
-    legend.push(`<span><i style="background:${st.color}"></i>${esc(ov.name)}</span>`);
+  if (state.indicatorsVisible) {
+    for (const ov of ch.overlays) {
+      const st = OVERLAY_STYLE[ov.name] || { color: "#94a3b8" };
+      const s = priceChart.addLineSeries({
+        color: st.color, lineWidth: st.width || 1, lineStyle: st.style || 0,
+        priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+      });
+      s.setData(ov.data);
+      state.overlaySeries.push(s);
+      legend.push(`<span><i style="background:${st.color}"></i>${esc(ov.name)}</span>`);
+    }
   }
-  legend.push(`<span><i style="background:#2dd4bf"></i>long ▲</span><span><i style="background:#f87171"></i>short ▼</span><span>● exit (reason#id)</span>`);
+  legend.push(`<span><i style="background:#2dd4bf"></i>BUY ▲</span><span><i style="background:#f87171"></i>SELL ▼</span>`);
   $("legend").innerHTML = legend.join("");
   candleSeries.setMarkers(ch.markers.map((m) => ({ time: m.time, position: m.position, shape: m.shape, color: m.color, text: m.text, id: String(m.trade_id) })));
 
@@ -170,19 +372,331 @@ function renderChart(sym) {
 }
 
 function renderEquity() {
-  const eq = state.result.equity;
+  const r = state.result;
+  const eq = r.equity;
   equitySeries.setData(eq.equity);
-  ddSeries.setData(eq.drawdown.map((d) => ({ time: d.time, value: d.value, color: d.value < -10 ? "rgba(242,85,90,0.8)" : "rgba(242,85,90,0.45)" })));
+  ddSeries.setData(eq.drawdown.map((d) => ({ time: d.time, value: d.value, color: d.value < -10 ? "rgba(244,63,94,0.75)" : "rgba(244,63,94,0.38)" })));
   if (state.startLine) equitySeries.removePriceLine(state.startLine);
+  const startCap = r.config.capital_inr || r.config.initial_capital_inr;
   state.startLine = equitySeries.createPriceLine({
-    price: state.result.config.initial_capital_inr, color: COLORS.muted, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "start",
+    price: startCap, color: COLORS.muted, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "start",
   });
+  $("eqStartLabel").textContent = `Starting capital ₹${nf0.format(startCap)}`;
+  $("eqEndValue").textContent = `₹${nf2.format(r.summary.final_equity_inr)}`;
+  $("eqEndPct").innerHTML = `<span class="${cls(r.summary.net_return_pct)}">${pct(r.summary.net_return_pct, true)}</span>`;
   equityChart.timeScale().fitContent();
 }
 
 function clearTradeLines() {
   state.tradeLines.forEach((l) => candleSeries.removePriceLine(l));
   state.tradeLines = [];
+}
+
+/* ------------------------------------------------------------------ Custom Strategies & Saved Results */
+async function loadCustomStrategies(symbol = null, selectId = null) {
+  const sym = symbol || $("symbolSelect").value || "ETHUSD";
+  const r = await api(`/api/strategies?symbol=${encodeURIComponent(sym)}`);
+  state.customStrategies = r.strategies || [];
+  const opts = state.customStrategies.map((s) => [s.id, `${s.name}${s.symbol && s.symbol !== "ALL" ? ` (${s.symbol})` : ""}`]);
+  setOptions($("strategySelect"), opts, !selectId);
+  if (selectId && [...$("strategySelect").options].some((o) => o.value === selectId)) {
+    $("strategySelect").value = selectId;
+  }
+  applySelectedStrategyDefaults();
+}
+
+function currentStrategyObj() {
+  const id = $("strategySelect").value;
+  return state.customStrategies.find((s) => s.id === id) || state.customStrategies[0] || null;
+}
+
+function applySelectedStrategyDefaults() {
+  const st = currentStrategyObj();
+  if (!st) {
+    $("strategyRuleHint").textContent = "No strategy for this coin — click + New to create one";
+    return;
+  }
+  const pStr = Object.entries(st.params || {}).map(([k, v]) => `${k}=${v}`).join(", ");
+  $("strategyRuleHint").textContent = `${st.rule_type} · ${pStr}`;
+  setTimeframePill(st.timeframe || "1h");
+  if (st.capital_inr) $("capital").value = st.capital_inr;
+  if (st.leverage) $("leverage").value = st.leverage;
+  if (st.risk_pct) setRiskValue(st.risk_pct);
+  if (st.sl_type) $("slType").value = st.sl_type;
+  if (st.sl_value) $("slValue").value = st.sl_value;
+  if (st.tp_type) $("tpType").value = st.tp_type;
+  if (st.tp_value) $("tpValue").value = st.tp_value;
+  if (st.trail_mult !== undefined) $("trailAtr").value = st.trail_mult;
+  if (st.fee_mode) $("feeMode").value = st.fee_mode;
+  if (st.slippage_bps !== undefined) $("slippage").value = String(Math.round(st.slippage_bps));
+  updateAdvSummary();
+  updateOverviewHeaderPreview();
+}
+
+function setTimeframePill(tf) {
+  $("tfSelect").value = tf;
+  document.querySelectorAll("#tfPills .tf-pill").forEach((b) => b.classList.toggle("active", b.dataset.tf === tf));
+}
+
+function setRiskValue(val) {
+  $("risk").value = val;
+  document.querySelectorAll("[data-risk]").forEach((b) => b.classList.toggle("active", Number(b.dataset.risk) === Number(val)));
+}
+
+function updateAdvSummary() {
+  const lev = $("leverage").value || 10;
+  const slT = $("slType").value === "fixed_pct" ? `Fixed ${$("slValue").value}% SL` : `${$("slValue").value}x ATR SL`;
+  const tpT = $("tpType").value === "rr_ratio" ? `${$("tpValue").value}R TP` : $("tpType").value === "fixed_pct" ? `${$("tpValue").value}% TP` : `${$("tpValue").value}x ATR TP`;
+  $("advFootSummary").textContent = `${lev}x leverage · ${slT} / ${tpT} · Fees + GST`;
+}
+
+function updateOverviewHeaderPreview() {
+  const sym = $("symbolSelect").value || "ETHUSD";
+  const st = currentStrategyObj();
+  const sname = st ? st.name : "Custom Strategy";
+  const tf = $("tfSelect").value || "1h";
+  const lev = $("leverage").value || 10;
+  $("overviewSubtitle").textContent = `${sym} · ${sname} · ${tf} · ${lev}x`;
+  $("priceChartSubtitle").textContent = `${sym} · ${tf}`;
+}
+
+function markPreviewStale() {
+  updateAdvSummary();
+  updateOverviewHeaderPreview();
+  if (!state.result) {
+    $("emptyRunOverlay").classList.remove("hidden");
+    $("saveResultBtn").disabled = true;
+    $("unsavedBadge").textContent = "Configure parameters & click Run backtest";
+    $("unsavedBadge").className = "unsaved-badge";
+  } else {
+    state.resultSaved = false;
+    $("unsavedBadge").textContent = "Parameters modified — click Run backtest to refresh";
+    $("unsavedBadge").className = "unsaved-badge unsaved";
+  }
+}
+
+function renderRuleParamInputs(ruleType, params = {}) {
+  const defs = RULE_PARAM_DEFS[ruleType] || RULE_PARAM_DEFS.ema_cross;
+  $("stratParamsContainer").innerHTML = defs.map((d) => {
+    const val = params[d.key] !== undefined ? params[d.key] : d.def;
+    return `<div class="field">
+      <label for="param_${d.key}">${esc(d.label)}</label>
+      <input id="param_${d.key}" data-param="${d.key}" type="number" min="${d.min}" step="${d.step}" value="${val}">
+    </div>`;
+  }).join("");
+}
+
+function openStrategyModal(isNew = false) {
+  const st = isNew ? null : currentStrategyObj();
+  $("stratDialogTitle").textContent = isNew ? "Create New Custom Strategy" : `Edit Strategy — ${st ? st.name : ""}`;
+  $("stratIdInput").value = st ? st.id : "";
+  $("stratNameInput").value = st ? st.name : "";
+  const coinOpts = [["ALL", "ALL (Available on every coin)"], ...(state.status ? state.status.symbols : ["ETHUSD", "BTCUSD", "SOLUSD"]).map((s) => [s, `${s} only`])];
+  setOptions($("stratSymbolInput"), coinOpts, false);
+  $("stratSymbolInput").value = st ? (st.symbol || "ALL") : ($("symbolSelect").value || "ALL");
+  $("stratRuleInput").value = st ? st.rule_type : "ema_cross";
+  $("stratTfInput").value = st ? (st.timeframe || "1h") : ($("tfSelect").value || "1h");
+  renderRuleParamInputs($("stratRuleInput").value, st ? (st.params || {}) : {});
+  $("stratCapInput").value = st ? st.capital_inr : ($("capital").value || 50000);
+  $("stratLevInput").value = st ? st.leverage : ($("leverage").value || 10);
+  $("stratRiskInput").value = st ? st.risk_pct : ($("risk").value || 2.0);
+  $("stratSlTypeInput").value = st ? st.sl_type : ($("slType").value || "atr_mult");
+  $("stratSlValInput").value = st ? st.sl_value : ($("slValue").value || 2.0);
+  $("stratTpTypeInput").value = st ? st.tp_type : ($("tpType").value || "atr_mult");
+  $("stratTpValInput").value = st ? st.tp_value : ($("tpValue").value || 5.0);
+  $("stratDeleteBtn").classList.toggle("hidden", isNew || !st);
+  $("stratFormMsg").textContent = "";
+  $("strategyDialog").showModal();
+}
+
+async function saveStrategyFromModal(ev) {
+  ev.preventDefault();
+  const id = $("stratIdInput").value.trim();
+  const params = {};
+  document.querySelectorAll("#stratParamsContainer [data-param]").forEach((inp) => {
+    params[inp.dataset.param] = Number(inp.value);
+  });
+  const payload = {
+    name: $("stratNameInput").value.trim(),
+    symbol: $("stratSymbolInput").value,
+    timeframe: $("stratTfInput").value,
+    rule_type: $("stratRuleInput").value,
+    params,
+    capital_inr: Number($("stratCapInput").value) || 50000,
+    leverage: Number($("stratLevInput").value) || 10,
+    risk_pct: Number($("stratRiskInput").value) || 2.0,
+    sl_type: $("stratSlTypeInput").value,
+    sl_value: Number($("stratSlValInput").value) || 2.0,
+    tp_type: $("stratTpTypeInput").value,
+    tp_value: Number($("stratTpValInput").value) || 5.0,
+    trail_mult: Number($("trailAtr").value) || 2.5,
+  };
+  try {
+    let saved;
+    if (id) {
+      saved = await api(`/api/strategies/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(payload) });
+      toast(`Updated strategy "${saved.name}"`);
+    } else {
+      saved = await api("/api/strategies", { method: "POST", body: JSON.stringify(payload) });
+      toast(`Created strategy "${saved.name}"`);
+    }
+    $("strategyDialog").close();
+    if (saved.symbol !== "ALL" && saved.symbol !== $("symbolSelect").value) {
+      $("symbolSelect").value = saved.symbol;
+    }
+    await loadCustomStrategies($("symbolSelect").value, saved.id);
+  } catch (e) {
+    $("stratFormMsg").textContent = e.message;
+  }
+}
+
+async function deleteStrategyFromModal() {
+  const id = $("stratIdInput").value.trim();
+  if (!id) return;
+  if (!confirm("Delete this custom strategy?")) return;
+  try {
+    await api(`/api/strategies/${encodeURIComponent(id)}`, { method: "DELETE" });
+    $("strategyDialog").close();
+    toast("Strategy deleted");
+    await loadCustomStrategies($("symbolSelect").value);
+  } catch (e) {
+    $("stratFormMsg").textContent = e.message;
+  }
+}
+
+async function saveCurrentBacktestResult() {
+  const r = state.result;
+  if (!r) return;
+  const st = currentStrategyObj();
+  const leg0 = r.legs[0] || {};
+  const payload = {
+    strategy_id: (st && st.id) || r.config.strategy_id || leg0.strategy,
+    strategy_name: (st && st.name) || r.config.strategy_name || leg0.strategy,
+    symbol: leg0.symbol || $("symbolSelect").value,
+    timeframe: leg0.timeframe || $("tfSelect").value,
+    period_days: r.window.days,
+    capital_inr: r.config.capital_inr || r.config.initial_capital_inr,
+    leverage: r.config.leverage,
+    risk_pct: r.config.risk_pct || r.config.risk_per_trade_pct,
+    sl_type: r.config.sl_type || $("slType").value,
+    sl_value: r.config.sl_value || Number($("slValue").value),
+    tp_type: r.config.tp_type || $("tpType").value,
+    tp_value: r.config.tp_value || Number($("tpValue").value),
+    trail_mult: r.config.trail_atr_mult,
+    rule_type: (st && st.rule_type) || r.config.rule_type,
+    params: (st && st.params) || r.config.params || {},
+    net_pnl_inr: r.summary.net_pnl_inr,
+    return_pct: r.summary.net_return_pct,
+    win_rate_pct: r.summary.win_rate_pct,
+    profit_factor: r.summary.profit_factor,
+    max_dd_pct: r.summary.max_drawdown_pct,
+    total_trades: r.summary.total_trades,
+    summary: r.summary,
+    trades: r.trades,
+  };
+  $("saveResultBtn").disabled = true;
+  try {
+    await api("/api/backtest/save_result", { method: "POST", body: JSON.stringify(payload) });
+    state.resultSaved = true;
+    $("unsavedBadge").textContent = "✓ Saved to Backtest Results";
+    $("unsavedBadge").className = "unsaved-badge saved";
+    toast("Backtest result saved to catalog");
+    await loadSavedResults();
+  } catch (e) {
+    $("saveResultBtn").disabled = false;
+    toast(`Save failed: ${e.message}`, true);
+  }
+}
+
+async function loadSavedResults() {
+  const q = new URLSearchParams();
+  if ($("resSymbolFilter").value) q.set("symbol", $("resSymbolFilter").value);
+  if ($("resStratFilter").value.trim()) q.set("strategy_name", $("resStratFilter").value.trim());
+  if ($("resTfFilter").value) q.set("timeframe", $("resTfFilter").value);
+  if ($("resMinWrFilter").value !== "") q.set("min_win_rate", $("resMinWrFilter").value);
+  if ($("resMinPfFilter").value !== "") q.set("min_pf", $("resMinPfFilter").value);
+  try {
+    const r = await api(`/api/backtest/results?${q}`);
+    state.savedResults = r.results || [];
+    $("savedCountBadge").textContent = String(state.savedResults.length);
+    $("resCatalogCount").textContent = `${state.savedResults.length} saved result(s)`;
+    renderSavedResultsTable();
+  } catch (e) {
+    toast(`Could not load saved results: ${e.message}`, true);
+  }
+}
+
+function renderSavedResultsTable() {
+  const rows = state.savedResults;
+  const head = `<thead><tr>
+    <th class="l">Date (UTC)</th><th class="l">Coin</th><th class="l">Strategy</th><th>TF</th>
+    <th>Capital ₹</th><th>Lev</th><th>SL / TP</th><th>Net P&amp;L ₹</th><th>Win Rate</th>
+    <th>PF</th><th>Max DD</th><th>Trades</th><th class="l">Actions</th>
+  </tr></thead>`;
+  if (!rows.length) {
+    $("resultsTable").innerHTML = head + `<tbody><tr><td class="l muted" colspan="13">No saved backtest results match your filters. Run a backtest and click "🔖 Save result" to add one.</td></tr></tbody>`;
+    return;
+  }
+  const body = rows.map((r, i) => {
+    const slLbl = `${r.sl_value}${r.sl_type === "fixed_pct" ? "%" : "x ATR"}`;
+    const tpLbl = `${r.tp_value}${r.tp_type === "rr_ratio" ? "R" : r.tp_type === "fixed_pct" ? "%" : "x ATR"}`;
+    return `<tr data-i="${i}">
+      <td class="l">${fmtTime(r.saved_at)}</td>
+      <td class="l"><b>${esc(r.symbol)}</b></td>
+      <td class="l">${esc(r.strategy_name)}</td>
+      <td>${esc(r.timeframe)}</td>
+      <td>₹${nf0.format(r.capital_inr)}</td>
+      <td>${r.leverage}x</td>
+      <td>${esc(slLbl)} / ${esc(tpLbl)}</td>
+      <td class="${cls(r.net_pnl_inr)}"><b>${inr(r.net_pnl_inr)}</b> <span class="muted">(${pct(r.return_pct, true, 1)})</span></td>
+      <td>${pct(r.win_rate_pct, false, 1)}</td>
+      <td>${pf(r.profit_factor)}</td>
+      <td class="neg">${pct(-Math.abs(r.max_dd_pct || 0), false, 2)}</td>
+      <td>${r.total_trades}</td>
+      <td class="l">
+        <button type="button" class="btn btn-xs btn-primary" data-load-res="${esc(r.id)}">Load</button>
+        <button type="button" class="btn btn-xs btn-danger" data-del-res="${esc(r.id)}">Delete</button>
+      </td>
+    </tr>`;
+  }).join("");
+  $("resultsTable").innerHTML = head + `<tbody>${body}</tbody>`;
+  $("resultsTable").querySelectorAll("[data-load-res]").forEach((btn) => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const item = state.savedResults.find((x) => x.id === btn.dataset.loadRes);
+      if (item) restoreSavedResult(item);
+    };
+  });
+  $("resultsTable").querySelectorAll("[data-del-res]").forEach((btn) => {
+    btn.onclick = async (ev) => {
+      ev.stopPropagation();
+      try {
+        await api(`/api/backtest/results/${encodeURIComponent(btn.dataset.delRes)}`, { method: "DELETE" });
+        toast("Saved result deleted");
+        loadSavedResults();
+      } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+async function restoreSavedResult(item) {
+  $("symbolSelect").value = item.symbol;
+  await loadCustomStrategies(item.symbol, item.strategy_id);
+  setTimeframePill(item.timeframe || "1h");
+  $("capital").value = item.capital_inr || 50000;
+  $("leverage").value = item.leverage || 10;
+  if (item.risk_pct) setRiskValue(item.risk_pct);
+  $("slType").value = item.sl_type || "atr_mult";
+  $("slValue").value = item.sl_value || 2.0;
+  $("tpType").value = item.tp_type || "atr_mult";
+  $("tpValue").value = item.tp_value || 5.0;
+  if (item.trail_mult !== undefined) $("trailAtr").value = item.trail_mult;
+  if (item.fee_mode) $("feeMode").value = item.fee_mode;
+  if (item.slippage_bps !== undefined) $("slippage").value = String(Math.round(item.slippage_bps));
+  const d = String(Math.round(item.period_days || 180));
+  if ([...$("daysSelect").options].some((o) => o.value === d)) $("daysSelect").value = d;
+  updateAdvSummary();
+  await runBacktest({ markSaved: true });
 }
 
 /* ------------------------------------------------------------------ status, presets */
@@ -195,129 +709,36 @@ async function loadStatus() {
 
   const live = s.is_live;
   const mb = $("modeBadge");
-  mb.textContent = live ? "LIVE TRADING ENABLED" : `${s.mode.toUpperCase()} MODE — LIVE TRADING DISABLED`;
-  mb.className = `badge ${live ? "badge-live" : "badge-research"}`;
+  mb.innerHTML = `<span class="dot"></span> ${live ? "Live trading enabled" : "Live trading disabled"}`;
+  mb.className = `status-pill ${live ? "live" : ""}`;
   $("envBadge").textContent = `${s.environment} · ${s.rest_url.replace("https://", "")}`;
 
   $("coverage").innerHTML = s.symbols.map((sym) => {
     const c = s.coverage[sym] && s.coverage[sym].series.TRADE;
     if (!c) return `<span class="cov-chip"><b>${esc(sym)}</b> no data</span>`;
     const gaps = Object.values(s.coverage[sym].series).reduce((a, x) => a + (x ? x.gaps : 0), 0);
-    return `<span class="cov-chip" title="${esc(sym)}: ${c.rows.toLocaleString()} 1m rows per series, ${esc(c.start)} → ${esc(c.end)}"><b>${esc(sym)}</b> ${c.days}d · to ${fmtTime(c.end)} · <span class="${gaps ? "bad" : "ok"}">${gaps} gaps</span></span>`;
+    return `<span class="cov-chip"><b>${esc(sym)}</b> ${c.days}d · <span class="${gaps ? "bad" : "ok"}">${gaps} gaps</span></span>`;
   }).join("");
 
   const symbolsWithData = s.symbols.filter((x) => s.coverage[x] && s.coverage[x].series.TRADE);
   setOptions($("symbolSelect"), symbolsWithData);
-  const checked = new Set([...document.querySelectorAll("#symbolChecks input:checked")].map((i) => i.value));
-  $("symbolChecks").innerHTML = symbolsWithData.map((x) =>
-    `<label><input type="checkbox" value="${esc(x)}" ${checked.size ? (checked.has(x) ? "checked" : "") : (s.config_symbols.includes(x) ? "checked" : "")}> ${esc(x)}</label>`).join("");
-  setOptions($("strategySelect"), s.strategies.map((x) => [x.name, x.name]));
+  setOptions($("resSymbolFilter"), [["", "All Coins"], ...symbolsWithData.map((x) => [x, x])]);
   setOptions($("tfSelect"), s.timeframes);
   setOptions($("exitMode"), s.exit_modes);
-  setOptions($("feeMode"), s.fee_modes);
+  setOptions($("feeMode"), [
+    ["taker_maker_tp", "Taker Entry / Maker TP"],
+    ["maker_maker", "Maker Entry + Maker TP (0.02%)"],
+    ["taker", "All Taker (0.05%)"],
+    ["maker", "All Maker (0.02%)"],
+  ]);
   setOptions($("triggerSource"), s.trigger_sources);
-  setOptions($("lbSymbol"), [["", "All symbols"], ...s.symbols.map((x) => [x, x])]);
-  setOptions($("lbStrategy"), [["", "All strategies"], ...s.strategies.map((x) => [x.name, x.name])]);
-  setOptions($("lbTf"), [["", "All timeframes"], ...s.timeframes.map((x) => [x, x])]);
-  if (!state.anchor) $("endSelect").value = "latest";
+
+  await loadCustomStrategies($("symbolSelect").value);
+  await loadSavedResults();
   renderSyncStatus(s.sync);
   if (s.sync && s.sync.state === "running") pollSync();
 }
 
-async function loadPresets() {
-  try {
-    const r = await api("/api/presets");
-    state.presets = r.presets;
-    if (r.anchor) state.anchor = r.anchor;
-    if (r.step4b_anchor) state.anchor4b = r.step4b_anchor;
-  } catch (e) {
-    toast(`Presets unavailable: ${e.message}`, true);
-    state.presets = [];
-  }
-  const groups = {};
-  state.presets.forEach((p, i) => { (groups[p.group] = groups[p.group] || []).push([i, p]); });
-  $("presetSelect").innerHTML = `<option value="">— choose a preset —</option>` + Object.entries(groups).map(([g, items]) =>
-    `<optgroup label="${esc(g)}">${items.map(([i, p]) => {
-      const st = p.stats ? ` · 180d ${inr(p.stats.net)}` : p.step4b_stats ? ` · ${p.step4b_stats.verdict}` : "";
-      return `<option value="${i}">${esc(p.tag || "")} ${esc(p.label)}${st}</option>`;
-    }).join("")}</optgroup>`).join("");
-}
-
-function applyPreset(p) {
-  $("capital").value = $("presetCapital").value === "50000" ? 50000 : p.initial_capital_inr;
-  $("leverage").value = p.leverage;
-  $("risk").value = p.risk_per_trade_pct;
-  $("dailyLoss").value = p.max_daily_loss_pct;
-  $("feeMode").value = p.fee_mode;
-  $("triggerSource").value = p.trigger_source || "trade";
-  $("trailAtr").value = p.trail_atr_mult;
-  $("slippage").value = String(p.slippage_bps || 0);
-  $("trend4h").checked = !!p.trend_filter_4h;
-  $("costGate").checked = !!p.cost_gate;
-  $("strictLot").checked = !!p.strict_lot_cap;
-  const days = String(p.days);
-  if (![...$("daysSelect").options].some((o) => o.value === days)) {
-    $("daysSelect").insertAdjacentHTML("beforeend", `<option value="${esc(days)}">${esc(days)} days</option>`);
-  }
-  $("daysSelect").value = days;
-  const anchorOk = (p.anchor === "step4b" && state.anchor4b) || (p.anchor !== "step4b" && state.anchor);
-  $("endSelect").value = p.end && anchorOk ? (p.anchor || "step3c") : "latest";
-  toggleCustomRange();
-
-  const leg0 = p.legs[0];
-  setLegControls(leg0);
-  const single = p.kind === "single";
-  setRunMode(single ? "single" : "portfolio");
-  if (single) {
-    $("symbolSelect").value = leg0.symbol;
-    state.legsOverride = null;
-  } else {
-    const syms = new Set(p.legs.map((l) => l.symbol));
-    document.querySelectorAll("#symbolChecks input").forEach((i) => { i.checked = syms.has(i.value); });
-    const same = p.legs.every((l) => ["strategy", "timeframe", "stop_mode", "sl_value", "tp_value", "exit_mode"].every((k) => l[k] === leg0[k]));
-    state.legsOverride = same ? null : p.legs;
-  }
-  renderLegsNotice();
-
-  let note = `${p.tag ? p.tag + " " : ""}${p.note ? p.note + ". " : ""}`;
-  if (p.step4b_stats) {
-    const s = p.step4b_stats;
-    note += `Step 4B primary screen (full extended history): ${inr(s.net_pnl_inr)} · PF ${pf(s.profit_factor)} · DD ${pct(s.max_drawdown_pct)} · ${s.total_trades} trades → ${s.verdict}.`;
-  } else if (p.stats) {
-    const s = p.stats;
-    note += `Step 3C: W1 ${inr(s.net_W1)} · W2 ${inr(s.net_W2)} · W3 ${inr(s.net_W3)} · 180d ${inr(s.net)} (${s.trades} trades).`;
-  } else if (p.standalone_stats) {
-    note += Object.entries(p.standalone_stats).map(([sym, s]) => `${sym} alone: W3 ${inr(s.net_W3)}, 180d ${inr(s.net)}`).join(" · ");
-  }
-  $("presetNote").textContent = note;
-}
-
-function setLegControls(leg) {
-  $("strategySelect").value = leg.strategy;
-  $("tfSelect").value = leg.timeframe;
-  $("stopMode").value = leg.stop_mode;
-  $("slValue").value = leg.sl_value;
-  $("tpValue").value = leg.tp_value;
-  $("exitMode").value = leg.exit_mode;
-}
-
-function renderLegsNotice() {
-  const n = $("legsNotice");
-  if (!state.legsOverride) { n.classList.add("hidden"); return; }
-  n.innerHTML = `<b>Specialist legs active</b> (each symbol runs its own config):<ul>${state.legsOverride.map((l) =>
-    `<li>${esc(l.symbol)}: ${esc(l.strategy)} ${esc(l.timeframe)} · ${esc(l.stop_mode)} ${l.sl_value}/${l.tp_value} · ${esc(l.exit_mode)}</li>`).join("")}</ul>
-    <button class="btn btn-ghost btn-sm" id="clearLegs">Use one config for all symbols</button>`;
-  n.classList.remove("hidden");
-  $("clearLegs").onclick = () => { state.legsOverride = null; renderLegsNotice(); };
-}
-
-function runMode() { return document.querySelector('input[name="runMode"]:checked').value; }
-function setRunMode(m) {
-  document.querySelector(`input[name="runMode"][value="${m}"]`).checked = true;
-  $("singleSymbolField").classList.toggle("hidden", m !== "single");
-  $("portfolioSymbolsField").classList.toggle("hidden", m !== "portfolio");
-  if (m === "single") { state.legsOverride = null; renderLegsNotice(); }
-}
 function toggleCustomRange() {
   const custom = $("daysSelect").value === "custom";
   $("customRange").classList.toggle("hidden", !custom);
@@ -326,26 +747,36 @@ function toggleCustomRange() {
 
 /* ------------------------------------------------------------------ backtest */
 function readRequest() {
-  const mode = runMode();
-  const symbols = mode === "single"
-    ? [$("symbolSelect").value].filter(Boolean)
-    : [...document.querySelectorAll("#symbolChecks input:checked")].map((i) => i.value);
+  const sym = $("symbolSelect").value;
+  const st = currentStrategyObj();
+  const trailOn = $("trailEnabled").checked;
   const req = {
-    symbols,
-    strategy: $("strategySelect").value,
-    timeframe: $("tfSelect").value,
-    stop_mode: $("stopMode").value,
+    symbol: sym,
+    symbols: [sym].filter(Boolean),
+    strategy: (st && st.id) || $("strategySelect").value || "bollinger_volume_breakout",
+    strategy_id: st ? st.id : $("strategySelect").value,
+    strategy_name: st ? st.name : $("strategySelect").value,
+    rule_type: st ? st.rule_type : null,
+    params: st ? st.params : null,
+    timeframe: $("tfSelect").value || "1h",
+    sl_type: $("slType").value,
+    stop_mode: $("slType").value === "fixed_pct" ? "pct" : "atr",
     sl_value: Number($("slValue").value),
+    tp_type: $("tpType").value,
     tp_value: Number($("tpValue").value),
-    exit_mode: $("exitMode").value,
+    trailing_stop: trailOn,
+    exit_mode: trailOn ? "trail" : "fixed",
+    trail_mult: Number($("trailAtr").value),
     trail_atr_mult: Number($("trailAtr").value),
-    fee_mode: $("feeMode").value,
-    trigger_source: $("triggerSource").value,
+    fee_mode: $("feeMode").value || "taker_maker_tp",
+    trigger_source: $("triggerSource").value || "trade",
+    capital_inr: Number($("capital").value),
     initial_capital_inr: Number($("capital").value),
     leverage: Number($("leverage").value),
+    risk_pct: Number($("risk").value),
     risk_per_trade_pct: Number($("risk").value),
-    max_daily_loss_pct: Number($("dailyLoss").value),
-    slippage_bps: Number($("slippage").value),
+    max_daily_loss_pct: Number($("dailyLoss").value || 5),
+    slippage_bps: Number($("slippage").value || 0),
     trend_filter_4h: $("trend4h").checked,
     cost_gate: $("costGate").checked,
     strict_lot_cap: $("strictLot").checked,
@@ -359,29 +790,36 @@ function readRequest() {
     req.end = `${$("endDate").value}T00:00:00Z`;
   } else {
     req.days = Number($("daysSelect").value);
-    // Pinned anchors also pin where indicator warm-up starts, so saved results reproduce exactly.
     const a = $("endSelect").value === "step3c" ? state.anchor : $("endSelect").value === "step4b" ? state.anchor4b : null;
     if (a) { req.end = a.end; req.history_start = a.warmup_start; }
-  }
-  if (mode === "portfolio" && state.legsOverride) {
-    req.legs = state.legsOverride.filter((l) => symbols.includes(l.symbol));
   }
   return req;
 }
 
-async function runBacktest() {
+async function runBacktest(opts = {}) {
   let req;
   try { req = readRequest(); } catch (e) { toast(e.message, true); return; }
-  if (!req.symbols.length) { toast("Select at least one symbol", true); return; }
+  if (!req.symbols.length) { toast("Select a coin", true); return; }
   $("runBtn").disabled = true;
   $("chartLoading").classList.remove("hidden");
   try {
     const r = await api("/api/backtest/run", { method: "POST", body: JSON.stringify(req) });
     state.result = r;
+    state.resultSaved = !!opts.markSaved;
     state.selectedTrade = null;
+    $("emptyRunOverlay").classList.add("hidden");
     renderResult();
     const w = r.window;
-    $("runInfo").textContent = `${fmtTime(w.start)} → ${fmtTime(w.end)} UTC (${w.days}d)${w.pinned_to_step3c ? " · pinned to Step 3C anchor" : ""} · ${r.elapsed_ms} ms`;
+    $("runInfo").textContent = `${fmtTime(w.start)} → ${fmtTime(w.end)} UTC (${Math.round(w.days)}d) · ${r.elapsed_ms} ms`;
+    if (state.resultSaved) {
+      $("unsavedBadge").textContent = "Loaded from saved result";
+      $("unsavedBadge").className = "unsaved-badge saved";
+      $("saveResultBtn").disabled = false;
+    } else {
+      $("unsavedBadge").textContent = "Unsaved preview — click Save result to keep";
+      $("unsavedBadge").className = "unsaved-badge unsaved";
+      $("saveResultBtn").disabled = false;
+    }
   } catch (e) {
     toast(`Backtest failed: ${e.message}`, true);
   } finally {
@@ -392,25 +830,16 @@ async function runBacktest() {
 
 function renderResult() {
   const r = state.result;
+  const leg0 = r.legs[0] || {};
+  $("overviewSubtitle").textContent = `${leg0.symbol} · ${r.config.strategy_name || leg0.strategy} · ${leg0.timeframe} · ${r.config.leverage}x`;
   renderKpis(r);
   const syms = Object.keys(r.charts);
-  $("chartTabs").innerHTML = syms.map((s) => {
-    const leg = r.legs.find((l) => l.symbol === s);
-    return `<button class="tab" data-sym="${esc(s)}">${esc(s)} · ${esc(leg.strategy)} ${esc(leg.timeframe)}</button>`;
-  }).join("");
+  $("chartTabs").innerHTML = syms.length > 1 ? syms.map((s) => `<button class="tab" data-sym="${esc(s)}">${esc(s)}</button>`).join("") : "";
   document.querySelectorAll("#chartTabs .tab").forEach((b) => { b.onclick = () => renderChart(b.dataset.sym); });
   renderEquity();
   renderChart(syms.includes(state.chartSymbol) ? state.chartSymbol : syms[0]);
   renderLedger();
   renderWalkForward();
-}
-
-function filterRejections(r) {
-  const stats = Object.values((r.filters && r.filters.stats) || {});
-  const sum = (k) => stats.reduce((a, st) => a + (st[k] || 0), 0);
-  const t = r.filters && r.filters.trend_filter_4h ? sum("rejected_by_trend4h") : "–";
-  const g = r.filters && r.filters.cost_gate ? sum("rejected_by_costgate") : "–";
-  return `${t} / ${g} / ${r.summary.skipped_lot_budget}`;
 }
 
 function kpi(label, value, sub = "", extra = "") {
@@ -420,42 +849,52 @@ function kpi(label, value, sub = "", extra = "") {
 function renderKpis(r) {
   const s = r.summary;
   const wins = r.trades.filter((t) => t.net_pnl_usd > 0).length;
-  const reasons = Object.entries(s.exit_reason_counts || {}).map(([k, v]) => `${k} ${v}`).join(" · ");
   $("kpis").innerHTML = [
-    kpi("Net PnL", `<span class="${cls(s.net_pnl_inr)}">${inr(s.net_pnl_inr)}</span>`, `<span class="${cls(s.net_return_pct)}">${pct(s.net_return_pct, true)}</span> · final ₹${nf2.format(s.final_equity_inr)}`, "primary"),
-    kpi("Gross PnL", `<span class="${cls(s.gross_pnl_inr)}">${inr(s.gross_pnl_inr)}</span>`, "price moves only"),
-    kpi("Fees + 18% GST", `<span class="neg">${inr(-s.fees_gst_inr)}</span>`, `${esc(r.config.fee_mode)}`),
-    kpi("Funding", `<span class="${cls(s.funding_inr)}">${inr(s.funding_inr)}</span>`, `${s.funding_events} settlements`),
-    kpi("Win rate", pct(s.win_rate_pct, false, 1), `${wins} / ${s.total_trades} trades`),
-    kpi("Profit factor", pf(s.profit_factor), "gross wins / losses (net)"),
-    kpi("Max drawdown", `<span class="neg">${pct(-s.max_drawdown_pct, false)}</span>`, `${s.daily_halts} daily-loss halts`),
-    kpi("Trades", String(s.total_trades), `L ${s.long_trades} / S ${s.short_trades}${reasons ? " · " + reasons : ""}`),
-    kpi("Slippage cost", `<span class="${s.slippage_inr > 0 ? "neg" : ""}">${inr(-s.slippage_inr)}</span>`, `${r.filters ? r.filters.slippage_bps : 0} bps per fill`),
-    kpi("Filter rejections", filterRejections(r), "4h trend / cost gate / lot budget"),
-    kpi("Ledger audit", r.audit.passed ? `<span class="audit-ok">✓ PASSED</span>` : `<span class="audit-bad">✗ FAILED</span>`,
-      r.audit.passed ? `${r.audit.trades_checked} trades recomputed` : esc(r.audit.errors.slice(0, 2).join("; "))),
+    `<div class="kpi">
+      <div class="kpi-top"><span class="kpi-ico ico-green">📊</span><span class="k-label">Net profit</span></div>
+      <div class="k-value ${cls(s.net_pnl_inr)}">${inr(s.net_pnl_inr, false)}</div>
+      <div class="k-sub ${cls(s.net_return_pct)}">${pct(s.net_return_pct, true)} return</div>
+    </div>`,
+    `<div class="kpi">
+      <div class="kpi-top"><span class="kpi-ico ico-blue">%</span><span class="k-label">Win rate</span></div>
+      <div class="k-value">${pct(s.win_rate_pct, false, 1)}</div>
+      <div class="k-sub">${wins} of ${s.total_trades} trades</div>
+    </div>`,
+    `<div class="kpi">
+      <div class="kpi-top"><span class="kpi-ico ico-blue">📈</span><span class="k-label">Profit factor</span></div>
+      <div class="k-value">${pf(s.profit_factor)}</div>
+      <div class="k-sub">gross wins / losses</div>
+    </div>`,
+    `<div class="kpi">
+      <div class="kpi-top"><span class="kpi-ico ico-red">↘</span><span class="k-label">Max drawdown</span></div>
+      <div class="k-value neg">${pct(-Math.abs(s.max_drawdown_pct || 0), false)}</div>
+      <div class="k-sub">Fees+GST ${inr(-s.fees_gst_inr)}</div>
+    </div>`,
+    `<div class="kpi">
+      <div class="kpi-top"><span class="kpi-ico ico-slate">≣</span><span class="k-label">Total trades</span></div>
+      <div class="k-value">${s.total_trades}</div>
+      <div class="k-sub">L ${s.long_trades} · S ${s.short_trades}</div>
+    </div>`,
   ].join("");
 }
 
 /* ------------------------------------------------------------------ ledger */
 const LEDGER_COLS = [
-  ["trade_id", "#"], ["symbol", "Symbol", "l"], ["side", "Side", "l"], ["entry_time", "Entry (UTC)", "l"], ["entry_price", "Entry"],
-  ["exit_time", "Exit (UTC)", "l"], ["exit_price", "Exit"], ["exit_reason", "Reason", "l"], ["contracts", "Lots"],
-  ["notional_entry_usd", "Notional $"], ["initial_sl", "SL"], ["tp_price", "TP"], ["gross_pnl_inr", "Gross ₹"],
-  ["fees_inr", "Fees+GST ₹"], ["funding_inr", "Funding ₹"], ["net_pnl_inr", "Net ₹"], ["net_pnl_usd", "Net $"],
-  ["equity_after_inr", "Equity ₹"], ["minutes_held", "Held"],
+  ["symbol", "Symbol", "l"],
+  ["side", "Side", "l"],
+  ["entry_price", "Entry"],
+  ["exit_price", "Exit"],
+  ["net_pnl_inr", "Net P&L"],
+  ["equity_after_inr", "Equity"],
+  ["minutes_held", "Duration"],
 ];
 
 function ledgerCell(t, key) {
   const v = t[key];
   switch (key) {
     case "side": return `<span class="tag ${v === "LONG" ? "tag-long" : "tag-short"}">${v}</span>`;
-    case "exit_reason": return `<span class="tag tag-reason">${esc(v)}</span>`;
-    case "entry_time": case "exit_time": return fmtTime(v);
-    case "notional_entry_usd": return `$${v.toFixed(2)}`;
-    case "gross_pnl_inr": case "funding_inr": case "net_pnl_inr": return `<span class="${cls(v)}">${inr(v)}</span>`;
-    case "fees_inr": return inr(-v);
-    case "net_pnl_usd": return `<span class="${cls(v)}">${usd(v)}</span>`;
+    case "entry_price": case "exit_price": return isNum(v) ? v.toFixed(2) : esc(v);
+    case "net_pnl_inr": return `<span class="${cls(v)}"><b>${inr(v)}</b></span>`;
     case "equity_after_inr": return `₹${nf2.format(v)}`;
     case "minutes_held": return v >= 1440 ? `${(v / 1440).toFixed(1)}d` : v >= 60 ? `${(v / 60).toFixed(1)}h` : `${v}m`;
     default: return esc(v);
@@ -464,7 +903,7 @@ function ledgerCell(t, key) {
 
 function renderLedger() {
   const trades = state.result.trades;
-  $("ledgerCount").textContent = `${trades.length} trades · INR at ₹${state.result.config.usd_inr_rate}/USD`;
+  $("ledgerCount").textContent = `${trades.length} trades · Sample rows from current run`;
   $("exportCsv").disabled = !trades.length;
   const head = `<thead><tr>${LEDGER_COLS.map(([, l, a]) => `<th class="${a || ""}">${l}</th>`).join("")}</tr></thead>`;
   const body = trades.map((t, i) => `<tr data-i="${i}">${LEDGER_COLS.map(([k, , a]) => `<td class="${a || ""}">${ledgerCell(t, k)}</td>`).join("")}</tr>`).join("");
@@ -501,8 +940,8 @@ function selectTrade(tr, { fromChart = false } = {}) {
 }
 
 function exportCsv() {
-  const trades = state.result.trades;
-  if (!trades.length) return;
+  const trades = state.result && state.result.trades;
+  if (!trades || !trades.length) return;
   const cols = ["trade_id", "symbol", "side", "signal_bar", "entry_time", "exit_time", "minutes_held", "contracts", "contract_value",
     "entry_price", "exit_price", "initial_sl", "final_sl", "tp_price", "exit_reason", "notional_entry_usd", "notional_exit_usd",
     "margin_usd", "gross_pnl_usd", "entry_fee_rate", "exit_fee_rate", "entry_fee_usd", "exit_fee_usd", "fees_usd", "gst_usd",
@@ -524,7 +963,7 @@ function renderWalkForward() {
     { label: "Full", start: r.window.start, end: r.window.end, days: r.window.days, summary: r.summary, audit_passed: r.audit.passed }];
   const syms = r.legs.map((l) => l.symbol);
   $("wfNote").textContent = r.windows.length
-    ? `Each window is an independent run with fresh ₹${nf0.format(r.config.initial_capital_inr)} capital (same method as the Step 3C CLI)${r.window.pinned_to_step3c && Math.round(r.window.days) === 180 ? " — pinned to the Step 3C anchor, so W1/W2/W3 match the walk-forward CSV." : "."}`
+    ? `Each window is an independent run with fresh ₹${nf0.format(r.config.initial_capital_inr)} capital.`
     : "Window breakdown disabled.";
   const head = ["Window", "Start (UTC)", "End (UTC)", "Days", "Trades", syms.length > 1 ? syms.join(" / ") : null, "Win %", "Gross ₹", "Fees+GST ₹", "Funding ₹", "Net ₹", "Return", "PF", "Max DD", "Audit"].filter(Boolean);
   const body = rows.map((w) => {
@@ -542,76 +981,6 @@ function renderWalkForward() {
     return `<tr>${cells.join("")}</tr>`;
   }).join("");
   $("wfTable").innerHTML = `<thead><tr>${head.map((h, i) => `<th class="${i < 3 ? "l" : ""}">${h}</th>`).join("")}</tr></thead><tbody>${body}</tbody>`;
-}
-
-/* ------------------------------------------------------------------ leaderboard */
-const LB_LABELS = {
-  symbol: "Symbol", strategy: "Strategy", tf: "TF", stops: "Stops", exits: "Exits", fees: "Fees", trades: "Trades", win_pct: "Win %",
-  net_W1: "W1 ₹", net_W2: "W2 ₹", net_W3: "W3 ₹", pos_windows: "+Win", net: "Net ₹", ret_pct: "Return", pf: "PF", max_dd: "Max DD",
-  fees_gst: "Fees+GST ₹", funding: "Funding ₹", passes: "Filter", net_train: "Train 60d ₹", net_test: "Test 30d ₹",
-};
-const LB_TEXT = new Set(["symbol", "strategy", "tf", "stops", "exits", "fees"]);
-
-function lbCell(row, c) {
-  const v = row[c];
-  if (c.startsWith("net") || c === "funding") return `<span class="${cls(v)}">${inr(v)}</span>`;
-  if (c === "fees_gst") return inr(-v);
-  if (c === "ret_pct") return `<span class="${cls(v)}">${pct(v, true)}</span>`;
-  if (c === "win_pct" || c === "max_dd") return pct(v, false, 1);
-  if (c === "pf") return pf(v);
-  if (c === "pos_windows") return `${v}/3`;
-  if (c === "passes") return v ? `<span class="tag tag-ok">pass</span>` : `<span class="muted">–</span>`;
-  return esc(v);
-}
-
-async function loadLeaderboard() {
-  const lb = state.lb;
-  const p = new URLSearchParams({ source: $("lbSource").value, sort: lb.sort, desc: lb.desc, limit: 300 });
-  if ($("lbSymbol").value) p.set("symbol", $("lbSymbol").value);
-  if ($("lbStrategy").value) p.set("strategy", $("lbStrategy").value);
-  if ($("lbTf").value) p.set("tf", $("lbTf").value);
-  if ($("lbPassing").checked) p.set("passing_only", "true");
-  try {
-    const r = await api(`/api/leaderboard?${p}`);
-    Object.assign(lb, { source: r.source, columns: r.columns, rows: r.rows, days: r.days });
-    $("lbCount").textContent = `${r.rows.length} of ${r.total} configs`;
-    const head = r.columns.map((c) => `<th class="sortable ${LB_TEXT.has(c) ? "l" : ""} ${c === lb.sort ? "sorted" + (lb.desc ? "" : " asc") : ""}" data-col="${c}">${LB_LABELS[c] || c}</th>`).join("");
-    const body = r.rows.map((row, i) => `<tr data-i="${i}">${r.columns.map((c) => `<td class="${LB_TEXT.has(c) ? "l" : ""}">${lbCell(row, c)}</td>`).join("")}</tr>`).join("");
-    $("lbTable").innerHTML = `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>`;
-    $("lbTable").querySelectorAll("th.sortable").forEach((th) => {
-      th.onclick = () => {
-        const c = th.dataset.col;
-        if (lb.sort === c) lb.desc = !lb.desc; else { lb.sort = c; lb.desc = !LB_TEXT.has(c); }
-        loadLeaderboard();
-      };
-    });
-    $("lbTable").querySelectorAll("tbody tr").forEach((tr) => { tr.onclick = () => loadLeaderboardRow(lb.rows[Number(tr.dataset.i)]); });
-  } catch (e) {
-    $("lbTable").innerHTML = "";
-    $("lbCount").textContent = e.message;
-  }
-}
-
-function parseStops(stops) {
-  const [mode, vals] = stops.split(" ");
-  const [sl, tp] = vals.split("/").map((v) => parseFloat(v));
-  return { stop_mode: mode, sl_value: sl, tp_value: tp };
-}
-
-function loadLeaderboardRow(row) {
-  const is3c = state.lb.source === "step3c";
-  applyPreset({
-    kind: "single", initial_capital_inr: 10000, leverage: 10, risk_per_trade_pct: 2, max_daily_loss_pct: 5,
-    fee_mode: is3c ? "taker_maker_tp" : row.fees, trigger_source: "trade", trail_atr_mult: 2.5,
-    slippage_bps: 0, trend_filter_4h: false, cost_gate: false, strict_lot_cap: false,
-    tag: is3c ? "[In-Sample 3-Window Selection]" : "",
-    days: state.lb.days, end: is3c ? state.anchor && state.anchor.end : null, anchor: is3c ? "step3c" : null,
-    legs: [{ symbol: row.symbol, strategy: row.strategy, timeframe: row.tf, exit_mode: row.exits, ...parseStops(row.stops) }],
-    note: is3c ? "Loaded from Step 3C leaderboard (in-sample ranking)" : "Loaded from Step 3B (90d, re-run on today's engine with full indicator warm-up — numbers can differ slightly from the 3B CSV)",
-    stats: is3c ? row : null,
-  });
-  $("presetSelect").value = "";
-  runBacktest();
 }
 
 /* ------------------------------------------------------------------ sync */
@@ -651,33 +1020,91 @@ function pollSync() {
 /* ------------------------------------------------------------------ wiring */
 function showTab(name) {
   document.querySelectorAll(".bottom .tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
-  ["ledger", "wf", "lb"].forEach((t) => $(`tab-${t}`).classList.toggle("hidden", t !== name));
+  ["ledger", "results", "wf"].forEach((t) => {
+    const el = $(`tab-${t}`);
+    if (el) el.classList.toggle("hidden", t !== name);
+  });
 }
 
 function bind() {
-  $("runBtn").onclick = runBacktest;
-  $("presetSelect").onchange = () => {
-    const p = state.presets[Number($("presetSelect").value)];
-    if ($("presetSelect").value === "" || !p) return;
-    applyPreset(p);
-    runBacktest();
+  $("runBtn").onclick = () => runBacktest();
+  $("saveResultBtn").onclick = saveCurrentBacktestResult;
+
+  $("symbolSelect").onchange = async () => {
+    await loadCustomStrategies($("symbolSelect").value);
+    markPreviewStale();
   };
-  document.querySelectorAll('input[name="runMode"]').forEach((r) => { r.onchange = () => setRunMode(runMode()); });
-  ["strategySelect", "tfSelect", "stopMode", "slValue", "tpValue", "exitMode"].forEach((id) => {
-    $(id).addEventListener("change", () => { if (state.legsOverride) { state.legsOverride = null; renderLegsNotice(); } });
+  $("strategySelect").onchange = () => {
+    applySelectedStrategyDefaults();
+    markPreviewStale();
+  };
+
+  document.querySelectorAll("#tfPills .tf-pill").forEach((b) => {
+    b.onclick = () => {
+      setTimeframePill(b.dataset.tf);
+      markPreviewStale();
+    };
   });
-  $("stopMode").addEventListener("change", () => {
-    const atr = $("stopMode").value === "atr";
-    $("slValue").value = atr ? 2 : 1.5;
-    $("tpValue").value = atr ? 5 : 4;
+
+  document.querySelectorAll("[data-risk]").forEach((b) => {
+    b.onclick = () => {
+      setRiskValue(b.dataset.risk);
+      markPreviewStale();
+    };
   });
-  $("daysSelect").onchange = toggleCustomRange;
-  document.querySelectorAll(".bottom .tab").forEach((b) => { b.onclick = () => showTab(b.dataset.tab); });
+  $("risk").oninput = () => {
+    setRiskValue($("risk").value);
+    markPreviewStale();
+  };
+
+  ["capital", "leverage", "slType", "slValue", "tpType", "tpValue", "trailEnabled", "trailAtr", "slippage", "feeMode", "daysSelect"].forEach((id) => {
+    const el = $(id);
+    if (el) el.addEventListener("change", () => {
+      if (id === "daysSelect") toggleCustomRange();
+      markPreviewStale();
+    });
+  });
+
+  $("newStrategyBtn").onclick = () => openStrategyModal(true);
+  $("editStrategyBtn").onclick = () => openStrategyModal(false);
+  $("stratRuleInput").onchange = () => renderRuleParamInputs($("stratRuleInput").value, {});
+  $("stratCancelBtn").onclick = () => $("strategyDialog").close();
+  $("strategyForm").addEventListener("submit", saveStrategyFromModal);
+  $("stratDeleteBtn").onclick = deleteStrategyFromModal;
+
+  $("toggleIndicatorsBtn").onclick = () => {
+    state.indicatorsVisible = !state.indicatorsVisible;
+    $("toggleIndicatorsBtn").classList.toggle("active", state.indicatorsVisible);
+    if (state.result && state.chartSymbol) renderChart(state.chartSymbol);
+  };
+  $("expandChartBtn").onclick = () => {
+    $("priceChartCard").classList.toggle("expanded");
+    if (priceChart) priceChart.timeScale().fitContent();
+  };
+
+  document.querySelectorAll(".bottom .tab").forEach((b) => {
+    b.onclick = () => {
+      showTab(b.dataset.tab);
+      if (b.dataset.tab === "results") loadSavedResults();
+    };
+  });
   $("exportCsv").onclick = exportCsv;
-  ["lbSource", "lbSymbol", "lbStrategy", "lbTf", "lbPassing"].forEach((id) => { $(id).onchange = () => {
-    if (id === "lbSource") { state.lb.sort = "net"; state.lb.desc = true; $("lbPassing").disabled = $("lbSource").value !== "step3c"; }
-    loadLeaderboard();
-  }; });
+
+  ["resSymbolFilter", "resTfFilter", "resMinWrFilter", "resMinPfFilter"].forEach((id) => {
+    $(id).addEventListener("change", loadSavedResults);
+  });
+  $("resStratFilter").addEventListener("input", () => {
+    clearTimeout(state._filterTimer);
+    state._filterTimer = setTimeout(loadSavedResults, 220);
+  });
+  $("resClearFiltersBtn").onclick = () => {
+    $("resSymbolFilter").value = "";
+    $("resStratFilter").value = "";
+    $("resTfFilter").value = "";
+    $("resMinWrFilter").value = "";
+    $("resMinPfFilter").value = "";
+    loadSavedResults();
+  };
 
   $("syncBtn").onclick = async () => {
     try { await startSync({}); } catch (e) { toast(e.message, true); }
@@ -728,6 +1155,7 @@ function botMsg(text, isError = false) {
 
 function setBadge(id, text, klass) {
   const b = $(id);
+  if (!b) return;
   b.textContent = text;
   b.className = `badge ${klass}`;
 }
@@ -900,8 +1328,6 @@ function bindBot() {
 const mt = { symbol: "BTCUSD", res: "5m", timer: null, chart: null, series: null, lines: [], lastBarTime: null, chartKey: null,
   catalog: null, product: null, state: null, previewTimer: null, preview: null, busy: false, protectSym: null, requestId: null };
 
-// Every manual mutation is bound to the mode the user saw (Step 9, F01): the server refuses it (409) when the
-// mode or its generation changed since, and in LIVE the typed confirmation travels with the request itself.
 function mtBinding(src, confirmText) {
   const b = { expected_mode: src.mode, mode_generation: src.mode_generation };
   if (src.mode === "live") b.confirm = confirmText;
@@ -1038,7 +1464,6 @@ async function mtPlace(side) {
     if (typed !== "LIVE") { mtMsg("Live order cancelled"); return; }
   } else if (!confirm(txt)) return;
   mt.busy = true; mtUpdateButtons();
-  // one id per ticket submission: a retry after a network error reuses it, so the server never opens it twice
   mt.requestId = mt.requestId || mtNewRequestId();
   try {
     const body = { ...mtReadOrder(side), ...mtBinding(pv, typed), client_request_id: mt.requestId };
@@ -1050,7 +1475,7 @@ async function mtPlace(side) {
     mtMsg(`${side} ${pv.symbol} [${(r.mode || mt.state.mode || "paper").toUpperCase()}]: ${r.result}${px ? ` @ ${fmtPx(px)}` : ""}${r.result === "resting" ? ` (limit ${req_limit(pv)})` : ""}${ex.exchange_order_id ? ` · order ${ex.exchange_order_id}` : ""}`);
     toast(`Manual ${side} ${pv.symbol}: ${r.result}`);
   } catch (e) {
-    if (e.status) mt.requestId = null;  // the server answered: the next click is a new request
+    if (e.status) mt.requestId = null;
     mtMsg(`Order failed: ${e.message}`, true);
     toast(`Order failed: ${e.message}`, true);
   } finally {
@@ -1289,7 +1714,7 @@ async function mtSwitchMode(mode) {
   try {
     const r = await api("/api/manual/mode", { method: "POST", body: JSON.stringify(body) });
     toast(`Manual mode: ${r.mode.toUpperCase()} (journal ${r.journal.split(/[\\/]/).pop()})`);
-    mt.preview = null;  // tickets priced in the old mode are stale (the server would refuse them anyway)
+    mt.preview = null;
     mt.requestId = null;
     await mtLoadState(true);
     mtSchedulePreview();
@@ -1363,7 +1788,7 @@ function bindManual() {
 }
 
 async function main() {
-  bindBot();  // the operations panel works even if the chart library cannot load
+  bindBot();
   bindManual();
   loadBotStatus();
   if (location.hash === "#bot") showView("bot");
@@ -1378,15 +1803,7 @@ async function main() {
     await loadStatus();
   } catch (e) {
     toast(`Status failed: ${e.message}`, true);
-    return;
   }
-  await loadPresets();
-  loadLeaderboard();
-  if (state.presets.length) {
-    $("presetSelect").value = "0";
-    applyPreset(state.presets[0]);
-  }
-  runBacktest();
 }
 
 main();

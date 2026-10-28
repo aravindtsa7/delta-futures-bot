@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     # --- Data ------------------------------------------------------------ #
     BASE_TIMEFRAME: str = "1m"
     SUPPORTED_RESAMPLE_TIMEFRAMES: list[str] = Field(
-        default_factory=lambda: ["3m", "5m", "15m", "1h", "2h", "4h"]
+        default_factory=lambda: ["1m", "3m", "5m", "15m", "30m", "45m", "1h", "2h", "4h"]
     )
     DEFAULT_LOOKBACK_DAYS: int = Field(90, ge=1)
     DATA_DIR: str = "data"
