@@ -1206,8 +1206,9 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame, *
             trig_l = c > dc["dc_high"]
             trig_s = c < dc["dc_low"]
         else:
-            trig_l = (~rib_l.shift(1).fillna(False)) | ((h > 0) & (h.shift(1) <= 0))
-            trig_s = (~rib_s.shift(1).fillna(False)) | ((h < 0) & (h.shift(1) >= 0))
+            # Keep boolean dtype: object-bool inversion produces truthy -1/-2.
+            trig_l = (~rib_l.shift(1, fill_value=False)) | ((h > 0) & (h.shift(1) <= 0))
+            trig_s = (~rib_s.shift(1, fill_value=False)) | ((h < 0) & (h.shift(1) >= 0))
 
         vol_ok = (v >= vol_m * out["vol_sma20"]) if vol_m > 0 else pd.Series(True, index=bars.index)
         adx_ok = out["adx14"] >= adx_min

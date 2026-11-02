@@ -2,11 +2,15 @@
 Run: python -m pytest -q test_review_repairs.py
 """
 import testenv  # noqa: F401
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import socket
 import shutil
+import threading
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -28,9 +32,45 @@ from notifier import TelegramNotifier
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch, tmp_path):
     # No fixture is permitted to reach an external server or overwrite user data.
+    real_connect = socket.socket.connect
+
     def no_network(*a, **k):
         raise AssertionError("network is forbidden in review regression tests")
+
+    def runtime_socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
+        """Private TCP pair for asyncio's self-pipe, including TestClient threads.
+
+        Like Python's Windows fallback, but only these newly created sockets can
+        use the saved connect method. Never unpatch connect or exempt localhost
+        (or an entire thread): either would let unrelated requests escape.
+        """
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            raise ValueError("Only AF_INET and AF_INET6 socket families are supported")
+        if type != socket.SOCK_STREAM or proto != 0:
+            raise ValueError("Only SOCK_STREAM with protocol zero is supported")
+        host = '127.0.0.1' if family == socket.AF_INET else '::1'
+        with socket.socket(family, type, proto) as listener, ExitStack() as cleanup:
+            listener.bind((host, 0))
+            listener.listen()
+            client = cleanup.enter_context(socket.socket(family, type, proto))
+            client.setblocking(False)
+            try:
+                real_connect(client, listener.getsockname())
+            except (BlockingIOError, InterruptedError):
+                pass
+            client.setblocking(True)
+            server, _ = listener.accept()
+            cleanup.enter_context(server)
+            # Reject a different process racing our connector to the listener.
+            if (server.getsockname() != client.getpeername()
+                    or client.getsockname() != server.getpeername()):
+                raise ConnectionError("Unexpected peer connection")
+            cleanup.pop_all()
+            return server, client
+
     monkeypatch.setattr(socket.socket, 'connect', no_network)
+    monkeypatch.setattr(socket.socket, 'connect_ex', no_network)
+    monkeypatch.setattr(socket, 'socketpair', runtime_socketpair)
     shutil.copytree(Path(__file__).parent/'data'/'metadata', tmp_path/'metadata')
     monkeypatch.setattr(settings, 'DATA_DIR', str(tmp_path))
     monkeypatch.setattr(settings, 'TELEGRAM_BOT_TOKEN', '')
@@ -39,6 +79,69 @@ def isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(ee, 'BOT_PROFILES_FILE', tmp_path/'profiles.json')
     monkeypatch.setattr(bot_ops, '_signals', lambda: {})
     app._frame_cache.clear()
+
+
+@pytest.mark.parametrize('method', ['connect', 'connect_ex'])
+@pytest.mark.parametrize('family,host', [
+    (socket.AF_INET, '192.0.2.1'),
+    (socket.AF_INET, '127.0.0.1'),
+    (socket.AF_INET6, '::1'),
+])
+def test_offline_guard_blocks_ordinary_connections(method, family, host):
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        with pytest.raises(AssertionError, match='network is forbidden'):
+            getattr(sock, method)((host, 443))
+
+
+@pytest.mark.parametrize('family', [socket.AF_INET, socket.AF_INET6])
+def test_offline_socketpair_in_worker_thread_keeps_guard_active(monkeypatch, family):
+    accepting = threading.Event()
+    release = threading.Event()
+    real_accept = socket.socket.accept
+
+    def blocked(address):
+        for method in ('connect', 'connect_ex'):
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                with pytest.raises(AssertionError, match='network is forbidden'):
+                    getattr(sock, method)(address)
+
+    def paused_accept(listener):
+        # Even this pair's active listening port is forbidden to ordinary calls
+        # in the creating thread; this is not a thread-local network exemption.
+        blocked(listener.getsockname())
+        accepting.set()
+        assert release.wait(5), 'test did not release socketpair accept'
+        return real_accept(listener)
+
+    def roundtrip():
+        with ExitStack() as cleanup:
+            left, right = socket.socketpair(family)
+            cleanup.enter_context(left)
+            cleanup.enter_context(right)
+            left.settimeout(5)
+            right.settimeout(5)
+            left.sendall(b'a')
+            assert right.recv(1) == b'a'
+            right.sendall(b'b')
+            assert left.recv(1) == b'b'
+            blocked(left.getsockname())
+
+    monkeypatch.setattr(socket.socket, 'accept', paused_accept)
+    host = '127.0.0.1' if family == socket.AF_INET else '::1'
+    with socket.socket(family, socket.SOCK_STREAM) as service:
+        service.bind((host, 0))
+        service.listen()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(roundtrip)
+            try:
+                assert accepting.wait(5), 'worker did not create socketpair'
+                # A local proxy/service cannot be reached even while another
+                # thread is inside socketpair construction.
+                blocked(service.getsockname())
+            finally:
+                release.set()
+            future.result(timeout=5)
+        blocked(service.getsockname())
 
 
 def frame(n=12, start='2026-01-01 00:45'):
@@ -267,6 +370,37 @@ def test_strategy_signal_prefix(rule,synthetic_history):
     pre=strategies.generate_signals(rule,bp,bars_4h=b4p)
     for col in ['signal','exit_signal']:
         if col in pre:pd.testing.assert_series_equal(full.loc[pre.index,col],pre[col])
+
+
+@pytest.mark.parametrize('direction', [1, -1])
+def test_ema_ribbon_requires_new_ribbon_or_histogram_cross(monkeypatch, direction):
+    bars = frame(9)
+    # Ribbon becomes active at bar 1, stays active through a histogram cross at
+    # bar 5, breaks at bar 7, and forms again at bar 8. Other gates all pass.
+    active = pd.Series([False, True, True, True, True, True, True, False, True], index=bars.index)
+
+    def fake_ema(close, period):
+        distance = {8: 1., 13: 2., 21: 3., 55: 4.}[period]
+        result = close - direction * distance
+        if period == 8:
+            result = result.where(active, close + direction)
+        return result
+
+    hist = pd.Series([1., 2., 3., 4., -1., 1., 2., 3., 4.], index=bars.index) * direction
+    monkeypatch.setattr(strategies, 'ema', fake_ema)
+    monkeypatch.setattr(strategies, 'macd', lambda *a: pd.DataFrame({'macd_hist': hist}))
+    monkeypatch.setattr(strategies, 'rsi', lambda *a: pd.Series(60 if direction == 1 else 40, index=bars.index))
+    monkeypatch.setattr(strategies, 'adx', lambda *a: pd.DataFrame({'adx': 30.}, index=bars.index))
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', DeprecationWarning)
+        out = strategies.evaluate_custom_strategy('scalp_ema_ribbon', {
+            'macro_ema': 0, 'use_4h_trend': 0, 'vol_mult': 0, 'cost_gate_mult': 0,
+        }, bars)
+    side = 'long' if direction == 1 else 'short'
+    other = 'short' if direction == 1 else 'long'
+    assert out['cond_' + side].tolist() == [False, True, False, False, False, True, False, False, True]
+    assert not out['cond_' + other].any()
+    assert out['signal'].tolist() == [0, direction, 0, 0, 0, direction, 0, 0, direction]
 
 
 def test_replay_detects_changed_source(monkeypatch):
