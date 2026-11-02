@@ -29,3 +29,6 @@ data/logs/
 # --- Verification-suite scratch directories ---
 data/step*_test/
 data/step8_smoke/
+
+# Immutable local research evidence (not source code)
+data/backtest_runs/

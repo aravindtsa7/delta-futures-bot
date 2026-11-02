@@ -1092,8 +1092,8 @@ def _api_body(c: TestClient, live: FakeDelta9, tn: FakeDelta9) -> None:
     rb = c.post("/api/manual/symbols", json={"symbol": "DOGEUSD", "backfill": False, "enable_auto_bot": True})
     prof = ee.bot_profiles()
     entries = json.loads(ee.BOT_PROFILES_FILE.read_text(encoding="utf-8")) if ee.BOT_PROFILES_FILE.exists() else {}
-    check("Section 5", "a newly added coin defaults to {'variant': 'C_costgate', 'enabled': false} (no auto-trading); "
-          "enable_auto_bot=true opts in", ra.status_code == 200 and rb.status_code == 200 and entries.get("XRPUSD") == {"variant": "C_costgate", "enabled": False}
+    check("Section 5", "a newly added coin stays undeployed (no auto-trading); "
+          "enable_auto_bot=true opts in", ra.status_code == 200 and rb.status_code == 200 and "XRPUSD" not in entries
           and "XRPUSD" not in prof and prof.get("DOGEUSD") is not None and prof["DOGEUSD"].variant == "C_costgate", f"bot_profiles.json {entries}")
 
 

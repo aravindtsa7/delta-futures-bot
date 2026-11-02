@@ -729,10 +729,11 @@ class LiveBotRunner:
         if self.daily_halted:
             return
         eq = self.equity_inr()
-        limit = self.day_start_equity * (1 - ee.DAILY_LOSS_LIMIT_PCT / 100)
+        daily_pct = float(self.engine.cfg_row["daily_loss_limit_pct"])
+        limit = self.day_start_equity * (1 - daily_pct / 100)
         reason = kind = None
-        if eq <= limit:
-            kind, reason = "DAILY", f"daily loss limit: equity ₹{eq:,.2f} <= ₹{limit:,.2f} (5% below day start ₹{self.day_start_equity:,.2f})"
+        if daily_pct > 0 and eq <= limit:
+            kind, reason = "DAILY", f"daily loss limit: equity ₹{eq:,.2f} <= ₹{limit:,.2f} ({daily_pct:g}% below day start ₹{self.day_start_equity:,.2f})"
         elif (n := self.loss_streak()) >= self.max_consecutive_losses:
             kind, reason = "LOSS_STREAK", f"{n} consecutive losing trades"
         if reason:

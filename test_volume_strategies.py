@@ -38,13 +38,15 @@ TIMEFRAMES = ("15m", "30m", "45m")
 
 # Cache _closed_4h_regime per (id(bars), ema_custom) for fast multi-TF evaluation
 _orig_closed_4h = st._closed_4h_regime
-_reg4_cache: dict[tuple[int, int], pd.DataFrame] = {}
+_reg4_cache: dict[tuple[int, int, int], pd.DataFrame] = {}
+_reg4_sources: dict[tuple[int, int, int], tuple] = {}
 
 
-def _cached_closed_4h(bars: pd.DataFrame, ema_custom: int = 100) -> pd.DataFrame:
-    key = (id(bars), int(ema_custom))
+def _cached_closed_4h(bars: pd.DataFrame, ema_custom: int = 100, bars_4h: pd.DataFrame | None = None) -> pd.DataFrame:
+    key = (id(bars), int(ema_custom), id(bars_4h))
     if key not in _reg4_cache:
-        _reg4_cache[key] = _orig_closed_4h(bars, ema_custom)
+        _reg4_sources[key] = (bars, bars_4h)
+        _reg4_cache[key] = _orig_closed_4h(bars, ema_custom, bars_4h=bars_4h)
     return _reg4_cache[key]
 
 
@@ -144,6 +146,7 @@ def main() -> None:
         eval_days = round((end - start) / pd.Timedelta(days=1), 1)
         half_mid = start + (end - start) / 2
 
+        bars_4h = dm.resample_candles(df_1m, "4h")
         spec = bt.ProductSpec.from_metadata(sym)
         meta = dm.load_metadata(sym)
         max_lev = int(float(meta.get("default_leverage") or 20))
@@ -156,7 +159,7 @@ def main() -> None:
 
             for rule_type, label, params in CANDIDATES:
                 p_use = dict(params)
-                out = st.evaluate_custom_strategy(rule_type, p_use, bars)
+                out = st.evaluate_custom_strategy(rule_type, p_use, bars, bars_4h=bars_4h)
                 sig = out["signal"]
                 in_win_sigs = int((sig[(bars.index >= start) & (bars.index < end)] != 0).sum())
                 if in_win_sigs < 5 or in_win_sigs > 140:

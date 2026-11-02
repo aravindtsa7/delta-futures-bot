@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 import backup_state
 import data_manager as dm
+import run_store
 import execution_engine as ee
 import live_bot as lb
 from config import PROJECT_ROOT, settings
@@ -435,7 +436,36 @@ class DeployStrategyRequest(BaseModel):
 
 
 def _build_deploy_entry(saved: dict[str, Any] | None, req: DeployStrategyRequest) -> dict[str, Any]:
-    src = saved or {}
+    src = dict(saved or {})
+    if saved is not None:
+        if not saved.get("run_id") or not saved.get("verified_run"):
+            raise HTTPException(422, "legacy result has no verified run evidence; rerun and save before deployment")
+        # Reload the content-addressed server result; editable library summaries are not authority.
+        try:
+            evidence = run_store.get(saved["run_id"])
+        except (ValueError, OSError, EOFError) as exc:
+            raise HTTPException(422, f"deployment evidence unavailable: {exc}") from exc
+        r = evidence["result"]
+        if not r["audit"]["passed"] or len(r["legs"]) != 1:
+            raise HTTPException(422, "deployment requires a passing single-symbol run")
+        leg = r["legs"][0]
+        cfg = evidence["leg_configs"][leg["symbol"]]
+        c = r["config"]
+        # Overrides require a new backtest, otherwise the displayed result would no longer apply.
+        changed = set(req.model_fields_set) - {"result_id", "saved_result_id", "id", "enabled", "custom_name", "strategy_name"}
+        if changed:
+            raise HTTPException(422, "rerun the backtest to change execution settings before deployment")
+        src.update(symbol=leg["symbol"], timeframe=leg["timeframe"], rule_type=c.get("rule_type") or leg["strategy"],
+                   params=c.get("params", {}), capital_inr=cfg["initial_capital_inr"], leverage=cfg["leverage"],
+                   risk_pct=cfg["risk_per_trade_pct"], sl_type=c["sl_type"], sl_value=c["sl_value"],
+                   tp_type=c["tp_type"], tp_value=c["tp_value"], trail_mult=cfg["trailing_atr_mult"],
+                   trailing_stop=cfg["trailing_atr_mult"] > 0 or cfg["trailing_sl_pct"] > 0,
+                   fee_mode=cfg["fee_mode"], slippage_bps=cfg["slippage_bps"],
+                   use_4h_trend=r["filters"]["trend_filter_4h"], use_cost_gate=r["filters"]["cost_gate"],
+                   strict_lot_cap=not cfg["allow_min_one_lot"], effective_config=cfg,
+                   history_start=evidence["history_starts"][leg["symbol"]],
+                   cooldown_bars=cfg["cooldown_bars"], max_daily_loss_pct=cfg["max_daily_loss_pct"],
+                   trigger_source=cfg["trigger_source"], exit_on_opposite_signal=cfg["exit_on_opposite_signal"])
     sym = str(req.symbol or src.get("symbol") or "").strip().upper()
     if not sym:
         raise HTTPException(422, "symbol or valid result_id is required to deploy a strategy")
@@ -458,7 +488,7 @@ def _build_deploy_entry(saved: dict[str, Any] | None, req: DeployStrategyRequest
     slippage_bps = float(req.slippage_bps if req.slippage_bps is not None else (src.get("slippage_bps") or 0.0))
     use_4h = bool(req.use_4h_trend if req.use_4h_trend is not None else src.get("use_4h_trend", bool(params.get("use_4h_trend", False))))
     use_gate = bool(req.use_cost_gate if req.use_cost_gate is not None else src.get("use_cost_gate", False))
-    return {
+    entry = {
         "enabled": bool(req.enabled),
         "saved_result_id": rid,
         "custom_name": cname,
@@ -480,7 +510,14 @@ def _build_deploy_entry(saved: dict[str, Any] | None, req: DeployStrategyRequest
         "use_4h_trend": use_4h,
         "use_cost_gate": use_gate,
         "deployed_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        **{k: src[k] for k in ("effective_config", "history_start", "cooldown_bars", "max_daily_loss_pct",
+                               "trigger_source", "exit_on_opposite_signal", "strict_lot_cap", "run_id") if k in src},
     }
+    try:
+        ee.validate_deployable(ee._profile_from_dict(sym, entry))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return entry
 
 
 @router.get("/deployed")
@@ -514,16 +551,27 @@ def deploy_strategy_to_bot(req: DeployStrategyRequest) -> dict[str, Any]:
             if cand and str(cand) in saved_all:
                 src = saved_all[str(cand)]
                 break
-        if rid and src is None and not req.symbol:
+        if rid and src is None:
             raise HTTPException(404, f"saved backtest result {rid!r} not found")
         entry = _build_deploy_entry(src, req)
         raw_profiles[entry["symbol"]] = entry
         deployed_symbols.append(entry["symbol"])
 
+    _validate_active_wallet(raw_profiles)
     ee.save_bot_profiles_raw(raw_profiles)
     _cache.pop("signals", None)
     view = deployed_summary_view(_signals())
     return _clean({"ok": True, "deployed_symbols": deployed_symbols, **view})
+
+
+def _validate_active_wallet(raw_profiles: dict[str, Any]) -> None:
+    try:
+        active = [ee.profile_config(ee._profile_from_dict(sym, ov))
+                  for sym, ov in raw_profiles.items() if ov.get("enabled", True)]
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if len({(c.initial_capital_inr, c.max_daily_loss_pct, c.usd_inr_rate) for c in active}) > 1:
+        raise HTTPException(422, "active strategies must share the same wallet capital, FX and daily loss limit")
 
 
 class ToggleDeployedRequest(BaseModel):
@@ -539,6 +587,8 @@ def toggle_deployed_strategy(symbol: str, req: ToggleDeployedRequest | None = No
     cur = bool(raw_profiles[sym].get("enabled", True))
     new_state = (not cur) if (req is None or req.enabled is None) else bool(req.enabled)
     raw_profiles[sym]["enabled"] = new_state
+    if new_state:
+        _validate_active_wallet(raw_profiles)
     ee.save_bot_profiles_raw(raw_profiles)
     _cache.pop("signals", None)
     view = deployed_summary_view(_signals())
