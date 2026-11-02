@@ -256,6 +256,21 @@ def test_missing_funding_rejected():
     with pytest.raises(ValueError,match='missing funding'):run_with_cfg(f,config())
 
 
+@pytest.mark.parametrize('symbols', [('XRPUSD',), ('XRPUSD', 'OTHER')])
+def test_signal_summary_counts_availability_inside_simulation_window(symbols):
+    f = frame(6)
+    # Availability is the next minute: the warmup signal acts before start,
+    # one signal acts exactly at start, and one acts at the exclusive end.
+    sig = pd.Series([1, 1, -1], index=[
+        f.index[0] - pd.Timedelta(minutes=1), f.index[0], f.index[3],
+    ])
+    legs = [bt.Leg(spec(symbol), f, sig, '1m') for symbol in symbols]
+    result = bt.Backtester(config()).run_portfolio(legs, f.index[1], f.index[4])
+    assert result.summary['signals'] == len(symbols)
+    assert len(result.trades) == len(symbols)
+    assert (result.trades.entry_time == f.index[1]).all()
+
+
 def test_45m_four_hour_source_is_true_and_prefix_stable():
     f=frame(960,'2026-01-01');f['close']=np.arange(960)+100.
     bars=dm.resample_candles(f,'45m');b4=dm.resample_candles(f,'4h')

@@ -495,7 +495,10 @@ class Backtester:
         trades = pd.DataFrame(sim.trades) if sim.trades else empty_trades()
         funding = pd.DataFrame(sim.fund_rows) if sim.fund_rows else pd.DataFrame(columns=FUNDING_COLUMNS)
         equity = pd.Series(sim.equity, index=index, name="equity_inr")
-        n_signals = sum(len(s.entry_map) for s in states)
+        # Count signals when their closed bars become actionable in this run,
+        # excluding warmup history and the exclusive end of the window.
+        first_minute, last_minute = int(t[0]), int(t[-1])
+        n_signals = sum(first_minute <= available <= last_minute for s in states for available in s.entry_map)
         summary = _summarise(cfg, trades, funding, equity, sim.counters, n_signals, len(legs))
         return BacktestResult(
             symbols=[leg.product.symbol for leg in legs],
