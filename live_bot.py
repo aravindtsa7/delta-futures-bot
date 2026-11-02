@@ -228,7 +228,12 @@ class RestMarketData:
             days = 90 if sym in self.profiles else 2  # managed-only symbols (manual positions) need recent minutes only
             fetched = sum(dm.download_1m_series(sym, st, days=days).rows_fetched for st in dm.SERIES_TYPES)
             hist = ee.load_history(sym)
+            if hist is not None and len(hist):
+                hist.columns = [str(c).lower() for c in hist.columns]
             self._hist[sym] = hist
+            if hist is None or len(hist) == 0:
+                out[sym] = {"status": "no_data", "signal": "FLAT", "close": 0.0, "fetched": fetched, "gaps": {}}
+                continue
             g = hist.attrs.get("gaps", {})
             out[sym] = {"last_1m": int(hist.index[-1].value // 10**9), "fetched": fetched,
                         "gaps": {k: v.gap_count for k, v in g.items()}}
@@ -241,7 +246,10 @@ class RestMarketData:
 
     def evaluate(self, sym: str, hour_close_s: int | None = None) -> dict[str, Any] | None:
         self.sync([sym])
-        s = ee.evaluate_symbol(self.profiles[sym], self._hist[sym])
+        h = self._hist.get(sym)
+        if h is None or len(h) == 0:
+            return None  # no_data -> FLAT
+        s = ee.evaluate_symbol(self.profiles[sym], h)
         if hour_close_s is not None and int(s["bar_close"].value // 10**9) != hour_close_s:
             return None  # REST has not published that hour yet
         return s
@@ -573,8 +581,21 @@ class LiveBotRunner:
             issues.append(f"missing_confirmed_protection:{sym}")
         return out
 
+    def _tf_seconds(self, symbol: str) -> int:
+        prof = self.profiles.get(symbol)
+        tf = prof.timeframe if prof else "1h"
+        return int(dm.TIMEFRAME_MINUTES.get(tf, 60)) * 60
+
+    def _is_tf_boundary(self, symbol: str, close_s: int) -> bool:
+        if symbol not in self.profiles:
+            return False
+        tf_s = self._tf_seconds(symbol)
+        if tf_s == 2700:  # 45m aligned to UTC day boundary
+            return (close_s % 86400) % 2700 == 0
+        return close_s % tf_s == 0
+
     def _catch_up(self, cov: dict[str, dict[str, Any]]) -> None:
-        """Replay closed minutes missed while away over open positions; queue a missed hour close."""
+        """Replay closed minutes missed while away over open positions; queue a missed timeframe close."""
         for sym, c in cov.items():
             last = self.last_minute.get(sym)
             p = self.store.position(self.mode, sym)
@@ -590,11 +611,11 @@ class LiveBotRunner:
                         if a:
                             self.actions.append({"symbol": sym, "catch_up": True, **a})
                     self.last_close[sym] = cl
-                    if (bar_s + 60) % 3600 == 0 and sym in self.profiles:
+                    if self._is_tf_boundary(sym, bar_s + 60):
                         self.pending_hour[sym] = bar_s + 60
             self.last_minute[sym] = max(self.last_minute.get(sym, 0), c["last_1m"])
 
-    # -- minute / hour processing --------------------------------------------------------- #
+    # -- minute / timeframe processing --------------------------------------------------------- #
     @_locked
     def on_minute_close(self, symbol: str, bar_s: int, o: float, h: float, l: float, c: float, source: str = "ws") -> None:
         if symbol not in self.symbols:
@@ -625,7 +646,7 @@ class LiveBotRunner:
         self._risk_checks(bar_s)
         if self.state == "HALTED" and not self.daily_halted:
             self.run_reconciliation("halt expired")
-        if (bar_s + 60) % 3600 == 0 and symbol in self.profiles:
+        if self._is_tf_boundary(symbol, bar_s + 60):
             self.pending_hour[symbol] = bar_s + 60
         if symbol in self.pending_hour:
             self._try_hour_signal(symbol)

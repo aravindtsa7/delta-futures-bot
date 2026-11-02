@@ -99,11 +99,28 @@ class EntryBlockedError(ExchangeError):
 @dataclass(frozen=True)
 class StrategyProfile:
     symbol: str
-    variant: str
-    strategy: str
-    timeframe: str
-    trend_filter_4h: bool
-    cost_gate: bool
+    variant: str = "custom"
+    strategy: str = STRATEGY
+    timeframe: str = TIMEFRAME
+    trend_filter_4h: bool = False
+    cost_gate: bool = False
+    enabled: bool = True
+    saved_result_id: str | None = None
+    custom_name: str | None = None
+    rule_type: str | None = None
+    params: dict[str, Any] | None = None
+    capital_inr: float = CAPITAL_INR
+    leverage: float = float(LEVERAGE)
+    risk_pct: float = RISK_PCT
+    sl_type: str = "atr_mult"
+    sl_value: float = SL_ATR_MULT
+    tp_type: str = "atr_mult"
+    tp_value: float = TP_ATR_MULT
+    trailing_stop: bool = True
+    trail_mult: float = TRAIL_ATR_MULT
+    fee_mode: str = "taker_maker_tp"
+    slippage_bps: float = 0.0
+    deployed_at: str | None = None
 
 
 FROZEN_PROFILES: dict[str, StrategyProfile] = {
@@ -118,46 +135,99 @@ BOT_PROFILES_FILE = settings.data_path / "bot_profiles.json"
 
 
 def make_profile(symbol: str, variant: str = DEFAULT_VARIANT) -> StrategyProfile:
-    trend, gate = VARIANT_FLAGS[variant]
+    trend, gate = VARIANT_FLAGS.get(variant, (False, True))
     return StrategyProfile(symbol, variant, STRATEGY, TIMEFRAME, trend, gate)
 
 
-def bot_profiles() -> dict[str, StrategyProfile]:
-    """Auto-bot universe: BTCUSD (D) + ETHUSD (C) + every coin added in the dashboard (default C_costgate).
-    data/bot_profiles.json overrides per symbol: {"SOLUSD": {"enabled": false}} or {"XRPUSD": {"variant": "D_both"}}.
-    Since Step 9, POST /api/manual/symbols writes {"variant": "C_costgate", "enabled": false} for a new coin
-    (see set_bot_profile_default), so added coins only auto-trade after an explicit opt-in."""
-    out = dict(FROZEN_PROFILES)
-    for sym in dm.app_symbols():
-        if sym not in out and dm.metadata_path(sym).exists():
-            out[sym] = make_profile(sym)
-    if BOT_PROFILES_FILE.exists():
-        for sym, ov in json.loads(BOT_PROFILES_FILE.read_text(encoding="utf-8")).items():
-            if ov.get("enabled") is False:
-                out.pop(sym, None)
-            elif ov.get("variant") in VARIANT_FLAGS and (sym in out or dm.metadata_path(sym).exists()):
-                out[sym] = make_profile(sym, ov["variant"])
-    return out
-
-
-def set_bot_profile_default(symbol: str, enable: bool = False, variant: str = DEFAULT_VARIANT) -> dict[str, Any]:
-    """Section 5 guard: a coin added from the dashboard gets {"variant": "C_costgate", "enabled": false} in
-    data/bot_profiles.json, so it never auto-trades unless explicitly enabled. An existing entry is kept (only
-    ``enable=True`` switches it on)."""
-    data = json.loads(BOT_PROFILES_FILE.read_text(encoding="utf-8")) if BOT_PROFILES_FILE.exists() else {}
-    if symbol in FROZEN_PROFILES:
-        return data.get(symbol, {})
-    entry = data.get(symbol)
-    if entry is None:
-        entry = data[symbol] = {"variant": variant, "enabled": bool(enable)}
-    elif enable:
-        entry["enabled"] = True
+def _profile_from_dict(symbol: str, ov: dict[str, Any]) -> StrategyProfile:
+    sym = symbol.strip().upper()
+    variant = str(ov.get("variant") or ov.get("custom_name") or ov.get("rule_type") or "custom")
+    rule_type = ov.get("rule_type")
+    strat = str(ov.get("strategy") or rule_type or STRATEGY)
+    tf = str(ov.get("timeframe") or TIMEFRAME)
+    if variant in VARIANT_FLAGS and "use_4h_trend" not in ov and "trend_filter_4h" not in ov:
+        trend_4h, c_gate = VARIANT_FLAGS[variant]
     else:
-        return entry
+        trend_4h = bool(ov.get("use_4h_trend") if "use_4h_trend" in ov else ov.get("trend_filter_4h", False))
+        c_gate = bool(ov.get("use_cost_gate") if "use_cost_gate" in ov else ov.get("cost_gate", False))
+    trailing_stop = bool(ov.get("trailing_stop", True))
+    trail_m = float(ov.get("trail_mult", TRAIL_ATR_MULT)) if trailing_stop else 0.0
+    return StrategyProfile(
+        symbol=sym,
+        variant=variant,
+        strategy=strat,
+        timeframe=tf,
+        trend_filter_4h=trend_4h,
+        cost_gate=c_gate,
+        enabled=bool(ov.get("enabled", True)),
+        saved_result_id=ov.get("saved_result_id"),
+        custom_name=str(ov.get("custom_name") or ov.get("strategy_name") or variant),
+        rule_type=rule_type,
+        params=dict(ov.get("params") or {}),
+        capital_inr=float(ov.get("capital_inr") or CAPITAL_INR),
+        leverage=float(ov.get("leverage") or LEVERAGE),
+        risk_pct=float(ov.get("risk_pct") or RISK_PCT),
+        sl_type=str(ov.get("sl_type") or "atr_mult"),
+        sl_value=float(ov.get("sl_value") or SL_ATR_MULT),
+        tp_type=str(ov.get("tp_type") or "atr_mult"),
+        tp_value=float(ov.get("tp_value") or TP_ATR_MULT),
+        trailing_stop=trailing_stop,
+        trail_mult=trail_m,
+        fee_mode=str(ov.get("fee_mode") or "taker_maker_tp"),
+        slippage_bps=float(ov.get("slippage_bps") or 0.0),
+        deployed_at=ov.get("deployed_at"),
+    )
+
+
+def load_bot_profiles_raw() -> dict[str, dict[str, Any]]:
+    if not BOT_PROFILES_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(BOT_PROFILES_FILE.read_text(encoding="utf-8"))
+        return {str(k).strip().upper(): v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def save_bot_profiles_raw(data: dict[str, dict[str, Any]]) -> None:
     BOT_PROFILES_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = BOT_PROFILES_FILE.with_name(BOT_PROFILES_FILE.name + f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(tmp, BOT_PROFILES_FILE)
+
+
+def all_deployed_profiles() -> dict[str, StrategyProfile]:
+    """All strategies stored in data/bot_profiles.json (both enabled and paused)."""
+    raw = load_bot_profiles_raw()
+    out: dict[str, StrategyProfile] = {}
+    for sym, ov in raw.items():
+        out[sym] = _profile_from_dict(sym, ov)
+    return out
+
+
+def bot_profiles() -> dict[str, StrategyProfile]:
+    """Active Auto-Bot roster: ONLY strategies explicitly deployed and enabled in data/bot_profiles.json."""
+    raw = load_bot_profiles_raw()
+    out: dict[str, StrategyProfile] = {}
+    for sym, ov in raw.items():
+        if ov.get("enabled", True) is False:
+            continue
+        if dm.metadata_path(sym).exists() or sym in FROZEN_PROFILES:
+            out[sym] = _profile_from_dict(sym, ov)
+    return out
+
+
+def set_bot_profile_default(symbol: str, enable: bool = False, variant: str = DEFAULT_VARIANT) -> dict[str, Any]:
+    """When a coin is added from Manual Trade / Data Lab, do not auto-deploy unless enable=True."""
+    data = load_bot_profiles_raw()
+    entry = data.get(symbol)
+    if not enable:
+        return entry or {"variant": variant, "enabled": False}
+    if entry is None:
+        entry = data[symbol] = {"variant": variant, "enabled": True}
+    else:
+        entry["enabled"] = True
+    save_bot_profiles_raw(data)
     return entry
 
 
@@ -633,35 +703,77 @@ class LotSizing:
 
 
 def sizing_config(equity_inr: float, risk_pct: float = RISK_PCT, leverage: float = LEVERAGE,
-                  slippage_bps: float | None = None) -> BacktestConfig:
-    """The Step 4B backtest config the live sizer shares (taker fees + GST, strict lots)."""
-    return BacktestConfig(
-        initial_capital_inr=equity_inr, leverage=leverage, risk_per_trade_pct=risk_pct,
+                  slippage_bps: float | None = None, *, sl_type: str = "atr_mult", sl_value: float = SL_ATR_MULT,
+                  tp_type: str = "atr_mult", tp_value: float = TP_ATR_MULT, trail_mult: float = TRAIL_ATR_MULT,
+                  atr_pct: float = 1.0) -> BacktestConfig:
+    """The backtest config the live sizer shares (taker fees + GST, strict lots, honoring custom SL/TP/leverage/risk)."""
+    sl_val = max(0.05, float(sl_value))
+    tp_val = max(0.05, float(tp_value))
+    ap = max(0.05, float(atr_pct or 1.0))
+    if sl_type in ("fixed_pct", "pct"):
+        if tp_type == "rr_ratio":
+            tp_pct = sl_val * tp_val
+        elif tp_type in ("atr_mult", "atr"):
+            tp_pct = tp_val * ap
+        else:
+            tp_pct = tp_val
+        stops = dict(sl_mode="pct", stop_loss_pct=sl_val, take_profit_pct=max(0.05, tp_pct))
+    else:
+        if tp_type == "rr_ratio":
+            tp_atr = sl_val * tp_val
+        elif tp_type in ("fixed_pct", "pct"):
+            tp_atr = tp_val / ap
+        else:
+            tp_atr = tp_val
+        stops = dict(sl_mode="atr", sl_atr_mult=sl_val, tp_atr_mult=max(0.1, tp_atr))
+    cfg = BacktestConfig(
+        initial_capital_inr=equity_inr, leverage=min(float(leverage), 100.0), risk_per_trade_pct=risk_pct,
         max_daily_loss_pct=DAILY_LOSS_LIMIT_PCT, fee_mode="taker", trigger_source="trade", cooldown_bars=COOLDOWN_BARS,
-        sl_mode="atr", sl_atr_mult=SL_ATR_MULT, tp_atr_mult=TP_ATR_MULT, atr_sl_min_pct=SL_MIN_PCT,
-        atr_sl_max_pct=SL_MAX_PCT, trailing_atr_mult=TRAIL_ATR_MULT, margin_buffer=MARGIN_BUFFER,
-        allow_min_one_lot=False, mark_fill_mode="traded",
+        atr_sl_min_pct=SL_MIN_PCT, atr_sl_max_pct=SL_MAX_PCT, trailing_atr_mult=max(0.0, float(trail_mult)),
+        margin_buffer=MARGIN_BUFFER, allow_min_one_lot=False, mark_fill_mode="traded",
         slippage_bps=settings.SIZING_SLIPPAGE_BPS if slippage_bps is None else slippage_bps,
+        **stops,
     )
+    if float(leverage) > 100.0:
+        object.__setattr__(cfg, "leverage", float(leverage))
+    return cfg
 
 
 def calculate_order_lots(product: ProductSpec, price: float, atr_value: float, side: str = "LONG",
                          equity_inr: float = CAPITAL_INR, available_inr: float | None = None,
                          risk_pct: float = RISK_PCT, leverage: float = LEVERAGE,
-                         slippage_bps: float | None = None) -> LotSizing:
-    """Whole contracts for one entry: 1% risk at the ATR stop incl. round-trip taker+GST and slippage,
-    capped by 95% of available margin at 10x. 0 contracts if even one lot exceeds the risk budget."""
+                         slippage_bps: float | None = None, *, profile: StrategyProfile | None = None,
+                         sl_type: str | None = None, sl_value: float | None = None,
+                         tp_type: str | None = None, tp_value: float | None = None,
+                         trail_mult: float | None = None) -> LotSizing:
+    """Whole contracts for one entry honoring the symbol's deployed risk_pct, leverage, sl_type/value, tp_type/value, and trail_mult."""
     if not (price > 0 and atr_value > 0):
         raise ValueError("price and ATR must be > 0")
+    if profile is not None:
+        risk_pct = float(profile.risk_pct)
+        leverage = float(profile.leverage)
+        sl_type = sl_type or profile.sl_type
+        sl_value = sl_value if sl_value is not None else float(profile.sl_value)
+        tp_type = tp_type or profile.tp_type
+        tp_value = tp_value if tp_value is not None else float(profile.tp_value)
+        if trail_mult is None:
+            trail_mult = float(profile.trail_mult) if profile.trailing_stop else 0.0
+    eff_sl_type = sl_type or "atr_mult"
+    eff_sl_val = float(sl_value if sl_value is not None else SL_ATR_MULT)
+    eff_tp_type = tp_type or "atr_mult"
+    eff_tp_val = float(tp_value if tp_value is not None else TP_ATR_MULT)
+    eff_trail = float(trail_mult if trail_mult is not None else TRAIL_ATR_MULT)
+
     d = 1 if side.upper() in ("LONG", "BUY") else -1
-    cfg = sizing_config(equity_inr, risk_pct, leverage, slippage_bps)
+    atr_pct = atr_value / price * 100.0
+    cfg = sizing_config(equity_inr, risk_pct, leverage, slippage_bps, sl_type=eff_sl_type, sl_value=eff_sl_val,
+                        tp_type=eff_tp_type, tp_value=eff_tp_val, trail_mult=eff_trail, atr_pct=atr_pct)
     bt = Backtester(cfg)
     rate = settings.FIXED_USD_INR_RATE
-    # sl_distance = clamp(2 x ATR, 0.8%, 4%) of price; tp_distance = sl_distance x 5/2 (backtester's own math).
     sl_pct, tp_pct = cfg.stop_pcts(price, atr_value)
     sl_distance, tp_distance = price * sl_pct / 100, price * tp_pct / 100
     sl, tp = bt.levels(price, d, sl_pct, tp_pct, product)
-    trail = float(snap_to_tick(TRAIL_ATR_MULT * atr_value, product.tick_size))
+    trail = float(snap_to_tick(eff_trail * atr_value, product.tick_size)) if eff_trail > 0 else 0.0
     available_inr = equity_inr if available_inr is None else available_inr
     n, n_risk, n_cap, _ = bt.size_position(equity_inr / rate, price, sl, product, available_inr / rate)
     lpc = bt.loss_per_contract(price, sl, product)
@@ -678,7 +790,7 @@ def calculate_order_lots(product: ProductSpec, price: float, atr_value: float, s
 
 
 # --------------------------------------------------------------------------- #
-# Live signal evaluation (frozen Step 4B strategies)
+# Live signal evaluation (deployed custom strategies & Step 4B profiles)
 # --------------------------------------------------------------------------- #
 def step4b_history_start() -> pd.Timestamp | None:
     """Warm-up start pinned by Step 4B, so EMA seeds match the backtest exactly."""
@@ -700,18 +812,26 @@ def sync_market_data(symbols: list[str], days: int = 90) -> dict[str, int]:
 def load_history(symbol: str, history_start: pd.Timestamp | None = None) -> pd.DataFrame:
     hist = dm.load_unified_1m_dataset(symbol)
     start = history_start if history_start is not None else step4b_history_start()
-    if start is not None:
+    if start is not None and len(hist) and start >= hist.index[0]:
         hist = hist[hist.index >= start]
     return hist
 
 
 def evaluate_symbol(profile: StrategyProfile, hist: pd.DataFrame, at: pd.Timestamp | None = None) -> dict[str, Any]:
-    """Frozen-variant state on the latest CLOSED 1h bar (optionally only using data before ``at``)."""
+    """Evaluate deployed strategy or frozen variant on the latest CLOSED bar of profile.timeframe."""
+    if hist is not None and len(hist):
+        hist = hist.copy(deep=False)
+        hist.columns = [str(c).lower() for c in hist.columns]
     if at is not None:
         hist = hist[hist.index < at]
-    tf_min = dm.TIMEFRAME_MINUTES[profile.timeframe]
+    tf_min = dm.TIMEFRAME_MINUTES.get(profile.timeframe, 60)
     bars = dm.resample_candles(hist, profile.timeframe)
-    out = strategies.generate_signals(profile.strategy, bars)
+    if profile.rule_type and profile.rule_type in strategies.CUSTOM_RULE_TYPES:
+        out = strategies.evaluate_custom_strategy(profile.rule_type, profile.params or {}, bars)
+    elif profile.strategy in strategies.CUSTOM_RULE_TYPES:
+        out = strategies.evaluate_custom_strategy(profile.strategy, profile.params or {}, bars)
+    else:
+        out = strategies.generate_signals(profile.strategy, bars)
     atr14 = strategies.atr(bars, 14)
     filters: dict[str, tuple[pd.Series, pd.Series]] = {}
     trend = None
@@ -722,17 +842,30 @@ def evaluate_symbol(profile: StrategyProfile, hist: pd.DataFrame, at: pd.Timesta
     gate = strategies.cost_gate(bars, settings.TAKER_FEE, settings.GST_ON_FEES, GATE_SLIPPAGE_BPS, GATE_MULT)
     if profile.cost_gate:
         filters["costgate"] = (gate["allow"], gate["allow"])
-    sig, _ = strategies.apply_entry_filters(out, filters)
+    sig, _ = strategies.apply_entry_filters(out, filters) if filters else (out["signal"], {})
     t = bars.index[-1]
     last_1m = hist.index[-1]
     if trend is None:  # report the regime even when the variant does not filter on it
         trend = strategies.trend_filter_4h(bars.iloc[-1:], dm.resample_candles(hist, HTF), tf_min)
     tr = trend.iloc[-1]
     s = int(sig.iloc[-1])
+    if "bb_upper" in out.columns and "bb_lower" in out.columns:
+        bb_u = float(out["bb_upper"].iloc[-1]) if pd.notna(out["bb_upper"].iloc[-1]) else float(bars["high"].iloc[-1])
+        bb_l = float(out["bb_lower"].iloc[-1]) if pd.notna(out["bb_lower"].iloc[-1]) else float(bars["low"].iloc[-1])
+    else:
+        bb_df = strategies.bollinger_bands(bars["close"], 20, 2.0)
+        bb_u = float(bb_df["bb_upper"].iloc[-1]) if pd.notna(bb_df["bb_upper"].iloc[-1]) else float(bars["high"].iloc[-1])
+        bb_l = float(bb_df["bb_lower"].iloc[-1]) if pd.notna(bb_df["bb_lower"].iloc[-1]) else float(bars["low"].iloc[-1])
     return {
-        "symbol": profile.symbol, "variant": profile.variant, "bar_open": t, "bar_close": t + pd.Timedelta(minutes=tf_min),
-        "last_1m_open": last_1m, "close": float(bars["close"].iloc[-1]), "bb_upper": float(out["bb_upper"].iloc[-1]),
-        "bb_lower": float(out["bb_lower"].iloc[-1]), "ema50_4h": float(tr["ema50_4h"]), "ema200_4h": float(tr["ema200_4h"]),
+        "symbol": profile.symbol, "variant": profile.custom_name or profile.variant,
+        "custom_name": profile.custom_name or profile.variant, "timeframe": profile.timeframe,
+        "rule_type": profile.rule_type or profile.strategy,
+        "leverage": profile.leverage, "risk_pct": profile.risk_pct,
+        "sl_type": profile.sl_type, "sl_value": profile.sl_value,
+        "tp_type": profile.tp_type, "tp_value": profile.tp_value, "trail_mult": profile.trail_mult,
+        "bar_open": t, "bar_close": t + pd.Timedelta(minutes=tf_min),
+        "last_1m_open": last_1m, "close": float(bars["close"].iloc[-1]), "bb_upper": bb_u,
+        "bb_lower": bb_l, "ema50_4h": float(tr["ema50_4h"]), "ema200_4h": float(tr["ema200_4h"]),
         "src_4h_open": tr["src_4h_open"], "allow_long_4h": bool(tr["allow_long"]), "allow_short_4h": bool(tr["allow_short"]),
         "atr14": float(atr14.iloc[-1]), "atr_ratio": float(gate["raw_atr_ratio"].iloc[-1]),
         "gate_threshold": float(GATE_MULT * gate["rt_cost_frac"].iloc[-1]), "cost_gate_pass": bool(gate["allow"].iloc[-1]),
@@ -887,34 +1020,49 @@ class ExecutionEngine:
         if st is not None and st["last_signal_bar_us"] is not None and signal_bar_us <= st["last_signal_bar_us"]:
             return {"action": "skip", "reason": "signal bar already processed"}
         self.store.mark_signal_seen(self.mode, symbol, signal_bar_us)
-        entry_us = signal_bar_us + self.tf_us
+        prof = self.profiles.get(symbol)
+        prof_tf_us = dm.TIMEFRAME_MINUTES.get(prof.timeframe, 60) * 60_000_000 if prof else self.tf_us
+        entry_us = signal_bar_us + prof_tf_us
         if st is not None and st["cooldown_until_us"] is not None and entry_us < st["cooldown_until_us"]:
             return {"action": "skip", "reason": "cooldown"}
         if self.mode != "paper" and (why := self.account_policy_refusal(symbol)) is not None:
             self._event("WARN", "entry_blocked_policy", symbol, why)
             return {"action": "skip", "reason": f"account policy: {why}"}
-        product = self.products[symbol]
+        product = self.ensure_product(symbol)
         equity, available = self.account_equity_inr()
         fill_ref = ref_price * (1 + direction * self.paper_slip) if self.mode == "paper" else ref_price
-        lots = calculate_order_lots(product, fill_ref, atr_value, side_name, equity, available)
+        lots = calculate_order_lots(product, fill_ref, atr_value, side_name, equity, available, profile=prof)
         if lots.contracts < 1:
             self._event("INFO", "entry_skipped", symbol, lots.reason)
             return {"action": "skip", "reason": lots.reason, "sizing": lots}
+        lev = float(prof.leverage) if prof else float(LEVERAGE)
         intent = self.store.create_intent(
             intent_id=f"in-{secrets.token_hex(8)}", client_order_id=self.new_client_oid(symbol), mode=self.mode,
             symbol=symbol, product_id=product.product_id, role="ENTRY", side="buy" if direction == 1 else "sell",
             size=lots.contracts, order_type="market_order", entry_price=fill_ref, sl_price=lots.sl_price,
-            tp_price=lots.tp_price, trail_amount=lots.trail_amount, signal_bar_us=signal_bar_us, atr=atr_value)
+            tp_price=lots.tp_price, trail_amount=lots.trail_amount, signal_bar_us=signal_bar_us, atr=atr_value,
+            leverage=lev)
         if self.mode == "paper":
-            return self._paper_fill_entry(intent, ref_price, lots)
+            return self._paper_fill_entry(intent, ref_price, lots, profile=prof)
         return self._dispatch_entry(intent)
 
-    def _paper_fill_entry(self, intent: sqlite3.Row, raw_price: float, lots: LotSizing) -> dict[str, Any]:
+    def _paper_fill_entry(self, intent: sqlite3.Row, raw_price: float, lots: LotSizing,
+                          profile: StrategyProfile | None = None) -> dict[str, Any]:
         sym, d = intent["symbol"], 1 if intent["side"] == "buy" else -1
-        product = self.products[sym]
+        product = self.ensure_product(sym)
         px = raw_price * (1 + d * self.paper_slip)
+        prof = profile or self.profiles.get(sym)
+        lev = float(prof.leverage) if prof else float(intent["leverage"] or LEVERAGE)
+        risk_pct = float(prof.risk_pct) if prof else RISK_PCT
+        sl_type = prof.sl_type if prof else "atr_mult"
+        sl_val = float(prof.sl_value) if prof else SL_ATR_MULT
+        tp_type = prof.tp_type if prof else "atr_mult"
+        tp_val = float(prof.tp_value) if prof else TP_ATR_MULT
+        trail_m = (float(prof.trail_mult) if prof.trailing_stop else 0.0) if prof else TRAIL_ATR_MULT
+        atr_pct = lots.atr / px * 100.0 if px > 0 else 1.0
         # Levels from the executed price (as the backtester does).
-        cfg = sizing_config(lots.equity_inr)
+        cfg = sizing_config(lots.equity_inr, risk_pct, lev, sl_type=sl_type, sl_value=sl_val,
+                            tp_type=tp_type, tp_value=tp_val, trail_mult=trail_m, atr_pct=atr_pct)
         sl_pct, tp_pct = cfg.stop_pcts(px, lots.atr)
         sl, tp = Backtester(cfg).levels(px, d, sl_pct, tp_pct, product)
         qty = intent["size"] * product.contract_value
@@ -929,10 +1077,10 @@ class ExecutionEngine:
                 contracts=intent["size"], contract_value=product.contract_value, entry_price=px, raw_entry_price=raw_price,
                 initial_sl=sl, sl_price=sl, tp_price=tp, trail_amount=lots.trail_amount, sl_order_id=None, tp_order_id=None,
                 highest_fav_price=px, opened_at_us=t, last_bar_us=t - t % 60_000_000 - 60_000_000,
-                realized_funding_usd=0.0, entry_fee_usd=qty * px * self.fee, margin_usd=qty * px / LEVERAGE,
-                atr_at_signal=lots.atr, intent_id=intent["intent_id"])
+                realized_funding_usd=0.0, entry_fee_usd=qty * px * self.fee, margin_usd=qty * px / lev,
+                atr_at_signal=lots.atr, intent_id=intent["intent_id"], leverage=lev)
         self._event("INFO", "paper_entry", sym, {"side": "LONG" if d == 1 else "SHORT", "contracts": intent["size"],
-                                                  "price": px, "sl": sl, "tp": tp})
+                                                  "price": px, "sl": sl, "tp": tp, "leverage": lev})
         self.notifier.notify_trade_entry(self.store.intent(intent["intent_id"]), self.store.position(self.mode, sym))
         return {"action": "filled", "intent_id": intent["intent_id"], "price": px, "contracts": intent["size"],
                 "sl": sl, "tp": tp, "sizing": lots}

@@ -382,6 +382,454 @@ def get_sync() -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
+# Step 17: Data Lab — Inventory, Backfill, Add Coin & Gap Repair
+# --------------------------------------------------------------------------- #
+_bf_lock = threading.Lock()
+_bf_state: dict[str, Any] = {
+    "is_running": False,
+    "state": "idle",
+    "symbol": "",
+    "symbols": [],
+    "mode": "idle",
+    "progress_pct": 0.0,
+    "current_chunk": 0,
+    "total_chunks": 0,
+    "message": "Up to date ✔",
+    "error": None,
+    "started_at": None,
+    "finished_at": None,
+    "results": [],
+}
+
+
+def backfill_status_snapshot() -> dict[str, Any]:
+    with _bf_lock:
+        return dict(_bf_state)
+
+
+def _invalidate_symbol_caches(symbol: str | None = None) -> None:
+    with _cache_lock:
+        if symbol is None:
+            _data_cache.clear()
+            _frame_cache.clear()
+            _coverage_cache.clear()
+        else:
+            _data_cache.pop(symbol, None)
+            for k in [k for k in _frame_cache if k and k[0] == symbol]:
+                _frame_cache.pop(k, None)
+            for k in [k for k in _coverage_cache if k and k[0] == symbol]:
+                _coverage_cache.pop(k, None)
+
+
+def _fmt_utc_minute(epoch_s: int | None) -> str | None:
+    if not epoch_s:
+        return None
+    return pd.Timestamp(int(epoch_s), unit="s", tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _build_symbol_inventory(sym: str, active_bf_sym: str | None, bf_running: bool) -> dict[str, Any]:
+    cov = coverage(sym)["series"]
+    meta: dict[str, Any] = {}
+    mpath = dm.metadata_path(sym)
+    if mpath.exists():
+        try:
+            meta = json.loads(mpath.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            meta = {}
+    trade_cov = cov.get("TRADE") or {}
+    mark_cov = cov.get("MARK") or {}
+    fund_cov = cov.get("FUNDING") or {}
+
+    t_rows = int(trade_cov.get("rows") or 0)
+    m_rows = int(mark_cov.get("rows") or 0)
+    f_rows = int(fund_cov.get("rows") or 0)
+
+    gaps_count = int(trade_cov.get("gaps") or 0)
+    missing_min = int(trade_cov.get("missing_minutes") or 0)
+
+    size_bytes = 0
+    for st_type in dm.SERIES_TYPES:
+        p = dm.raw_1m_path(sym, st_type)
+        if p.exists():
+            size_bytes += p.stat().st_size
+    file_size_mb = round(size_bytes / (1024 * 1024), 2)
+
+    start_iso = trade_cov.get("start")
+    end_iso = trade_cov.get("end")
+    start_ts = int(pd.Timestamp(start_iso).timestamp()) if start_iso else None
+    end_ts = int(pd.Timestamp(end_iso).timestamp()) if end_iso else None
+    start_date = pd.Timestamp(start_iso).strftime("%Y-%m-%d %H:%M UTC") if start_iso else None
+    end_date = pd.Timestamp(end_iso).strftime("%Y-%m-%d %H:%M UTC") if end_iso else None
+
+    if start_ts and end_ts and end_ts >= start_ts:
+        cov_days = round((end_ts - start_ts + 60) / 86_400, 2)
+    else:
+        cov_days = round(t_rows / 1440.0, 2)
+
+    if bf_running and active_bf_sym in (sym, "ALL", "ALTCOINS"):
+        st_label = "downloading"
+    elif _job.get("state") == "running" and sym in (_job.get("symbols") or []):
+        st_label = "syncing"
+    elif t_rows > 0:
+        st_label = "ready"
+    else:
+        st_label = "no_data"
+
+    max_lev = 20
+    try:
+        max_lev = int(float(meta.get("default_leverage") or 20))
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {
+        "symbol": sym,
+        "name": meta.get("description") or f"{sym} Perpetual Future",
+        "contract_value": meta.get("contract_value"),
+        "tick_size": meta.get("tick_size"),
+        "max_leverage": max_lev,
+        "status": st_label,
+        "coverage_days": cov_days,
+        "start_date": start_date,
+        "end_date": end_date,
+        "start_iso": start_iso,
+        "end_iso": end_iso,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "trade_rows": t_rows,
+        "mark_rows": m_rows,
+        "funding_rows": f_rows,
+        "total_series_rows": t_rows + m_rows + f_rows,
+        "gaps_count": gaps_count,
+        "missing_minutes": missing_min,
+        "gaps_by_series": {
+            "TRADE": int(trade_cov.get("gaps") or 0),
+            "MARK": int(mark_cov.get("gaps") or 0),
+            "FUNDING": int(fund_cov.get("gaps") or 0),
+        },
+        "file_size_mb": file_size_mb,
+    }
+
+
+@app.get("/api/data/inventory")
+def get_data_inventory() -> JSONResponse:
+    syms = app_symbols()
+    bf = backfill_status_snapshot()
+    bf_running = bool(bf.get("is_running"))
+    active_sym = bf.get("symbol")
+    items = [_build_symbol_inventory(s, active_sym, bf_running) for s in syms]
+    total_candles = sum(x["trade_rows"] for x in items)
+    total_all_series = sum(x["total_series_rows"] for x in items)
+    total_mb = round(sum(x["file_size_mb"] for x in items), 2)
+    end_dates = [x["end_date"] for x in items if x.get("end_date")]
+    latest_sync = max(end_dates) if end_dates else None
+    payload = {
+        "items": items,
+        "inventory": items,
+        "coins": items,
+        "total_symbols": len(items),
+        "total_candles_all_coins": total_candles,
+        "total_rows_all_series": total_all_series,
+        "total_disk_size_mb": total_mb,
+        "latest_sync_utc": latest_sync,
+        "backfill_status": bf,
+    }
+    return JSONResponse(clean(payload))
+
+
+class BackfillRequest(BaseModel):
+    symbol: str = "ALL"
+    mode: Literal["older", "latest", "custom_range", "target_days"] = "older"
+    days_to_add: int | None = Field(30, ge=0, le=1500)
+    start_date: str | None = None
+    end_date: str | None = None
+    dry_run: bool = False
+
+
+def _parse_date_to_epoch(val: str | None, is_end: bool = False) -> int | None:
+    if not val:
+        return None
+    s = val.strip()
+    t = pd.Timestamp(s)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    else:
+        t = t.tz_convert("UTC")
+    if len(s) <= 10 and is_end:
+        t = t + pd.Timedelta(hours=23, minutes=59)
+    return int(t.timestamp())
+
+
+def _compute_symbol_target_range(
+    sym: str, mode: str, days_to_add: int, start_date: str | None, end_date: str | None
+) -> tuple[int, int]:
+    now_end = dm._last_closed_minute()
+    cov_t = (coverage(sym)["series"] or {}).get("TRADE") or {}
+    start_iso = cov_t.get("start")
+    end_iso = cov_t.get("end")
+    have_min = int(pd.Timestamp(start_iso).timestamp()) if start_iso else None
+    have_max = int(pd.Timestamp(end_iso).timestamp()) if end_iso else None
+
+    if mode == "custom_range":
+        s_ep = _parse_date_to_epoch(start_date, is_end=False)
+        e_ep = _parse_date_to_epoch(end_date, is_end=True)
+        if not s_ep or not e_ep or s_ep >= e_ep:
+            raise ValueError("custom_range requires valid start_date < end_date")
+        return s_ep, min(e_ep, now_end)
+
+    if mode == "latest":
+        req_start = (have_max - 3600) if have_max else (now_end + 60 - max(1, days_to_add) * 86_400)
+        return req_start, now_end
+
+    if mode == "target_days":
+        d = max(1, days_to_add or 365)
+        return now_end + 60 - d * 86_400, now_end
+
+    # mode == "older"
+    d = max(1, days_to_add or 30)
+    if have_min:
+        return have_min - d * 86_400, have_max or now_end
+    return now_end + 60 - d * 86_400, now_end
+
+
+def _backfill_worker(
+    target_symbols: list[str],
+    mode: str,
+    days_to_add: int,
+    start_date: str | None,
+    end_date: str | None,
+    dry_run: bool,
+) -> None:
+    results = []
+    try:
+        # Pre-calculate total chunks across all target symbols & series for accurate progress %
+        plan: list[tuple[str, dm.SeriesType, int, int, int]] = []
+        total_chunks = 0
+        for sym in target_symbols:
+            if not dm.metadata_path(sym).exists():
+                try:
+                    dm.fetch_and_save_metadata([sym])
+                except Exception:  # noqa: BLE001
+                    pass
+            req_s, req_e = _compute_symbol_target_range(sym, mode, days_to_add, start_date, end_date)
+            for st_type in dm.SERIES_TYPES:
+                if dry_run or days_to_add == 0:
+                    n_ch = 1
+                else:
+                    _, ranges = dm.missing_ranges_for_series(sym, st_type, req_s, req_e)
+                    n_ch = len(dm.chunks_for_ranges(ranges))
+                plan.append((sym, st_type, req_s, req_e, n_ch))
+                total_chunks += n_ch
+
+        total_chunks = max(1, total_chunks)
+        with _bf_lock:
+            _bf_state["total_chunks"] = total_chunks
+            _bf_state["current_chunk"] = 0
+            _bf_state["progress_pct"] = 2.0
+
+        done_before = 0
+        for sym, st_type, req_s, req_e, n_ch in plan:
+            with _bf_lock:
+                _bf_state["symbol"] = sym
+                _bf_state["message"] = f"{sym} ({st_type}) · preparing range…"
+
+            if dry_run or days_to_add == 0:
+                done_before += 1
+                pct = round(min(99.0, done_before * 100.0 / total_chunks), 1)
+                with _bf_lock:
+                    _bf_state.update(
+                        current_chunk=done_before,
+                        progress_pct=pct,
+                        message=f"Verified chunk {done_before} of {total_chunks} · {pct}% · {sym} {st_type}",
+                    )
+                results.append({"symbol": sym, "series": st_type, "fetched": 0, "requests": 0})
+                continue
+
+            if n_ch == 0:
+                results.append({"symbol": sym, "series": st_type, "fetched": 0, "requests": 0})
+                continue
+
+            def _on_chunk(idx: int, tot: int, cs: int, ce: int, s_type: str, _sym: str = sym, _base: int = done_before) -> None:
+                cur = _base + idx
+                pct = round(min(99.0, cur * 100.0 / total_chunks), 1)
+                d1 = pd.Timestamp(cs, unit="s", tz="UTC").strftime("%Y-%m-%d")
+                d2 = pd.Timestamp(ce, unit="s", tz="UTC").strftime("%Y-%m-%d")
+                with _bf_lock:
+                    _bf_state.update(
+                        symbol=_sym,
+                        current_chunk=cur,
+                        progress_pct=pct,
+                        message=f"Downloading chunk {cur} of {total_chunks} · {pct}% · {_sym} {s_type} ({d1} to {d2})…",
+                    )
+
+            with _file_lock:
+                r = dm.download_1m_range(sym, st_type, req_s, req_e, progress_cb=_on_chunk)
+            done_before += n_ch
+            _invalidate_symbol_caches(sym)
+            results.append({
+                "symbol": sym,
+                "series": st_type,
+                "rows_before": r.rows_before,
+                "rows_after": r.rows_after,
+                "fetched": r.rows_fetched,
+                "requests": r.requests,
+            })
+
+        _invalidate_symbol_caches(None)
+        with _bf_lock:
+            _bf_state.update(
+                is_running=False,
+                state="done",
+                progress_pct=100.0,
+                current_chunk=total_chunks,
+                total_chunks=total_chunks,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                message=f"Backfill complete ✔ ({len(target_symbols)} coin(s) updated)",
+                error=None,
+                results=results,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("backfill failed")
+        with _bf_lock:
+            _bf_state.update(
+                is_running=False,
+                state="error",
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                message=f"Backfill error: {exc}",
+                error=str(exc),
+                results=results,
+            )
+
+
+@app.post("/api/data/backfill")
+def start_backfill(req: BackfillRequest) -> JSONResponse:
+    raw_sym = (req.symbol or "ALL").strip().upper()
+    all_syms = app_symbols()
+    if raw_sym == "ALL":
+        targets = all_syms
+    elif raw_sym == "ALTCOINS":
+        targets = [s for s in all_syms if s not in ("BTCUSD", "ETHUSD")] or all_syms
+    else:
+        s = check_symbol(raw_sym)
+        if s not in all_syms:
+            add_app_symbol(s)
+        targets = [s]
+
+    if req.mode == "custom_range":
+        try:
+            _compute_symbol_target_range(targets[0], req.mode, int(req.days_to_add or 30), req.start_date, req.end_date)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    with _bf_lock:
+        if _bf_state.get("is_running"):
+            raise HTTPException(409, "A data backfill/download job is already running")
+        _bf_state.update(
+            is_running=True,
+            state="running",
+            symbol=raw_sym,
+            symbols=targets,
+            mode=req.mode,
+            progress_pct=1.0,
+            current_chunk=0,
+            total_chunks=max(1, len(targets) * 3),
+            message=f"Starting {req.mode} backfill for {', '.join(targets)}…",
+            error=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=None,
+            results=[],
+        )
+
+    threading.Thread(
+        target=_backfill_worker,
+        args=(targets, req.mode, int(req.days_to_add if req.days_to_add is not None else 30), req.start_date, req.end_date, req.dry_run),
+        daemon=True,
+    ).start()
+    return JSONResponse(clean(backfill_status_snapshot()), status_code=202)
+
+
+@app.get("/api/data/backfill/status")
+def get_backfill_status() -> JSONResponse:
+    return JSONResponse(clean(backfill_status_snapshot()))
+
+
+class AddCoinRequest(BaseModel):
+    symbol: str
+    initial_days: int = Field(60, ge=0, le=1500)
+    dry_run: bool = False
+
+
+@app.post("/api/data/add_coin")
+def add_coin_endpoint(req: AddCoinRequest) -> JSONResponse:
+    sym = check_symbol(req.symbol)
+    mpath = dm.metadata_path(sym)
+    product: dict[str, Any] | None = None
+    if mpath.exists():
+        try:
+            product = json.loads(mpath.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            product = None
+    if product is None:
+        try:
+            product = dm.client().get(f"/v2/products/{sym}")
+        except requests.HTTPError as exc:
+            code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(404 if code in (400, 404) else 502, f"{sym}: not found on Delta Exchange ({code})") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(404, f"{sym}: product lookup failed ({exc})") from exc
+        if product.get("contract_type") != "perpetual_futures" or product.get("state") != "live":
+            raise HTTPException(
+                400,
+                f"{sym}: contract_type={product.get('contract_type')}, state={product.get('state')} (need a live perpetual future)",
+            )
+        dm.metadata_dir().mkdir(parents=True, exist_ok=True)
+        dm._atomic_write_bytes(mpath, json.dumps(product, indent=2, sort_keys=True).encode("utf-8"))
+
+    add_app_symbol(sym)
+    _invalidate_symbol_caches(sym)
+
+    if req.initial_days > 0 and not req.dry_run:
+        bf_req = BackfillRequest(symbol=sym, mode="target_days", days_to_add=req.initial_days, dry_run=False)
+        start_backfill(bf_req)
+
+    return JSONResponse(
+        clean({
+            "ok": True,
+            "symbol": sym,
+            "initial_days": req.initial_days,
+            "symbols": app_symbols(),
+            "product": product_info(sym),
+            "backfill_status": backfill_status_snapshot(),
+        })
+    )
+
+
+class RepairGapsRequest(BaseModel):
+    symbol: str = "ALL"
+
+
+@app.post("/api/data/repair_gaps")
+def repair_gaps_endpoint(req: RepairGapsRequest) -> JSONResponse:
+    raw_sym = (req.symbol or "ALL").strip().upper()
+    targets = app_symbols() if raw_sym == "ALL" else [check_symbol(raw_sym)]
+    reports = []
+    for sym in targets:
+        with _file_lock:
+            rep = dm.repair_symbol_gaps(sym)
+        _invalidate_symbol_caches(sym)
+        reports.append(rep)
+    return JSONResponse(
+        clean({
+            "ok": True,
+            "symbol": raw_sym,
+            "gaps_before": sum(r["gaps_before"] for r in reports),
+            "gaps_after": sum(r["gaps_after"] for r in reports),
+            "rows_added": sum(r["rows_added"] for r in reports),
+            "reports": reports,
+        })
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Presets + leaderboard (from CLI result files)
 # --------------------------------------------------------------------------- #
 _results_cache: dict[str, tuple[float, pd.DataFrame]] = {}
@@ -1159,6 +1607,8 @@ def run_backtest(req: BacktestRequest) -> JSONResponse:
 
 class SaveResultRequest(BaseModel):
     id: str | None = None
+    custom_name: str | None = None
+    notes: str | None = None
     strategy_id: str | None = None
     strategy_name: str | None = None
     symbol: str | None = None
@@ -1171,7 +1621,13 @@ class SaveResultRequest(BaseModel):
     sl_value: float | None = None
     tp_type: str | None = None
     tp_value: float | None = None
+    trailing_stop: bool | None = None
     trail_mult: float | None = None
+    fee_mode: str | None = None
+    slippage_bps: float | None = None
+    use_4h_trend: bool | None = None
+    use_cost_gate: bool | None = None
+    strict_lot_cap: bool | None = None
     rule_type: str | None = None
     params: dict[str, Any] | None = None
     net_pnl_inr: float | None = None
@@ -1184,6 +1640,7 @@ class SaveResultRequest(BaseModel):
     summary: dict[str, Any] | None = None
     config: dict[str, Any] | None = None
     window: dict[str, Any] | None = None
+    filters: dict[str, Any] | None = None
 
 
 @app.post("/api/backtest/save_result")
@@ -1191,15 +1648,32 @@ def save_backtest_result(req: SaveResultRequest) -> JSONResponse:
     s = req.summary or {}
     c = req.config or {}
     w = req.window or {}
+    f = req.filters or {}
     rid = req.id or f"bt_{uuid.uuid4().hex[:10]}"
+    sym = (req.symbol or "ETHUSD").strip().upper()
+    tf = req.timeframe or "1h"
+    rt = req.rule_type or c.get("rule_type")
+    params = req.params if req.params is not None else (c.get("params") or {})
+    default_name = req.strategy_name or c.get("strategy_name") or f"{sym} {tf} {rt or 'Strategy'}"
+    custom_name = (req.custom_name or req.strategy_name or default_name).strip()
+    trail_m = float(req.trail_mult if req.trail_mult is not None else (c.get("trail_atr_mult") if c.get("trail_atr_mult") is not None else 2.5))
+    trail_on = bool(req.trailing_stop if req.trailing_stop is not None else (trail_m > 0))
+    use_4h = bool(req.use_4h_trend if req.use_4h_trend is not None else (f.get("trend_filter_4h") or bool(params.get("use_4h_trend", False))))
+    use_gate = bool(req.use_cost_gate if req.use_cost_gate is not None else f.get("cost_gate", False))
+    strict_lot = bool(req.strict_lot_cap if req.strict_lot_cap is not None else f.get("strict_lot_cap", False))
+
     entry = {
         "id": rid,
+        "custom_name": custom_name,
+        "strategy_name": custom_name,
+        "notes": (req.notes or "").strip(),
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "strategy_id": req.strategy_id or c.get("strategy_id") or "custom",
-        "strategy_name": req.strategy_name or c.get("strategy_name") or req.strategy_id or "Custom Strategy",
-        "symbol": (req.symbol or "ETHUSD").strip().upper(),
-        "timeframe": req.timeframe or "1h",
+        "symbol": sym,
+        "timeframe": tf,
         "period_days": round(float(req.period_days if req.period_days is not None else (w.get("days") or 180)), 1),
+        "rule_type": rt,
+        "params": params,
         "capital_inr": float(req.capital_inr if req.capital_inr is not None else (c.get("capital_inr") or c.get("initial_capital_inr") or 50000.0)),
         "leverage": float(req.leverage if req.leverage is not None else (c.get("leverage") or 10)),
         "risk_pct": float(req.risk_pct if req.risk_pct is not None else (c.get("risk_pct") or c.get("risk_per_trade_pct") or 2.0)),
@@ -1207,9 +1681,13 @@ def save_backtest_result(req: SaveResultRequest) -> JSONResponse:
         "sl_value": float(req.sl_value if req.sl_value is not None else (c.get("sl_value") or 2.0)),
         "tp_type": req.tp_type or c.get("tp_type") or "atr_mult",
         "tp_value": float(req.tp_value if req.tp_value is not None else (c.get("tp_value") or 5.0)),
-        "trail_mult": float(req.trail_mult if req.trail_mult is not None else (c.get("trail_atr_mult") or 2.5)),
-        "rule_type": req.rule_type or c.get("rule_type"),
-        "params": req.params if req.params is not None else (c.get("params") or {}),
+        "trailing_stop": trail_on,
+        "trail_mult": trail_m,
+        "fee_mode": req.fee_mode or c.get("fee_mode") or "taker_maker_tp",
+        "slippage_bps": float(req.slippage_bps if req.slippage_bps is not None else (f.get("slippage_bps") or 0.0)),
+        "use_4h_trend": use_4h,
+        "use_cost_gate": use_gate,
+        "strict_lot_cap": strict_lot,
         "net_pnl_inr": float(req.net_pnl_inr if req.net_pnl_inr is not None else (s.get("net_pnl_inr") or 0.0)),
         "return_pct": float(req.return_pct if req.return_pct is not None else (s.get("net_return_pct") or 0.0)),
         "win_rate_pct": float(req.win_rate_pct if req.win_rate_pct is not None else (s.get("win_rate_pct") or 0.0)),
@@ -1226,22 +1704,60 @@ def save_backtest_result(req: SaveResultRequest) -> JSONResponse:
     return JSONResponse(clean(entry))
 
 
+class UpdateSavedResultRequest(BaseModel):
+    custom_name: str | None = None
+    strategy_name: str | None = None
+    notes: str | None = None
+
+
+@app.put("/api/backtest/results/{result_id}")
+def update_backtest_result(result_id: str, req: UpdateSavedResultRequest) -> JSONResponse:
+    items = _load_saved_backtests()
+    target = next((r for r in items if r.get("id") == result_id), None)
+    if target is None:
+        raise HTTPException(404, f"saved result {result_id!r} not found")
+    new_name = (req.custom_name if req.custom_name is not None else req.strategy_name)
+    if new_name is not None and new_name.strip():
+        target["custom_name"] = new_name.strip()
+        target["strategy_name"] = new_name.strip()
+    if req.notes is not None:
+        target["notes"] = req.notes.strip()
+    _save_saved_backtests(items)
+    return JSONResponse(clean(target))
+
+
 @app.get("/api/backtest/results")
 def list_backtest_results(
     symbol: str | None = None,
     strategy_name: str | None = None,
+    custom_name: str | None = None,
+    search: str | None = None,
     timeframe: str | None = None,
     min_win_rate: float | None = None,
     min_pf: float | None = None,
 ) -> JSONResponse:
     items = _load_saved_backtests()
+    def _norm(v):
+        v = (v or "").strip()
+        return "" if (not v or v.lower().startswith("all")) else v
+    symbol, timeframe = _norm(symbol), _norm(timeframe)
+    q_str = (search or custom_name or strategy_name or "").strip().lower()
     out = []
     for r in items:
+        if not r.get("custom_name"):
+            r["custom_name"] = r.get("strategy_name") or "Custom Strategy"
         if symbol and symbol.strip().upper() not in ("", "ALL"):
             if str(r.get("symbol", "")).upper() != symbol.strip().upper():
                 continue
-        if strategy_name and strategy_name.strip():
-            if strategy_name.strip().lower() not in str(r.get("strategy_name", "")).lower():
+        if q_str:
+            hay = " ".join([
+                str(r.get("custom_name", "")),
+                str(r.get("strategy_name", "")),
+                str(r.get("notes", "")),
+                str(r.get("rule_type", "")),
+                str(r.get("symbol", "")),
+            ]).lower()
+            if q_str not in hay:
                 continue
         if timeframe and timeframe.strip().lower() not in ("", "all"):
             if str(r.get("timeframe", "")).lower() != timeframe.strip().lower():

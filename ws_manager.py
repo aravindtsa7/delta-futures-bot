@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
@@ -38,9 +39,9 @@ from exchange_client import sign_request
 log = logging.getLogger(__name__)
 
 WATCHDOG_SECONDS = 35.0
-HANDSHAKE_TIMEOUT_SECONDS = 15.0
+HANDSHAKE_TIMEOUT_SECONDS = 30.0
 SNAPSHOT_TIMEOUT_SECONDS = 10.0
-RECONNECT_BACKOFF = (1.0, 2.0, 5.0, 10.0, 30.0)
+RECONNECT_BACKOFF = (2.0, 4.0, 8.0)
 
 SYMBOL_MANDATORY = {"orders", "positions", "v2/user_trades", "candlestick_1m", "v2/ticker", "ticker", "mark_price",
                     "ob_l1", "ob_l2", "ob_updates", "spot_price", "v2/spot_price"}
@@ -270,8 +271,10 @@ Connector = Callable[[str], Awaitable[Any]]
 
 async def default_connector(url: str) -> Any:
     import websockets
-    return await websockets.connect(url, user_agent_header=settings.USER_AGENT, open_timeout=HANDSHAKE_TIMEOUT_SECONDS,
-                                    ping_interval=20, ping_timeout=20, max_size=2**23)
+    return await websockets.connect(url, user_agent_header=settings.USER_AGENT, open_timeout=30.0,
+                                    ping_interval=20.0, ping_timeout=20.0, close_timeout=10.0,
+                                    family=socket.AF_INET,  # force IPv4: avoid hanging IPv6 attempts on Windows
+                                    max_size=2**23)
 
 
 @dataclass
@@ -600,7 +603,7 @@ class DeltaWebSocketManager:
             reason = ""
             try:
                 gen = await self.connect_once()
-                failures = 0
+                failures = 0  # connected: clear the disconnect counter
                 reason = await self.read_loop(stop)
             except (AuthError, TimeoutError, WatchdogTimeout, ConnectionLost, OSError) as exc:
                 reason = f"{type(exc).__name__}: {exc}"

@@ -564,17 +564,56 @@ async function deleteStrategyFromModal() {
   }
 }
 
-async function saveCurrentBacktestResult() {
+function openSaveResultModal() {
   const r = state.result;
   if (!r) return;
   const st = currentStrategyObj();
   const leg0 = r.legs[0] || {};
+  const sym = leg0.symbol || $("symbolSelect").value || "ETHUSD";
+  const tf = leg0.timeframe || $("tfSelect").value || "1h";
+  const ruleLbl = (st && (st.name || st.rule_type)) || r.config.strategy_name || r.config.rule_type || leg0.strategy || "Strategy";
+  const defaultName = `${sym} ${tf} ${ruleLbl}`;
+  $("saveResultNameInput").value = defaultName;
+  $("saveResultNotesInput").value = "";
+  $("saveResultModalMsg").textContent = "";
+
+  const slLbl = `${r.config.sl_value || $("slValue").value}${(r.config.sl_type || $("slType").value) === "fixed_pct" ? "%" : "x ATR"}`;
+  const tpType = r.config.tp_type || $("tpType").value;
+  const tpLbl = `${r.config.tp_value || $("tpValue").value}${tpType === "rr_ratio" ? "R" : tpType === "fixed_pct" ? "%" : "x ATR"}`;
+  $("saveResultPreviewSummary").innerHTML = `
+    <div class="sl-save-preview-row">
+      <span><b>${esc(sym)}</b> · <b>${esc(tf)}</b> · ${r.config.leverage}x · Risk ${r.config.risk_pct || r.config.risk_per_trade_pct}% · SL ${esc(slLbl)} / TP ${esc(tpLbl)}</span>
+      <span class="${cls(r.summary.net_pnl_inr)}"><b>${inr(r.summary.net_pnl_inr)}</b> (${pct(r.summary.net_return_pct, true, 1)}) · WR ${pct(r.summary.win_rate_pct, false, 1)} · PF ${pf(r.summary.profit_factor)}</span>
+    </div>`;
+  $("saveResultModal").showModal();
+  setTimeout(() => {
+    $("saveResultNameInput").focus();
+    $("saveResultNameInput").select();
+  }, 30);
+}
+
+async function confirmSaveBacktestResult(ev) {
+  if (ev) ev.preventDefault();
+  const r = state.result;
+  if (!r) return;
+  const st = currentStrategyObj();
+  const leg0 = r.legs[0] || {};
+  const sym = leg0.symbol || $("symbolSelect").value;
+  const tf = leg0.timeframe || $("tfSelect").value;
+  const ruleLbl = (st && (st.name || st.rule_type)) || r.config.strategy_name || leg0.strategy;
+  const customName = ($("saveResultNameInput") ? $("saveResultNameInput").value.trim() : "") || `${sym} ${tf} ${ruleLbl}`;
+  const notes = $("saveResultNotesInput") ? $("saveResultNotesInput").value.trim() : "";
+
   const payload = {
+    custom_name: customName,
+    notes,
     strategy_id: (st && st.id) || r.config.strategy_id || leg0.strategy,
-    strategy_name: (st && st.name) || r.config.strategy_name || leg0.strategy,
-    symbol: leg0.symbol || $("symbolSelect").value,
-    timeframe: leg0.timeframe || $("tfSelect").value,
+    strategy_name: customName,
+    symbol: sym,
+    timeframe: tf,
     period_days: r.window.days,
+    rule_type: (st && st.rule_type) || r.config.rule_type || leg0.strategy,
+    params: (st && st.params) || r.config.params || {},
     capital_inr: r.config.capital_inr || r.config.initial_capital_inr,
     leverage: r.config.leverage,
     risk_pct: r.config.risk_pct || r.config.risk_per_trade_pct,
@@ -582,9 +621,13 @@ async function saveCurrentBacktestResult() {
     sl_value: r.config.sl_value || Number($("slValue").value),
     tp_type: r.config.tp_type || $("tpType").value,
     tp_value: r.config.tp_value || Number($("tpValue").value),
+    trailing_stop: $("trailEnabled") ? $("trailEnabled").checked : (Number(r.config.trail_atr_mult) > 0),
     trail_mult: r.config.trail_atr_mult,
-    rule_type: (st && st.rule_type) || r.config.rule_type,
-    params: (st && st.params) || r.config.params || {},
+    fee_mode: r.config.fee_mode || $("feeMode").value || "taker_maker_tp",
+    slippage_bps: (r.filters && r.filters.slippage_bps !== undefined) ? r.filters.slippage_bps : Number($("slippage").value || 0),
+    use_4h_trend: !!(r.filters && r.filters.trend_filter_4h) || $("trend4h").checked,
+    use_cost_gate: !!(r.filters && r.filters.cost_gate) || $("costGate").checked,
+    strict_lot_cap: !!(r.filters && r.filters.strict_lot_cap) || $("strictLot").checked,
     net_pnl_inr: r.summary.net_pnl_inr,
     return_pct: r.summary.net_return_pct,
     win_rate_pct: r.summary.win_rate_pct,
@@ -595,23 +638,33 @@ async function saveCurrentBacktestResult() {
     trades: r.trades,
   };
   $("saveResultBtn").disabled = true;
+  if ($("saveResultConfirmBtn")) $("saveResultConfirmBtn").disabled = true;
   try {
-    await api("/api/backtest/save_result", { method: "POST", body: JSON.stringify(payload) });
+    const saved = await api("/api/backtest/save_result", { method: "POST", body: JSON.stringify(payload) });
+    if ($("saveResultModal") && $("saveResultModal").open) $("saveResultModal").close();
     state.resultSaved = true;
-    $("unsavedBadge").textContent = "✓ Saved to Backtest Results";
+    $("unsavedBadge").textContent = `✓ Saved as "${saved.custom_name || customName}"`;
     $("unsavedBadge").className = "unsaved-badge saved";
-    toast("Backtest result saved to catalog");
+    toast(`Saved "${saved.custom_name || customName}" to Strategy Lab`);
     await loadSavedResults();
+    if (typeof loadStrategyLab === "function") loadStrategyLab();
   } catch (e) {
     $("saveResultBtn").disabled = false;
+    if ($("saveResultModalMsg")) $("saveResultModalMsg").textContent = e.message;
     toast(`Save failed: ${e.message}`, true);
+  } finally {
+    if ($("saveResultConfirmBtn")) $("saveResultConfirmBtn").disabled = false;
   }
+}
+
+async function saveCurrentBacktestResult() {
+  openSaveResultModal();
 }
 
 async function loadSavedResults() {
   const q = new URLSearchParams();
   if ($("resSymbolFilter").value) q.set("symbol", $("resSymbolFilter").value);
-  if ($("resStratFilter").value.trim()) q.set("strategy_name", $("resStratFilter").value.trim());
+  if ($("resStratFilter").value.trim()) q.set("search", $("resStratFilter").value.trim());
   if ($("resTfFilter").value) q.set("timeframe", $("resTfFilter").value);
   if ($("resMinWrFilter").value !== "") q.set("min_win_rate", $("resMinWrFilter").value);
   if ($("resMinPfFilter").value !== "") q.set("min_pf", $("resMinPfFilter").value);
@@ -619,6 +672,7 @@ async function loadSavedResults() {
     const r = await api(`/api/backtest/results?${q}`);
     state.savedResults = r.results || [];
     $("savedCountBadge").textContent = String(state.savedResults.length);
+    if ($("navStratBadge")) $("navStratBadge").textContent = String(state.savedResults.length);
     $("resCatalogCount").textContent = `${state.savedResults.length} saved result(s)`;
     renderSavedResultsTable();
   } catch (e) {
@@ -629,7 +683,7 @@ async function loadSavedResults() {
 function renderSavedResultsTable() {
   const rows = state.savedResults;
   const head = `<thead><tr>
-    <th class="l">Date (UTC)</th><th class="l">Coin</th><th class="l">Strategy</th><th>TF</th>
+    <th class="l">Date (UTC)</th><th class="l">Custom Name</th><th class="l">Coin</th><th>TF</th>
     <th>Capital ₹</th><th>Lev</th><th>SL / TP</th><th>Net P&amp;L ₹</th><th>Win Rate</th>
     <th>PF</th><th>Max DD</th><th>Trades</th><th class="l">Actions</th>
   </tr></thead>`;
@@ -640,10 +694,11 @@ function renderSavedResultsTable() {
   const body = rows.map((r, i) => {
     const slLbl = `${r.sl_value}${r.sl_type === "fixed_pct" ? "%" : "x ATR"}`;
     const tpLbl = `${r.tp_value}${r.tp_type === "rr_ratio" ? "R" : r.tp_type === "fixed_pct" ? "%" : "x ATR"}`;
+    const cName = r.custom_name || r.strategy_name || "Custom Strategy";
     return `<tr data-i="${i}">
       <td class="l">${fmtTime(r.saved_at)}</td>
+      <td class="l"><b>${esc(cName)}</b>${r.notes ? `<div class="muted" style="font-size:10.5px">${esc(r.notes)}</div>` : ""}</td>
       <td class="l"><b>${esc(r.symbol)}</b></td>
-      <td class="l">${esc(r.strategy_name)}</td>
       <td>${esc(r.timeframe)}</td>
       <td>₹${nf0.format(r.capital_inr)}</td>
       <td>${r.leverage}x</td>
@@ -654,12 +709,19 @@ function renderSavedResultsTable() {
       <td class="neg">${pct(-Math.abs(r.max_dd_pct || 0), false, 2)}</td>
       <td>${r.total_trades}</td>
       <td class="l">
-        <button type="button" class="btn btn-xs btn-primary" data-load-res="${esc(r.id)}">Load</button>
+        <button type="button" class="btn btn-xs btn-primary" data-deploy-res="${esc(r.id)}">🚀 Deploy</button>
+        <button type="button" class="btn btn-xs btn-ghost" data-load-res="${esc(r.id)}">📊 Load</button>
         <button type="button" class="btn btn-xs btn-danger" data-del-res="${esc(r.id)}">Delete</button>
       </td>
     </tr>`;
   }).join("");
   $("resultsTable").innerHTML = head + `<tbody>${body}</tbody>`;
+  $("resultsTable").querySelectorAll("[data-deploy-res]").forEach((btn) => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      deploySavedStrategyToBot(btn.dataset.deployRes);
+    };
+  });
   $("resultsTable").querySelectorAll("[data-load-res]").forEach((btn) => {
     btn.onclick = (ev) => {
       ev.stopPropagation();
@@ -674,14 +736,21 @@ function renderSavedResultsTable() {
         await api(`/api/backtest/results/${encodeURIComponent(btn.dataset.delRes)}`, { method: "DELETE" });
         toast("Saved result deleted");
         loadSavedResults();
+        if (typeof loadStrategyLab === "function") loadStrategyLab();
       } catch (e) { toast(e.message, true); }
     };
   });
 }
 
 async function restoreSavedResult(item) {
+  showView("lab");
   $("symbolSelect").value = item.symbol;
   await loadCustomStrategies(item.symbol, item.strategy_id);
+  const st = state.customStrategies.find((s) => s.id === item.strategy_id);
+  if (st && item.rule_type) {
+    st.rule_type = item.rule_type;
+    if (item.params) st.params = { ...st.params, ...item.params };
+  }
   setTimeframePill(item.timeframe || "1h");
   $("capital").value = item.capital_inr || 50000;
   $("leverage").value = item.leverage || 10;
@@ -690,9 +759,13 @@ async function restoreSavedResult(item) {
   $("slValue").value = item.sl_value || 2.0;
   $("tpType").value = item.tp_type || "atr_mult";
   $("tpValue").value = item.tp_value || 5.0;
+  if ($("trailEnabled") && item.trailing_stop !== undefined) $("trailEnabled").checked = !!item.trailing_stop;
   if (item.trail_mult !== undefined) $("trailAtr").value = item.trail_mult;
   if (item.fee_mode) $("feeMode").value = item.fee_mode;
   if (item.slippage_bps !== undefined) $("slippage").value = String(Math.round(item.slippage_bps));
+  if ($("trend4h") && item.use_4h_trend !== undefined) $("trend4h").checked = !!item.use_4h_trend;
+  if ($("costGate") && item.use_cost_gate !== undefined) $("costGate").checked = !!item.use_cost_gate;
+  if ($("strictLot") && item.strict_lot_cap !== undefined) $("strictLot").checked = !!item.strict_lot_cap;
   const d = String(Math.round(item.period_days || 180));
   if ([...$("daysSelect").options].some((o) => o.value === d)) $("daysSelect").value = d;
   updateAdvSummary();
@@ -880,24 +953,54 @@ function renderKpis(r) {
 
 /* ------------------------------------------------------------------ ledger */
 const LEDGER_COLS = [
+  ["entry_time", "Date / Time (Entry)", "l"],
+  ["exit_time", "Exit Time", "l"],
   ["symbol", "Symbol", "l"],
   ["side", "Side", "l"],
-  ["entry_price", "Entry"],
-  ["exit_price", "Exit"],
-  ["net_pnl_inr", "Net P&L"],
-  ["equity_after_inr", "Equity"],
+  ["entry_price", "Entry Price"],
+  ["exit_price", "Exit Price"],
+  ["net_pnl_inr", "Net P&L (₹)"],
+  ["exit_reason", "Exit Reason", "l"],
   ["minutes_held", "Duration"],
+  ["equity_after_inr", "Equity (₹)"],
 ];
+
+function fmtTradePx(v) {
+  if (!isNum(v)) return esc(v);
+  const abs = Math.abs(v);
+  if (abs > 0 && abs < 1) return v.toFixed(4);
+  if (abs > 0 && abs < 10) return v.toFixed(3);
+  return v.toFixed(2);
+}
+
+function exitReasonBadge(reason) {
+  const r = String(reason || "EXIT").toUpperCase();
+  const label = r === "TSL" ? "TRAIL" : r;
+  const klass = r === "TP" ? "tag-tp" : r === "SL" ? "tag-sl" : (r === "TSL" || r === "TRAIL") ? "tag-trail" : r === "BE" ? "tag-be" : "tag-reason";
+  return `<span class="tag ${klass}">${esc(label)}</span>`;
+}
 
 function ledgerCell(t, key) {
   const v = t[key];
   switch (key) {
-    case "side": return `<span class="tag ${v === "LONG" ? "tag-long" : "tag-short"}">${v}</span>`;
-    case "entry_price": case "exit_price": return isNum(v) ? v.toFixed(2) : esc(v);
-    case "net_pnl_inr": return `<span class="${cls(v)}"><b>${inr(v)}</b></span>`;
-    case "equity_after_inr": return `₹${nf2.format(v)}`;
-    case "minutes_held": return v >= 1440 ? `${(v / 1440).toFixed(1)}d` : v >= 60 ? `${(v / 60).toFixed(1)}h` : `${v}m`;
-    default: return esc(v);
+    case "entry_time":
+    case "exit_time":
+      return `<span class="ts-mono">${esc(fmtTime(v))} UTC</span>`;
+    case "side":
+      return `<span class="tag ${v === "LONG" ? "tag-long" : "tag-short"}">${esc(v)}</span>`;
+    case "entry_price":
+    case "exit_price":
+      return fmtTradePx(v);
+    case "net_pnl_inr":
+      return `<span class="${cls(v)}"><b>${inr(v)}</b></span>`;
+    case "exit_reason":
+      return exitReasonBadge(v);
+    case "equity_after_inr":
+      return `₹${nf2.format(v)}`;
+    case "minutes_held":
+      return v >= 1440 ? `${(v / 1440).toFixed(1)}d` : v >= 60 ? `${(v / 60).toFixed(1)}h` : `${v}m`;
+    default:
+      return esc(v);
   }
 }
 
@@ -906,9 +1009,11 @@ function renderLedger() {
   $("ledgerCount").textContent = `${trades.length} trades · Sample rows from current run`;
   $("exportCsv").disabled = !trades.length;
   const head = `<thead><tr>${LEDGER_COLS.map(([, l, a]) => `<th class="${a || ""}">${l}</th>`).join("")}</tr></thead>`;
-  const body = trades.map((t, i) => `<tr data-i="${i}">${LEDGER_COLS.map(([k, , a]) => `<td class="${a || ""}">${ledgerCell(t, k)}</td>`).join("")}</tr>`).join("");
-  $("ledgerTable").innerHTML = head + `<tbody>${body}</tbody>`;
-  $("ledgerTable").querySelectorAll("tbody tr").forEach((tr) => {
+  const body = trades.length
+    ? trades.map((t, i) => `<tr data-i="${i}">${LEDGER_COLS.map(([k, , a]) => `<td class="${a || ""}">${ledgerCell(t, k)}</td>`).join("")}</tr>`).join("")
+    : `<tr><td class="l muted" colspan="${LEDGER_COLS.length}">No trades in this window</td></tr>`;
+  $("ledgerTable").innerHTML = head + `<tbody id="tradesTableBody">${body}</tbody>`;
+  $("ledgerTable").querySelectorAll("tbody tr[data-i]").forEach((tr) => {
     tr.onclick = () => selectTrade(trades[Number(tr.dataset.i)]);
   });
 }
@@ -942,12 +1047,17 @@ function selectTrade(tr, { fromChart = false } = {}) {
 function exportCsv() {
   const trades = state.result && state.result.trades;
   if (!trades || !trades.length) return;
-  const cols = ["trade_id", "symbol", "side", "signal_bar", "entry_time", "exit_time", "minutes_held", "contracts", "contract_value",
-    "entry_price", "exit_price", "initial_sl", "final_sl", "tp_price", "exit_reason", "notional_entry_usd", "notional_exit_usd",
+  const cols = ["trade_id", "entry_time", "exit_time", "symbol", "side", "entry_price", "exit_price", "net_pnl_inr",
+    "exit_reason", "minutes_held", "equity_after_inr", "signal_bar", "contracts", "contract_value",
+    "initial_sl", "final_sl", "tp_price", "notional_entry_usd", "notional_exit_usd",
     "margin_usd", "gross_pnl_usd", "entry_fee_rate", "exit_fee_rate", "entry_fee_usd", "exit_fee_usd", "fees_usd", "gst_usd",
-    "funding_usd", "funding_events", "net_pnl_usd", "gross_pnl_inr", "fees_inr", "gst_inr", "funding_inr", "net_pnl_inr", "equity_after_inr"];
+    "funding_usd", "funding_events", "net_pnl_usd", "gross_pnl_inr", "fees_inr", "gst_inr", "funding_inr"];
+  const fmtCsvVal = (t, c) => {
+    if (c === "entry_time" || c === "exit_time") return t[c] ? `${fmtTime(t[c])} UTC` : "";
+    return t[c];
+  };
   const q = (v) => { const s = v == null ? "" : String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-  const csv = [cols.join(","), ...trades.map((t) => cols.map((c) => q(t[c])).join(","))].join("\n");
+  const csv = [cols.join(","), ...trades.map((t) => cols.map((c) => q(fmtCsvVal(t, c))).join(","))].join("\n");
   const legs = state.result.legs.map((l) => `${l.symbol}-${l.strategy}-${l.timeframe}`).join("_");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
@@ -1136,6 +1246,8 @@ function showView(name) {
   $("labView").classList.toggle("hidden", name !== "lab");
   $("botView").classList.toggle("hidden", name !== "bot");
   $("manualView").classList.toggle("hidden", name !== "manual");
+  if ($("dataView")) $("dataView").classList.toggle("hidden", name !== "data");
+  if ($("strategiesView")) $("strategiesView").classList.toggle("hidden", name !== "strategies");
   if (history.replaceState) history.replaceState(null, "", name === "lab" ? "#" : `#${name}`);
   clearInterval(bot.timer);
   clearInterval(mt.timer);
@@ -1144,6 +1256,10 @@ function showView(name) {
     bot.timer = setInterval(() => { if (!document.hidden) loadBotStatus(); }, 5000);
   } else if (name === "manual") {
     mtEnter();
+  } else if (name === "data") {
+    dlEnter();
+  } else if (name === "strategies") {
+    slEnter();
   }
 }
 
@@ -1220,15 +1336,22 @@ function renderBot(s) {
   ].join("");
 
   const sig = s.signals || {};
-  $("botSignals").innerHTML = `<thead><tr><th class="l">Symbol</th><th class="l">Variant</th><th>1h bar (UTC)</th><th>Close</th><th>BB upper</th><th>BB lower</th>
-    <th>4h EMA50</th><th>4h EMA200</th><th class="l">4h regime</th><th>ATR14</th><th>ATR/close</th><th>Gate ≥</th><th>Cost gate</th><th>Raw L/S</th><th>Signal</th></tr></thead><tbody>` +
-    Object.entries(sig).map(([sym, x]) => x.error ? `<tr>${td(esc(sym), "l")}<td class="l" colspan="14">${esc(x.error)}</td></tr>` : `<tr>
-      ${td(esc(sym), "l")}${td(esc(x.variant), "l")}${td(shortTime(x.bar_open))}${td(nf2.format(x.close))}${td(nf2.format(x.bb_upper))}${td(nf2.format(x.bb_lower))}
-      ${td(nf2.format(x.ema50_4h))}${td(nf2.format(x.ema200_4h))}
-      ${td(`${x.allow_long_4h ? "long-ok" : x.allow_short_4h ? "short-ok" : "neutral"}${x.trend_filter_used ? "" : " (unused)"}`, "l")}
-      ${td(nf2.format(x.atr14))}${td(pct(x.atr_ratio * 100, false, 3))}${td(pct(x.gate_threshold * 100, false, 3))}
-      ${td(x.cost_gate_used ? chip(x.cost_gate_pass) : "n/a")}${td(`${x.cond_long ? 1 : 0}/${x.cond_short ? 1 : 0}`)}
-      ${td(x.signal_side ? `<span class="chip sig">${esc(x.signal_side)}</span>` : "none")}</tr>`).join("") + "</tbody>";
+  const dep = s.deployed_strategies || {};
+  const sigEntries = Object.entries(sig);
+  $("botSignals").innerHTML = `<thead><tr><th class="l">Symbol</th><th class="l">Deployed Strategy</th><th>TF</th><th>Lev / Risk</th><th class="l">SL / TP</th><th>Bar (UTC)</th><th>Close</th><th>ATR14</th><th>Cost gate</th><th>Raw L/S</th><th>Status</th><th>Signal</th></tr></thead><tbody>` +
+    (sigEntries.length ? sigEntries.map(([sym, x]) => {
+      const d = dep[sym] || {};
+      const cName = x.custom_name || d.custom_name || x.strategy_name || x.variant || "–";
+      const tf = x.timeframe || d.timeframe || "1h";
+      const levRisk = `${x.leverage || d.leverage || 3}x · ${x.risk_pct || d.risk_pct || 1}%`;
+      const slTp = `${x.sl_value || d.sl_value || 2}x / ${x.tp_value || d.tp_value || 3}x`;
+      const enChip = (x.enabled !== false && d.enabled !== false) ? `<span class="chip ok">ACTIVE</span>` : `<span class="chip no">PAUSED</span>`;
+      return x.error ? `<tr>${td(esc(sym), "l")}${td(esc(cName), "l")}${td(`<span class="sl-tf-badge">${esc(tf)}</span>`)}${td(esc(levRisk))}${td(esc(slTp), "l")}<td class="l" colspan="7">${esc(x.error)}</td></tr>` : `<tr>
+      ${td(`<strong>${esc(sym)}</strong>`, "l")}${td(`<strong>${esc(cName)}</strong>`, "l")}${td(`<span class="sl-tf-badge">${esc(tf)}</span>`)}${td(esc(levRisk))}${td(esc(slTp), "l")}
+      ${td(shortTime(x.bar_open))}${td(nf2.format(x.close))}${td(nf2.format(x.atr14))}
+      ${td(x.cost_gate_used ? chip(x.cost_gate_pass) : "off")}${td(`${x.cond_long ? 1 : 0}/${x.cond_short ? 1 : 0}`)}
+      ${td(enChip)}${td(x.signal_side ? `<span class="chip sig">${esc(x.signal_side)}</span>` : "none")}</tr>`;
+    }).join("") : `<tr><td class="l muted" colspan="12">No strategies deployed to Paper Bot yet — open <a href="#strategies" onclick="showView('strategies');return false;" style="color:#60a5fa;text-decoration:underline">Strategy Lab</a> to deploy saved strategies.</td></tr>`) + "</tbody>";
 
   $("botPosCount").textContent = pos.length ? `${pos.length} open` : "flat";
   $("botPositions").innerHTML = `<thead><tr><th class="l">Symbol</th><th class="l">Side</th><th>Lots</th><th>Entry</th><th>Mark</th><th>Unrealized ₹</th>
@@ -1787,12 +1910,574 @@ function bindManual() {
   mtSetLevBounds(100);
 }
 
+/* ------------------------------------------------------------------ Step 17: Data Lab View (/#data) */
+const dl = {
+  inventory: [],
+  summary: null,
+  catalogList: [],
+  pollTimer: null,
+};
+
+async function dlEnter() {
+  await loadDataInventory();
+  dlLoadCatalogList();
+  const bf = dl.summary && dl.summary.backfill_status;
+  if (bf && bf.is_running) {
+    dlStartPolling();
+  }
+}
+
+async function loadDataInventory() {
+  try {
+    const r = await api("/api/data/inventory");
+    dl.summary = r;
+    dl.inventory = r.items || [];
+    renderDataLab(r);
+  } catch (e) {
+    toast(`Inventory load failed: ${e.message}`, true);
+  }
+}
+
+function renderDataLab(r) {
+  if (!$("dlKpiCoins")) return;
+  const items = r.items || [];
+  $("dlKpiCoins").textContent = `${r.total_symbols || items.length} Coins`;
+  $("dlKpiCoinsSub").textContent = items.map((x) => x.symbol.replace(/USD$/, "")).join(" · ") || "No coins tracked";
+  $("dlKpiCandles").textContent = nf0.format(r.total_candles_all_coins || 0);
+  $("dlKpiCandlesSub").textContent = `${nf0.format(r.total_rows_all_series || 0)} total Parquet rows (T+M+F)`;
+  $("dlKpiDisk").textContent = `${nf2.format(r.total_disk_size_mb || 0)} MB`;
+  $("dlKpiDiskSub").textContent = ` across ${items.length * 3} Parquet files`;
+
+  const bf = r.backfill_status || {};
+  const running = !!bf.is_running;
+  $("dlKpiStatus").textContent = running ? "Syncing / Backfilling…" : (bf.error ? "Warning" : "Up to date ✔");
+  $("dlKpiStatus").className = `k-value ${running ? "" : bf.error ? "neg" : "pos"}`;
+  $("dlKpiStatusSub").textContent = r.latest_sync_utc ? `Latest: ${r.latest_sync_utc}` : "No local history";
+  $("dlInventorySubtitle").textContent = `${items.length} tracked perpetual futures · 1-minute resolution (TRADE + MARK + FUNDING)`;
+
+  dlRenderProgress(bf);
+
+  const head = `<thead><tr>
+    <th class="l">Coin</th>
+    <th>Coverage (Days)</th>
+    <th class="l">Date Range (UTC)</th>
+    <th>1m Candles</th>
+    <th>Gaps &amp; Health</th>
+    <th>Size</th>
+    <th class="l">Actions</th>
+  </tr></thead>`;
+
+  if (!items.length) {
+    $("dlInventoryTable").innerHTML = head + `<tbody><tr><td class="l muted" colspan="7">No coins tracked yet. Click "+ Add Coin from Delta Catalog" to add one.</td></tr></tbody>`;
+    return;
+  }
+
+  const body = items.map((x) => {
+    const days = Number(x.coverage_days || 0);
+    const covClass = days >= 300 ? "dl-cov-high" : days >= 55 ? "dl-cov-mid" : "dl-cov-low";
+    const startShort = x.start_date ? x.start_date.slice(0, 16) : "—";
+    const endShort = x.end_date ? x.end_date.slice(0, 16) : "—";
+    const gaps = Number(x.gaps_count || 0);
+    const healthBadge = gaps === 0 && x.trade_rows > 0
+      ? `<span class="dl-health-ok">0 Gaps ✔</span>`
+      : x.trade_rows === 0
+      ? `<span class="dl-health-warn">No Data</span>`
+      : `<span class="dl-health-warn">${gaps} Gap(s) (${x.missing_minutes || 0}m)</span>`;
+
+    const statusTag = x.status === "downloading" || x.status === "syncing"
+      ? `<span class="badge badge-testnet" style="margin-left:6px">SYNCING…</span>` : "";
+
+    return `<tr>
+      <td class="l">
+        <div class="dl-coin-cell">
+          <span class="dl-sym-pill">${esc(x.symbol)}</span>
+          <div class="dl-coin-meta">
+            <span class="dl-coin-name">${esc(x.name || x.symbol)}${statusTag}</span>
+            <span class="dl-coin-spec">lot ${esc(x.contract_value ?? "–")} · tick ${esc(x.tick_size ?? "–")} · max ${esc(x.max_leverage ?? 20)}x</span>
+          </div>
+        </div>
+      </td>
+      <td><span class="dl-cov-badge ${covClass}">${days.toFixed(1)}d</span></td>
+      <td class="l">
+        <div><b>${esc(startShort)}</b> → <b>${esc(endShort)}</b></div>
+        <div class="muted" style="font-size:11px">UTC 1m continuous</div>
+      </td>
+      <td>
+        <div><b>${nf0.format(x.trade_rows || 0)}</b></div>
+        <div class="muted" style="font-size:10.5px">M:${nf0.format(x.mark_rows || 0)} · F:${nf0.format(x.funding_rows || 0)}</div>
+      </td>
+      <td>${healthBadge}</td>
+      <td><b>${nf2.format(x.file_size_mb || 0)} MB</b></td>
+      <td class="l">
+        <div class="dl-row-actions">
+          <button type="button" class="btn btn-xs btn-sync" data-dl-sync="${esc(x.symbol)}" title="Incremental sync up to latest closed minute">⚡ Sync</button>
+          <button type="button" class="btn btn-xs btn-primary" data-dl-backfill="${esc(x.symbol)}" title="Extend past history or backfill custom date range">📅 Backfill</button>
+          <button type="button" class="btn btn-xs btn-ghost" data-dl-repair="${esc(x.symbol)}" title="Scan and repair any missing 1m candles">🔧 Repair</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join("");
+
+  $("dlInventoryTable").innerHTML = head + `<tbody>${body}</tbody>`;
+
+  $("dlInventoryTable").querySelectorAll("[data-dl-sync]").forEach((btn) => {
+    btn.onclick = () => triggerBackfill({ symbol: btn.dataset.dlSync, mode: "latest", days_to_add: 7 });
+  });
+  $("dlInventoryTable").querySelectorAll("[data-dl-backfill]").forEach((btn) => {
+    btn.onclick = () => openBackfillModal(btn.dataset.dlBackfill);
+  });
+  $("dlInventoryTable").querySelectorAll("[data-dl-repair]").forEach((btn) => {
+    btn.onclick = () => repairSymbolGaps(btn.dataset.dlRepair);
+  });
+}
+
+function dlRenderProgress(bf) {
+  const running = !!(bf && bf.is_running);
+  const pctVal = Math.max(0, Math.min(100, Number(bf && bf.progress_pct) || 0));
+  const msg = (bf && bf.message) || (running ? "Downloading…" : "Idle");
+
+  if ($("dlGlobalProgressWrap")) {
+    $("dlGlobalProgressWrap").classList.toggle("hidden", !running && (bf && bf.state !== "done"));
+    $("dlGlobalProgressText").textContent = msg;
+    $("dlGlobalProgressPct").textContent = `${pctVal.toFixed(0)}%`;
+    $("dlGlobalProgressBar").style.width = `${pctVal}%`;
+  }
+  if ($("bfModalProgressWrap") && $("backfillModal") && $("backfillModal").open) {
+    $("bfModalProgressWrap").classList.toggle("hidden", !running && (bf && bf.state !== "done"));
+    $("bfModalProgressText").textContent = msg;
+    $("bfModalProgressPct").textContent = `${pctVal.toFixed(0)}%`;
+    $("bfModalProgressBar").style.width = `${pctVal}%`;
+  }
+  if ($("acModalProgressWrap") && $("addCoinModal") && $("addCoinModal").open) {
+    $("acModalProgressWrap").classList.toggle("hidden", !running && (bf && bf.state !== "done"));
+    $("acModalProgressText").textContent = msg;
+    $("acModalProgressPct").textContent = `${pctVal.toFixed(0)}%`;
+    $("acModalProgressBar").style.width = `${pctVal}%`;
+  }
+}
+
+function dlStartPolling() {
+  clearInterval(dl.pollTimer);
+  dl.pollTimer = setInterval(async () => {
+    try {
+      const bf = await api("/api/data/backfill/status");
+      dlRenderProgress(bf);
+      if (!bf.is_running) {
+        clearInterval(dl.pollTimer);
+        dl.pollTimer = null;
+        if (bf.error) {
+          toast(`Backfill error: ${bf.error}`, true);
+        } else {
+          toast(bf.message || "History update complete ✔");
+        }
+        await loadDataInventory();
+        await loadStatus();
+      }
+    } catch (_) {
+      clearInterval(dl.pollTimer);
+      dl.pollTimer = null;
+    }
+  }, 900);
+}
+
+async function triggerBackfill(payload) {
+  try {
+    const st = await api("/api/data/backfill", { method: "POST", body: JSON.stringify(payload) });
+    dlRenderProgress(st);
+    toast(`Started ${payload.mode} job for ${payload.symbol}`);
+    dlStartPolling();
+  } catch (e) {
+    toast(e.message, true);
+    if ($("bfModalMsg")) $("bfModalMsg").textContent = e.message;
+  }
+}
+
+function openBackfillModal(sym) {
+  const item = dl.inventory.find((x) => x.symbol === sym) || { symbol: sym, coverage_days: 0, trade_rows: 0 };
+  $("bfSymbolLabel").textContent = sym;
+  $("bfSymbolInput").value = sym;
+  const sDate = item.start_date ? item.start_date.slice(0, 10) : "—";
+  const eDate = item.end_date ? item.end_date.slice(0, 10) : "—";
+  $("bfCurrentCoverage").textContent = `Current on disk: ${sDate} to ${eDate} (${Number(item.coverage_days || 0).toFixed(1)} days, ${nf0.format(item.trade_rows || 0)} candles)`;
+  $("bfFromDate").value = "";
+  $("bfToDate").value = "";
+  $("bfModeInput").value = "older";
+  $("bfDaysInput").value = "60";
+  document.querySelectorAll("#bfPresetBtns .dl-preset-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.bfMode === "older" && b.dataset.bfDays === "60");
+  });
+  $("bfModalProgressWrap").classList.add("hidden");
+  $("bfModalMsg").textContent = "";
+  $("backfillModal").showModal();
+}
+
+async function repairSymbolGaps(sym) {
+  toast(`Scanning & repairing 1m gaps for ${sym}…`);
+  try {
+    const r = await api("/api/data/repair_gaps", { method: "POST", body: JSON.stringify({ symbol: sym }) });
+    toast(`${sym}: ${r.gaps_before} gap(s) scanned → ${r.gaps_after} remaining (${r.rows_added} rows added)`);
+    await loadDataInventory();
+  } catch (e) {
+    toast(`Repair failed: ${e.message}`, true);
+  }
+}
+
+async function dlLoadCatalogList() {
+  if (dl.catalogList.length) {
+    renderAddCoinCatalogOptions($("acSearchInput") ? $("acSearchInput").value : "");
+    return;
+  }
+  try {
+    const c = await api("/api/products/catalog");
+    dl.catalogList = c.products || [];
+    renderAddCoinCatalogOptions($("acSearchInput") ? $("acSearchInput").value : "");
+  } catch (e) {
+    if ($("acModalMsg")) $("acModalMsg").textContent = `Catalog load error: ${e.message}`;
+  }
+}
+
+function renderAddCoinCatalogOptions(query = "") {
+  const sel = $("acCatalogSelect");
+  if (!sel) return;
+  const q = String(query || "").trim().toUpperCase();
+  const tracked = new Set((dl.inventory || []).map((x) => x.symbol));
+  const filtered = dl.catalogList.filter((p) => !q || p.symbol.includes(q) || String(p.description || "").toUpperCase().includes(q));
+  if ($("acCatalogCount")) $("acCatalogCount").textContent = String(filtered.length);
+  sel.innerHTML = filtered.slice(0, 250).map((p, idx) => {
+    const tag = tracked.has(p.symbol) ? " [Already Tracked]" : "";
+    return `<option value="${esc(p.symbol)}" ${idx === 0 ? "selected" : ""}>${esc(p.symbol)} — ${esc(p.description || "Perpetual")} (max ${p.max_leverage}x · lot ${p.contract_value})${tag}</option>`;
+  }).join("");
+}
+
+function bindDataLab() {
+  if (!$("dlAddCoinBtn")) return;
+  $("dlRefreshBtn").onclick = () => loadDataInventory();
+  $("dlSyncAllBtn").onclick = () => triggerBackfill({ symbol: "ALL", mode: "latest", days_to_add: 7 });
+  $("dlExtendAltsBtn").onclick = () => triggerBackfill({ symbol: "ALTCOINS", mode: "target_days", days_to_add: 365 });
+
+  $("dlAddCoinBtn").onclick = async () => {
+    $("acModalMsg").textContent = "";
+    $("acModalProgressWrap").classList.add("hidden");
+    $("addCoinModal").showModal();
+    await dlLoadCatalogList();
+    $("acSearchInput").focus();
+  };
+
+  $("acSearchInput").addEventListener("input", () => renderAddCoinCatalogOptions($("acSearchInput").value));
+  document.querySelectorAll("#acDepthBtns .dl-preset-btn").forEach((btn) => {
+    btn.onclick = () => {
+      document.querySelectorAll("#acDepthBtns .dl-preset-btn").forEach((b) => b.classList.toggle("active", b === btn));
+      $("acDaysInput").value = btn.dataset.acDays;
+    };
+  });
+  $("acCancelBtn").onclick = () => $("addCoinModal").close();
+  $("addCoinCatalogForm").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const sym = ($("acCatalogSelect").value || $("acSearchInput").value || "").trim().toUpperCase();
+    const days = Number($("acDaysInput").value) || 60;
+    if (!sym) { $("acModalMsg").textContent = "Select a perpetual symbol first"; return; }
+    $("acSubmitBtn").disabled = true;
+    $("acModalMsg").textContent = `Adding ${sym} and starting ${days}d download…`;
+    try {
+      const r = await api("/api/data/add_coin", { method: "POST", body: JSON.stringify({ symbol: sym, initial_days: days }) });
+      dlRenderProgress(r.backfill_status);
+      toast(`${sym} added to tracked coins — downloading ${days}d history`);
+      dlStartPolling();
+      await loadDataInventory();
+      await loadStatus();
+    } catch (e) {
+      $("acModalMsg").textContent = e.message;
+    } finally {
+      $("acSubmitBtn").disabled = false;
+    }
+  });
+
+  document.querySelectorAll("#bfPresetBtns .dl-preset-btn").forEach((btn) => {
+    btn.onclick = () => {
+      document.querySelectorAll("#bfPresetBtns .dl-preset-btn").forEach((b) => b.classList.toggle("active", b === btn));
+      $("bfModeInput").value = btn.dataset.bfMode;
+      $("bfDaysInput").value = btn.dataset.bfDays;
+      $("bfFromDate").value = "";
+      $("bfToDate").value = "";
+    };
+  });
+  const onCustomDateChange = () => {
+    if ($("bfFromDate").value && $("bfToDate").value) {
+      document.querySelectorAll("#bfPresetBtns .dl-preset-btn").forEach((b) => b.classList.remove("active"));
+      $("bfModeInput").value = "custom_range";
+    }
+  };
+  $("bfFromDate").addEventListener("change", onCustomDateChange);
+  $("bfToDate").addEventListener("change", onCustomDateChange);
+  $("bfCloseBtn").onclick = () => $("backfillModal").close();
+
+  $("backfillForm").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const sym = $("bfSymbolInput").value;
+    const fromD = $("bfFromDate").value;
+    const toD = $("bfToDate").value;
+    const mode = (fromD && toD) ? "custom_range" : ($("bfModeInput").value || "older");
+    const days = Number($("bfDaysInput").value) || 60;
+    $("bfModalMsg").textContent = `Starting ${mode} backfill for ${sym}…`;
+    await triggerBackfill({
+      symbol: sym,
+      mode,
+      days_to_add: days,
+      start_date: fromD || null,
+      end_date: toD || null,
+    });
+  });
+}
+
+/* ------------------------------------------------------------------ Step 18: Strategy Lab & Paper Bot Deployment */
+const sl = { deployed: [], summary: {}, saved: [] };
+
+async function slEnter() {
+  await loadStrategyLab();
+}
+
+function slQuery() {
+  const q = new URLSearchParams();
+  const v = (id) => ($(id) ? String($(id).value || "").trim() : "");
+  const s = v("slSearchInput"), c = v("slCoinFilter"), t = v("slTfFilter"), w = v("slMinWrFilter"), p = v("slMinPfFilter");
+  if (s) q.set("search", s);
+  if (c && !/^all/i.test(c)) q.set("symbol", c);
+  if (t && !/^all/i.test(t)) q.set("timeframe", t);
+  if (w !== "") q.set("min_win_rate", w);
+  if (p !== "") q.set("min_pf", p);
+  return q.toString();
+}
+
+async function loadStrategyLab() {
+  try {
+    const [dep, lib] = await Promise.all([
+      api("/api/bot/deployed"),
+      api(`/api/backtest/results?${slQuery()}`),
+    ]);
+    sl.deployed = Array.isArray(dep.deployed) ? dep.deployed : Object.values(dep.deployed || {});
+    sl.summary = dep;
+    sl.saved = lib.results || [];
+    if ($("navStratBadge") && !slQuery()) $("navStratBadge").textContent = String(sl.saved.length);
+    renderStrategyLab();
+  } catch (e) {
+    toast(`Strategy Lab load failed: ${e.message}`, true);
+  }
+}
+
+function slTpLabel(r) {
+  const sv = r.sl_value ?? "–", tv = r.tp_value ?? "–";
+  const slL = `${sv}${r.sl_type === "fixed_pct" ? "%" : "x ATR"}`;
+  const tpL = `${tv}${r.tp_type === "rr_ratio" ? "R" : r.tp_type === "fixed_pct" ? "%" : "x ATR"}`;
+  return `${slL} / ${tpL}`;
+}
+
+function renderStrategyLab() {
+  renderStrategyLabRoster();
+  renderStrategyLabLibrary();
+}
+
+function renderStrategyLabRoster() {
+  const rows = sl.deployed || [];
+  const sum = sl.summary || {};
+  if ($("slActiveCoinsCount")) $("slActiveCoinsCount").textContent = `${sum.active_count ?? 0} / ${rows.length}`;
+  if ($("slCombinedRisk")) $("slCombinedRisk").textContent = `${nf2.format(sum.combined_risk_pct ?? 0)}% (${inr(sum.combined_risk_inr ?? 0, false)})`;
+  if ($("slClearDeployedBtn")) $("slClearDeployedBtn").disabled = !rows.length;
+  $("slDeployedEmpty")?.classList.toggle("hidden", rows.length > 0);
+  $("slDeployedTableWrap")?.classList.toggle("hidden", rows.length === 0);
+  const tbl = $("slDeployedTable");
+  if (!tbl) return;
+  const head = `<thead><tr><th>On</th><th class="l">Coin</th><th class="l">Custom Name</th><th>TF</th><th>Capital ₹</th><th>Lev</th><th>Risk</th><th>SL / TP</th><th>Last signal</th><th class="l">Actions</th></tr></thead>`;
+  const body = rows.map((d) => `<tr class="${d.enabled === false ? "sl-row-paused" : ""}">
+    <td><input type="checkbox" class="sl-roster-toggle" data-symbol="${esc(d.symbol)}" ${d.enabled !== false ? "checked" : ""}></td>
+    <td class="l"><b>${esc(d.symbol)}</b></td>
+    <td class="l"><b>${esc(d.custom_name || "")}</b></td>
+    <td><span class="sl-tf-badge">${esc(d.timeframe || "1h")}</span></td>
+    <td>₹${nf0.format(d.capital_inr || 0)}</td>
+    <td>${d.leverage}x</td>
+    <td>${d.risk_pct}%</td>
+    <td>${esc(d.sl_tp || slTpLabel(d))}</td>
+    <td>${d.last_signal && d.last_signal !== "none" ? `<span class="chip sig">${esc(d.last_signal)}</span>` : "none"}</td>
+    <td class="l"><button type="button" class="btn btn-xs btn-danger sl-roster-remove" data-symbol="${esc(d.symbol)}">Remove</button></td>
+  </tr>`).join("");
+  tbl.innerHTML = head + `<tbody>${body}</tbody>`;
+  tbl.querySelectorAll(".sl-roster-toggle").forEach((chk) => {
+    chk.onchange = async () => {
+      try {
+        await api(`/api/bot/deployed/${encodeURIComponent(chk.dataset.symbol)}/toggle`, {
+          method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: chk.checked }),
+        });
+        await loadStrategyLab();
+      } catch (e) { toast(`Toggle failed: ${e.message}`, true); }
+    };
+  });
+  tbl.querySelectorAll(".sl-roster-remove").forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await api(`/api/bot/deployed/${encodeURIComponent(btn.dataset.symbol)}`, { method: "DELETE" });
+        await loadStrategyLab();
+      } catch (e) { toast(`Remove failed: ${e.message}`, true); }
+    };
+  });
+}
+
+function slIsDeployed(r) {
+  return (sl.deployed || []).some((d) => d.symbol === r.symbol && d.saved_result_id && d.saved_result_id === r.id);
+}
+
+function updateSlBatchBtn() {
+  const n = document.querySelectorAll("#slLibraryTable .sl-lib-check:checked").length;
+  const b = $("slBatchDeployBtn");
+  if (b) { b.disabled = n === 0; b.textContent = `🚀 Deploy Selected (${n}) to Paper Bot`; }
+}
+
+function renderStrategyLabLibrary() {
+  const rows = sl.saved || [];
+  if ($("slLibraryCount")) $("slLibraryCount").textContent = `${rows.length} saved strateg${rows.length === 1 ? "y" : "ies"}`;
+  const tbl = $("slLibraryTable");
+  if (!tbl) return;
+  const head = `<thead><tr><th><input type="checkbox" id="slSelectAll"></th><th class="l">Custom Name</th><th class="l">Coin</th><th>TF</th><th>Capital ₹</th><th>Lev</th><th>SL / TP</th><th>Net P&amp;L ₹</th><th>Win Rate</th><th>PF</th><th>Max DD</th><th>Trades</th><th>Status</th><th class="l">Actions</th></tr></thead>`;
+  if (!rows.length) {
+    tbl.innerHTML = head + `<tbody><tr><td class="l muted" colspan="14">No saved strategies match your filters. Save a backtest from Research Lab.</td></tr></tbody>`;
+    updateSlBatchBtn();
+    return;
+  }
+  const body = rows.map((r) => {
+    const cName = r.custom_name || r.strategy_name || "Custom Strategy";
+    return `<tr>
+    <td><input type="checkbox" class="sl-lib-check" data-rid="${esc(r.id)}"></td>
+    <td class="l"><b>${esc(cName)}</b>${r.notes ? `<div class="muted" style="font-size:10.5px">${esc(r.notes)}</div>` : ""}</td>
+    <td class="l"><b>${esc(r.symbol)}</b></td>
+    <td><span class="sl-tf-badge">${esc(r.timeframe)}</span></td>
+    <td>₹${nf0.format(r.capital_inr || 0)}</td>
+    <td>${r.leverage}x</td>
+    <td>${esc(slTpLabel(r))}</td>
+    <td class="${cls(r.net_pnl_inr)}"><b>${inr(r.net_pnl_inr)}</b> <span class="muted">(${pct(r.return_pct, true, 1)})</span></td>
+    <td>${pct(r.win_rate_pct, false, 1)}</td>
+    <td>${pf(r.profit_factor)}</td>
+    <td class="neg">${pct(-Math.abs(r.max_dd_pct || 0), false, 2)}</td>
+    <td>${r.total_trades}</td>
+    <td>${slIsDeployed(r) ? `<span class="sl-status-deployed">🚀 Deployed</span>` : `<span class="muted">Saved</span>`}</td>
+    <td class="l">
+      <button type="button" class="btn btn-xs btn-primary" data-act="deploy" data-rid="${esc(r.id)}">🚀 Deploy to Paper Bot</button>
+      <button type="button" class="btn btn-xs btn-ghost" data-act="load" data-rid="${esc(r.id)}">📊 Load</button>
+      <button type="button" class="btn btn-xs btn-ghost" data-act="rename" data-rid="${esc(r.id)}">✏️ Rename</button>
+      <button type="button" class="btn btn-xs btn-danger" data-act="del" data-rid="${esc(r.id)}">🗑️ Delete</button>
+    </td></tr>`;
+  }).join("");
+  tbl.innerHTML = head + `<tbody>${body}</tbody>`;
+  tbl.querySelector("#slSelectAll").onchange = (ev) => {
+    tbl.querySelectorAll(".sl-lib-check").forEach((c) => { c.checked = ev.target.checked; });
+    updateSlBatchBtn();
+  };
+  tbl.querySelectorAll(".sl-lib-check").forEach((c) => { c.onchange = updateSlBatchBtn; });
+  tbl.querySelectorAll("button[data-act]").forEach((btn) => {
+    btn.onclick = async () => {
+      const item = rows.find((x) => x.id === btn.dataset.rid);
+      if (!item) return;
+      const act = btn.dataset.act;
+      if (act === "deploy") await deploySavedStrategyToBot(item);
+      else if (act === "load") { showView("lab"); await restoreSavedResult(item); }
+      else if (act === "rename") await renameSavedStrategy(item);
+      else if (act === "del") {
+        try {
+          await api(`/api/backtest/results/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+          toast("Deleted saved strategy");
+          await loadSavedResults();
+          await loadStrategyLab();
+        } catch (e) { toast(`Delete failed: ${e.message}`, true); }
+      }
+    };
+  });
+  updateSlBatchBtn();
+}
+
+function deployPayload(row) {
+  const id = row.id || row.result_id;
+  return { ...row, result_id: id, id, symbol: row.symbol, enabled: true };
+}
+
+async function deploySavedStrategyToBot(itemOrId) {
+  const row = typeof itemOrId === "string"
+    ? ((state.savedResults || []).find((x) => x.id === itemOrId || x.result_id === itemOrId)
+       || (sl.saved || []).find((x) => x.id === itemOrId || x.result_id === itemOrId)
+       || { id: itemOrId })
+    : itemOrId;
+  try {
+    await api("/api/bot/deploy", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(deployPayload(row)),
+    });
+    toast(`🚀 Deployed "${row.custom_name || row.strategy_name || row.symbol}" to Paper Bot`);
+    await loadStrategyLab();
+    loadBotStatus();
+  } catch (e) {
+    toast(`Deploy failed: ${e.message}`, true);
+  }
+}
+
+async function renameSavedStrategy(item) {
+  const current = item.custom_name || item.strategy_name || "";
+  const nextName = window.prompt("New custom name:", current);
+  if (!nextName || !nextName.trim() || nextName.trim() === current) return;
+  try {
+    await api(`/api/backtest/results/${encodeURIComponent(item.id)}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ custom_name: nextName.trim() }),
+    });
+    toast(`Renamed to "${nextName.trim()}"`);
+    await loadSavedResults();
+    await loadStrategyLab();
+  } catch (e) { toast(`Rename failed: ${e.message}`, true); }
+}
+
+function bindStrategyLab() {
+  $("saveResultForm")?.addEventListener("submit", confirmSaveBacktestResult);
+  if ($("saveResultCancelBtn")) $("saveResultCancelBtn").onclick = () => $("saveResultModal")?.close();
+  if ($("slGoResearchBtn")) $("slGoResearchBtn").onclick = () => showView("lab");
+  if ($("slOpenBotBtn")) $("slOpenBotBtn").onclick = () => showView("bot");
+  if ($("slRefreshBtn")) $("slRefreshBtn").onclick = () => loadStrategyLab();
+  if ($("slClearDeployedBtn")) $("slClearDeployedBtn").onclick = async () => {
+    try {
+      await api("/api/bot/deployed", { method: "DELETE" });
+      toast("Cleared all deployed strategies");
+      await loadStrategyLab();
+      loadBotStatus();
+    } catch (e) { toast(`Clear failed: ${e.message}`, true); }
+  };
+  if ($("slBatchDeployBtn")) $("slBatchDeployBtn").onclick = async () => {
+    const ids = Array.from(document.querySelectorAll("#slLibraryTable .sl-lib-check:checked")).map((c) => c.dataset.rid);
+    if (!ids.length) return;
+    try {
+      await api("/api/bot/deploy", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ result_ids: ids, enabled: true }),
+      });
+      toast(`🚀 Deployed ${ids.length} strateg${ids.length === 1 ? "y" : "ies"} to Paper Bot`);
+      await loadStrategyLab();
+      loadBotStatus();
+    } catch (e) { toast(`Batch deploy failed: ${e.message}`, true); }
+  };
+  if ($("slClearFiltersBtn")) $("slClearFiltersBtn").onclick = () => {
+    ["slSearchInput", "slCoinFilter", "slTfFilter", "slMinWrFilter", "slMinPfFilter"].forEach((id) => { if ($(id)) $(id).value = ""; });
+    loadStrategyLab();
+  };
+  ["slSearchInput", "slMinWrFilter", "slMinPfFilter"].forEach((id) => $(id)?.addEventListener("input", () => loadStrategyLab()));
+  ["slCoinFilter", "slTfFilter"].forEach((id) => $(id)?.addEventListener("change", () => loadStrategyLab()));
+}
+
 async function main() {
   bindBot();
   bindManual();
+  bindDataLab();
+  bindStrategyLab();
   loadBotStatus();
-  if (location.hash === "#bot") showView("bot");
-  if (location.hash === "#manual") showView("manual");
+  const applyHashView = () => {
+    const h = (location.hash || "").replace(/^#\/?/, "");
+    if (h === "bot" || h === "manual" || h === "data" || h === "strategies" || h === "lab") showView(h);
+  };
+  applyHashView();
+  window.addEventListener("hashchange", applyHashView);
   if (!window.LightweightCharts) {
     toast("Could not load TradingView Lightweight Charts from unpkg.com — check your internet connection.", true);
     return;

@@ -12,6 +12,8 @@
     <div class="brand"><span class="brand-mark">D</span> Delta Futures Lab</div>
     <nav class="view-switch" aria-label="View">
       <button class="vbtn active" data-view="lab">Research Lab</button>
+      <button class="vbtn" id="navStrategies" data-view="strategies">Strategy Lab <span id="navStratBadge" class="tab-count">0</span></button>
+      <button class="vbtn" id="navData" data-view="data">Data Lab</button>
       <button class="vbtn" data-view="bot">Bot Operations</button>
       <button class="vbtn" data-view="manual">Manual Trade</button>
     </nav>
@@ -297,7 +299,27 @@
             <div class="spacer"></div>
             <span class="muted">Click any trade row to inspect entry/exit on the chart</span>
           </div>
-          <div class="table-wrap"><table id="ledgerTable" class="data"></table></div>
+          <div class="table-wrap">
+            <table id="ledgerTable" class="data">
+              <thead>
+                <tr>
+                  <th class="l">Date / Time (Entry)</th>
+                  <th class="l">Exit Time</th>
+                  <th class="l">Symbol</th>
+                  <th class="l">Side</th>
+                  <th>Entry Price</th>
+                  <th>Exit Price</th>
+                  <th>Net P&amp;L (₹)</th>
+                  <th class="l">Exit Reason</th>
+                  <th>Duration</th>
+                  <th>Equity (₹)</th>
+                </tr>
+              </thead>
+              <tbody id="tradesTableBody">
+                <tr><td class="l muted" colspan="10">No trades in current preview — click Run backtest</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
 
         <div class="tab-body hidden" id="tab-results">
@@ -644,6 +666,287 @@
       <div class="table-wrap"><table id="mtTrades" class="data"></table></div>
     </section>
   </div>
+
+  <!-- Step 17: Dedicated Data Lab View (/#data) -->
+  <div id="dataView" class="data-view hidden">
+    <section class="panel dl-header-card">
+      <div class="dl-header-top">
+        <div>
+          <h2 class="dl-title">Data Lab — Historical 1m Inventory &amp; Backfill Engine</h2>
+          <div class="dl-subtitle">Manage local 1-minute Parquet archives (<code>TRADE</code> · <code>MARK</code> · <code>FUNDING</code>), extend altcoin history to 1 Year (365d), or add any of Delta Exchange India's 237 perpetual contracts.</div>
+        </div>
+        <div class="dl-actions">
+          <button type="button" id="dlAddCoinBtn" class="btn btn-primary">+ Add Coin from Delta Catalog</button>
+          <button type="button" id="dlSyncAllBtn" class="btn btn-sync">⚡ Sync All to Latest</button>
+          <button type="button" id="dlExtendAltsBtn" class="btn btn-accent-outline">📅 Extend Altcoins to 1 Year (365d)</button>
+        </div>
+      </div>
+
+      <div id="dlGlobalProgressWrap" class="dl-progress-box hidden">
+        <div class="dl-progress-head">
+          <span id="dlGlobalProgressText" class="dl-progress-text">Downloading chunk 1 of 10 · 10%…</span>
+          <span id="dlGlobalProgressPct" class="dl-progress-pct">10%</span>
+        </div>
+        <div class="dl-progress-track">
+          <div id="dlGlobalProgressBar" class="dl-progress-fill" style="width: 10%"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="kpis dl-kpis-4" id="dlKpis" aria-label="Data Lab Summary">
+      <div class="kpi">
+        <div class="kpi-top"><span class="kpi-ico ico-blue">🪙</span><span class="k-label">Coins Tracked</span></div>
+        <div id="dlKpiCoins" class="k-value">–</div>
+        <div id="dlKpiCoinsSub" class="k-sub">Perpetual futures in local store</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-top"><span class="kpi-ico ico-green">📊</span><span class="k-label">Total 1m Candles</span></div>
+        <div id="dlKpiCandles" class="k-value">–</div>
+        <div id="dlKpiCandlesSub" class="k-sub">TRADE candles (plus MARK &amp; FUNDING)</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-top"><span class="kpi-ico ico-slate">💾</span><span class="k-label">Disk Storage</span></div>
+        <div id="dlKpiDisk" class="k-value">–</div>
+        <div id="dlKpiDiskSub" class="k-sub">Compressed Parquet archives</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-top"><span class="kpi-ico ico-green">⚡</span><span class="k-label">Global Sync Status</span></div>
+        <div id="dlKpiStatus" class="k-value">Up to date ✔</div>
+        <div id="dlKpiStatusSub" class="k-sub">Latest candle UTC timestamp</div>
+      </div>
+    </section>
+
+    <section class="panel dl-table-card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Historical Data Inventory</div>
+          <div id="dlInventorySubtitle" class="card-sub">8 tracked perpetual futures · 1-minute resolution (`TRADE` + `MARK` + `FUNDING`)</div>
+        </div>
+        <div class="spacer"></div>
+        <button type="button" id="dlRefreshBtn" class="btn btn-sm btn-card-action">↻ Refresh Inventory</button>
+      </div>
+      <div class="table-wrap dl-table-wrap">
+        <table id="dlInventoryTable" class="data dl-table"></table>
+      </div>
+    </section>
+  </div>
+
+  <!-- Step 18: Dedicated Strategy Lab View (/#strategies) -->
+  <div id="strategiesView" class="strategies-view hidden">
+    <section class="panel sl-header-card">
+      <div class="sl-header-top">
+        <div>
+          <h2 class="sl-title">Strategy Lab — Saved Backtest Library &amp; Paper Auto-Bot Deployment</h2>
+          <div class="sl-subtitle">Save and name your winning Research Lab setups, manage your active Paper Auto-Bot roster, and deploy custom strategies to run 24/7 on their exact timeframe (`1m` to `4h`).</div>
+        </div>
+        <div class="sl-header-actions">
+          <button type="button" id="slGoResearchBtn" class="btn btn-ghost">← Back to Research Lab</button>
+          <button type="button" id="slRefreshBtn" class="btn btn-sync">↻ Refresh Library</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section A: Active Paper Bot Roster (Deployed Strategies) -->
+    <section class="panel sl-roster-card" id="slDeployedCard">
+      <div class="sl-roster-head">
+        <div>
+          <div class="card-title">Active Paper Bot Roster (Deployed Strategies)</div>
+          <div class="card-sub">Strategies currently assigned to the Paper Auto-Bot (`data/bot_profiles.json`). Only enabled strategies below will trade when the Paper Bot runs.</div>
+        </div>
+      </div>
+
+      <div class="sl-portfolio-bar" id="slPortfolioBar">
+        <div class="sl-port-stat">
+          <span class="sl-port-label">Active Deployed Coins:</span>
+          <b id="slActiveCoinsCount" class="sl-port-val">0</b>
+        </div>
+        <span class="sl-port-sep">|</span>
+        <div class="sl-port-stat">
+          <span class="sl-port-label">Combined Max Simultaneous Risk:</span>
+          <b id="slCombinedRisk" class="sl-port-val">0.0% (₹0)</b>
+        </div>
+        <div class="spacer"></div>
+        <button type="button" id="slClearDeployedBtn" class="btn btn-sm btn-danger" disabled>✕ Clear All Deployed</button>
+        <button type="button" id="slOpenBotBtn" class="btn btn-sm btn-primary">▶ Open Bot Operations (/#bot)</button>
+      </div>
+
+      <div id="slDeployedEmpty" class="sl-empty-roster">
+        No strategies deployed on Paper Bot yet. Backtest in Research Lab &rarr; Save Result &rarr; Click <b>'🚀 Deploy to Paper Bot'</b> below.
+      </div>
+
+      <div id="slDeployedTableWrap" class="table-wrap hidden">
+        <table id="slDeployedTable" class="data sl-table"></table>
+      </div>
+    </section>
+
+    <!-- Section B: Saved Backtest Strategies Library -->
+    <section class="panel sl-library-card" id="slLibraryCard">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Saved Backtest Strategies Library</div>
+          <div id="slLibrarySubtitle" class="card-sub">Custom-named backtest runs saved from Research Lab (`data/saved_backtests.json`)</div>
+        </div>
+        <div class="spacer"></div>
+        <button type="button" id="slBatchDeployBtn" class="btn btn-primary btn-sm" disabled>🚀 Deploy Selected (0) to Paper Bot</button>
+      </div>
+
+      <div class="tab-toolbar filters sl-filter-bar">
+        <input id="slSearchInput" type="text" placeholder="Search by Custom Name or notes…" style="width:220px">
+        <select id="slCoinFilter" title="Filter by Coin">
+          <option value="">All Coins</option>
+          <option value="BTCUSD">BTCUSD</option>
+          <option value="ETHUSD">ETHUSD</option>
+          <option value="DOGEUSD">DOGEUSD</option>
+          <option value="XRPUSD">XRPUSD</option>
+          <option value="SOLUSD">SOLUSD</option>
+          <option value="BNBUSD">BNBUSD</option>
+          <option value="SUIUSD">SUIUSD</option>
+          <option value="ADAUSD">ADAUSD</option>
+        </select>
+        <select id="slTfFilter" title="Filter by Timeframe">
+          <option value="">All Timeframes</option>
+          <option value="1m">1m</option>
+          <option value="5m">5m</option>
+          <option value="15m">15m</option>
+          <option value="30m">30m</option>
+          <option value="45m">45m</option>
+          <option value="1h">1h</option>
+          <option value="4h">4h</option>
+        </select>
+        <input id="slMinWrFilter" type="number" min="0" max="100" step="1" placeholder="Min Win Rate %" style="width:125px">
+        <input id="slMinPfFilter" type="number" min="0" step="0.1" placeholder="Min PF" style="width:95px">
+        <button type="button" id="slClearFiltersBtn" class="btn btn-sm btn-ghost">Clear Filters</button>
+        <div class="spacer"></div>
+        <span id="slLibraryCount" class="muted">0 saved strategies</span>
+      </div>
+
+      <div class="table-wrap sl-table-wrap">
+        <table id="slLibraryTable" class="data sl-table"></table>
+      </div>
+    </section>
+  </div>
+
+  <!-- Custom Name Modal on "Save Result" in Research Lab -->
+  <dialog id="saveResultModal" class="strat-dialog sl-save-modal">
+    <form method="dialog" id="saveResultForm">
+      <div class="dialog-head">
+        <h3>🔖 Save Backtest Strategy to Strategy Lab</h3>
+        <p class="hint">Give this backtest setup a memorable custom name so you can compare it in Strategy Lab or deploy it 1-click to the Paper Auto-Bot.</p>
+      </div>
+      <div id="saveResultPreviewSummary" class="sl-save-preview"></div>
+      <div class="field">
+        <label for="saveResultNameInput">Strategy / Result Name</label>
+        <input id="saveResultNameInput" type="text" required placeholder="e.g. My DOGE 15m Scalp v1" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="saveResultNotesInput">Notes / Tag (optional)</label>
+        <input id="saveResultNotesInput" type="text" placeholder="e.g. High PF, tight 1.8x ATR SL, maker fees" autocomplete="off">
+      </div>
+      <div id="saveResultModalMsg" class="hint"></div>
+      <div class="dialog-actions">
+        <button type="button" id="saveResultCancelBtn" class="btn btn-ghost">Cancel</button>
+        <button type="submit" id="saveResultConfirmBtn" class="btn btn-primary">🔖 Save to Strategy Lab</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Custom Backfill & History Extension Modal -->
+  <dialog id="backfillModal" class="strat-dialog dl-modal">
+    <form method="dialog" id="backfillForm">
+      <div class="dialog-head">
+        <h3 id="bfModalTitle">📅 Extend / Backfill Historical Data — <span id="bfSymbolLabel">DOGEUSD</span></h3>
+        <p id="bfCurrentCoverage" class="hint">Current on disk: —</p>
+      </div>
+      <input type="hidden" id="bfSymbolInput" value="DOGEUSD">
+      <input type="hidden" id="bfModeInput" value="older">
+      <input type="hidden" id="bfDaysInput" value="60">
+
+      <div class="section-title">Quick History Extension Presets</div>
+      <div class="dl-preset-grid" id="bfPresetBtns">
+        <button type="button" class="dl-preset-btn" data-bf-mode="older" data-bf-days="30">+30 Days Older</button>
+        <button type="button" class="dl-preset-btn active" data-bf-mode="older" data-bf-days="60">+60 Days Older</button>
+        <button type="button" class="dl-preset-btn" data-bf-mode="older" data-bf-days="90">+90 Days Older</button>
+        <button type="button" class="dl-preset-btn" data-bf-mode="older" data-bf-days="180">+180 Days Older</button>
+        <button type="button" class="dl-preset-btn dl-preset-highlight" data-bf-mode="target_days" data-bf-days="365">★ Full 1 Year (365 Days Total)</button>
+      </div>
+
+      <div class="section-title">Or Custom Date Range (UTC)</div>
+      <div class="row2">
+        <div class="field">
+          <label for="bfFromDate">From Date (UTC)</label>
+          <input id="bfFromDate" type="date">
+        </div>
+        <div class="field">
+          <label for="bfToDate">To Date (UTC)</label>
+          <input id="bfToDate" type="date">
+        </div>
+      </div>
+
+      <div id="bfModalProgressWrap" class="dl-progress-box hidden">
+        <div class="dl-progress-head">
+          <span id="bfModalProgressText" class="dl-progress-text">Starting backfill…</span>
+          <span id="bfModalProgressPct" class="dl-progress-pct">0%</span>
+        </div>
+        <div class="dl-progress-track">
+          <div id="bfModalProgressBar" class="dl-progress-fill" style="width: 0%"></div>
+        </div>
+      </div>
+
+      <div id="bfModalMsg" class="hint" style="margin-top:6px"></div>
+      <div class="dialog-actions">
+        <button type="button" id="bfCloseBtn" class="btn btn-ghost">Close</button>
+        <button type="submit" id="bfStartBtn" class="btn btn-primary">▶ Start Backfill</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- + Add Coin from 237-Coin Delta Catalog Modal -->
+  <dialog id="addCoinModal" class="strat-dialog dl-modal">
+    <form method="dialog" id="addCoinCatalogForm">
+      <div class="dialog-head">
+        <h3>+ Add Coin from Delta India Catalog</h3>
+        <p class="hint">Search all live Delta Exchange India perpetual futures (`GET /v2/products`), save metadata, and download 1m history (`TRADE`, `MARK`, `FUNDING`).</p>
+      </div>
+
+      <div class="field">
+        <label for="acSearchInput">Search Symbol or Coin Name</label>
+        <input id="acSearchInput" type="text" placeholder="Type e.g. PEPE, AVAX, LINK, SHIB, WIF, NEAR…" autocomplete="off">
+      </div>
+
+      <div class="field">
+        <label for="acCatalogSelect">Select Perpetual Contract (<span id="acCatalogCount">237</span> available)</label>
+        <select id="acCatalogSelect" size="6" class="dl-catalog-select"></select>
+      </div>
+
+      <div class="field">
+        <label>Initial History Depth to Download</label>
+        <div class="dl-preset-grid" id="acDepthBtns">
+          <button type="button" class="dl-preset-btn" data-ac-days="30">30 days</button>
+          <button type="button" class="dl-preset-btn active" data-ac-days="60">60 days</button>
+          <button type="button" class="dl-preset-btn" data-ac-days="90">90 days</button>
+          <button type="button" class="dl-preset-btn" data-ac-days="180">180 days</button>
+          <button type="button" class="dl-preset-btn dl-preset-highlight" data-ac-days="365">365 days (1 Year)</button>
+        </div>
+        <input type="hidden" id="acDaysInput" value="60">
+      </div>
+
+      <div id="acModalProgressWrap" class="dl-progress-box hidden">
+        <div class="dl-progress-head">
+          <span id="acModalProgressText" class="dl-progress-text">Downloading…</span>
+          <span id="acModalProgressPct" class="dl-progress-pct">0%</span>
+        </div>
+        <div class="dl-progress-track">
+          <div id="acModalProgressBar" class="dl-progress-fill" style="width: 0%"></div>
+        </div>
+      </div>
+
+      <div id="acModalMsg" class="hint" style="margin-top:6px"></div>
+      <div class="dialog-actions">
+        <button type="button" id="acCancelBtn" class="btn btn-ghost">Cancel</button>
+        <button type="submit" id="acSubmitBtn" class="btn btn-primary">Add &amp; Download</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="mtProtectDialog">
     <form method="dialog" id="mtProtectForm">

@@ -172,24 +172,90 @@ def _ticker(symbol: str) -> dict[str, Any] | None:
 
 
 def _signals() -> dict[str, Any]:
-    """Frozen-variant state on the latest CLOSED 1h/4h bars from the local history (cached 60s)."""
+    """State on the latest CLOSED bar of each deployed strategy's timeframe from local history (cached 60s)."""
     hit = _cache.get("signals")
     if hit and time.time() - hit[0] < 60:
         return hit[1]
     out: dict[str, Any] = {}
     for sym, prof in ee.bot_profiles().items():
+        meta = {
+            "deployed_strategy": prof.custom_name or prof.variant or "-",
+            "custom_name": prof.custom_name or prof.variant or "-",
+            "timeframe": prof.timeframe or "1h", "leverage": prof.leverage, "risk_pct": prof.risk_pct,
+            "sl_type": prof.sl_type, "sl_value": prof.sl_value, "tp_type": prof.tp_type, "tp_value": prof.tp_value,
+            "sl_tp": f"{prof.sl_value:g}{'%' if prof.sl_type == 'fixed_pct' else 'x ATR'} / "
+                     f"{prof.tp_value:g}{'R' if prof.tp_type == 'rr_ratio' else ('%' if prof.tp_type == 'fixed_pct' else 'x ATR')}",
+            "enabled": prof.enabled,
+        }
         try:
-            s = ee.evaluate_symbol(prof, ee.load_history(sym))
-            out[sym] = {k: s[k] for k in ("variant", "bar_open", "bar_close", "last_1m_open", "close", "bb_upper", "bb_lower",
+            hist = ee.load_history(sym)
+            if hist is None or len(hist) == 0:
+                out[sym] = {**meta, "status": "no_data", "signal": "FLAT", "signal_side": None, "close": 0.0}
+                continue
+            s = ee.evaluate_symbol(prof, hist)
+            out[sym] = {k: s[k] for k in ("variant", "custom_name", "timeframe", "rule_type", "leverage", "risk_pct",
+                                           "sl_type", "sl_value", "tp_type", "tp_value", "trail_mult",
+                                           "bar_open", "bar_close", "last_1m_open", "close", "bb_upper", "bb_lower",
                                            "ema50_4h", "ema200_4h", "src_4h_open", "allow_long_4h", "allow_short_4h", "atr14",
                                            "atr_ratio", "gate_threshold", "cost_gate_pass", "cond_long", "cond_short",
                                            "signal_side", "fresh_signal")}
             out[sym]["trend_filter_used"] = prof.trend_filter_4h
             out[sym]["cost_gate_used"] = prof.cost_gate
+            out[sym].update(meta)
         except Exception as exc:  # noqa: BLE001
-            out[sym] = {"error": f"{type(exc).__name__}: {exc}"}
+            out[sym] = {**meta, "error": f"{type(exc).__name__}: {exc}"}
     _cache["signals"] = (time.time(), out)
     return out
+
+
+def deployed_summary_view(sig_map: dict[str, Any] | None = None) -> dict[str, Any]:
+    all_profs = ee.all_deployed_profiles()
+    deployed_list: list[dict[str, Any]] = []
+    for sym, prof in all_profs.items():
+        sl_lbl = f"{prof.sl_value:g}{'%' if prof.sl_type == 'fixed_pct' else 'x ATR'}"
+        tp_lbl = f"{prof.tp_value:g}{'R' if prof.tp_type == 'rr_ratio' else ('%' if prof.tp_type == 'fixed_pct' else 'x ATR')}"
+        trail_lbl = f"{prof.trail_mult:g}x ATR" if prof.trailing_stop and prof.trail_mult > 0 else "Off"
+        sig_info = (sig_map or {}).get(sym) or {}
+        item = {
+            "symbol": sym,
+            "enabled": prof.enabled,
+            "saved_result_id": prof.saved_result_id,
+            "custom_name": prof.custom_name or prof.variant,
+            "timeframe": prof.timeframe,
+            "rule_type": prof.rule_type or prof.strategy,
+            "params": prof.params or {},
+            "capital_inr": prof.capital_inr,
+            "leverage": prof.leverage,
+            "risk_pct": prof.risk_pct,
+            "sl_type": prof.sl_type,
+            "sl_value": prof.sl_value,
+            "tp_type": prof.tp_type,
+            "tp_value": prof.tp_value,
+            "trailing_stop": prof.trailing_stop,
+            "trail_mult": prof.trail_mult,
+            "sl_tp": f"{sl_lbl} / {tp_lbl}",
+            "sl_tp_summary": f"SL {sl_lbl} · TP {tp_lbl} · Trail {trail_lbl}",
+            "fee_mode": prof.fee_mode,
+            "slippage_bps": prof.slippage_bps,
+            "use_4h_trend": prof.trend_filter_4h,
+            "use_cost_gate": prof.cost_gate,
+            "deployed_at": prof.deployed_at,
+            "last_signal": sig_info.get("signal_side") or "none",
+            "last_bar_open": sig_info.get("bar_open"),
+            "last_close": sig_info.get("close"),
+        }
+        deployed_list.append(item)
+    active_items = [x for x in deployed_list if x["enabled"]]
+    combined_risk_pct = round(sum(float(x["risk_pct"]) for x in active_items), 2)
+    combined_risk_inr = round(sum(float(x["capital_inr"]) * float(x["risk_pct"]) / 100.0 for x in active_items), 2)
+    return _clean({
+        "deployed": deployed_list,
+        "profiles": {x["symbol"]: x for x in deployed_list},
+        "active_count": len(active_items),
+        "total_count": len(deployed_list),
+        "combined_risk_pct": combined_risk_pct,
+        "combined_risk_inr": combined_risk_inr,
+    })
 
 
 def loss_streak(trades: list[sqlite3.Row], floor_us: int) -> int:
@@ -218,6 +284,8 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
     con = ro_conn(jmode)
     if con is None:
         cap = ee.CAPITAL_INR
+        sigs = _signals() if with_market and with_signals else {}
+        dep = deployed_summary_view(sigs)
         base.update(readiness_state="NO_JOURNAL", mode=jmode, entries_paused=False, daily_halted=False, loss_streak=0,
                     positions=[], intents=[], trades=[], events=[], transitions=[],
                     wallet={"initial_capital_inr": cap, "realized_equity_inr": cap, "unrealized_pnl_inr": 0.0,
@@ -225,7 +293,9 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
                             "today_pnl_pct": 0.0, "day_start_equity_inr": cap, "daily_loss_limit_pct": ee.DAILY_LOSS_LIMIT_PCT,
                             "daily_loss_limit_inr": cap * ee.DAILY_LOSS_LIMIT_PCT / 100, "closed_trades": 0,
                             "closed_net_inr": 0.0, "usd_inr_rate": settings.FIXED_USD_INR_RATE},
-                    signals=_signals() if with_market and with_signals else {})
+                    signals=sigs,
+                    deployed_strategies=dep["deployed"],
+                    deployed_summary=dep)
         return _clean(base)
     try:
         cfg = con.execute("SELECT * FROM bot_config_state WHERE id=1").fetchone()
@@ -309,7 +379,9 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
         transitions=[{"at": us_iso(e["at_us"]), **json.loads(e["detail"] or "{}")} for e in events if e["kind"] == "state"][:25],
         events=[{"id": e["id"], "at": us_iso(e["at_us"]), "level": e["level"], "kind": e["kind"], "symbol": e["symbol"],
                  "detail": e["detail"]} for e in events if e["kind"] != "state"][:40],
-        signals=_signals() if with_market and with_signals else {},
+        signals=(sigs := _signals() if with_market and with_signals else {}),
+        deployed_strategies=(dep := deployed_summary_view(sigs))["deployed"],
+        deployed_summary=dep,
     )
     return _clean(base)
 
@@ -320,6 +392,181 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
 @router.get("/status")
 def bot_status() -> dict[str, Any]:
     return read_status()
+
+
+SAVED_BACKTESTS_FILE = settings.data_path / "saved_backtests.json"
+
+
+def _load_saved_results_for_deploy() -> list[dict[str, Any]]:
+    if not SAVED_BACKTESTS_FILE.exists():
+        return []
+    try:
+        raw = json.loads(SAVED_BACKTESTS_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+class DeployStrategyRequest(BaseModel):
+    result_id: str | None = None
+    saved_result_id: str | None = None
+    id: str | None = None
+    result_ids: list[str] | None = None
+    symbol: str | None = None
+    custom_name: str | None = None
+    strategy_name: str | None = None
+    timeframe: str | None = None
+    rule_type: str | None = None
+    params: dict[str, Any] | None = None
+    capital_inr: float | None = None
+    leverage: float | None = None
+    risk_pct: float | None = None
+    sl_type: str | None = None
+    sl_value: float | None = None
+    tp_type: str | None = None
+    tp_value: float | None = None
+    trailing_stop: bool | None = None
+    trail_mult: float | None = None
+    fee_mode: str | None = None
+    slippage_bps: float | None = None
+    use_4h_trend: bool | None = None
+    use_cost_gate: bool | None = None
+    enabled: bool = True
+
+
+def _build_deploy_entry(saved: dict[str, Any] | None, req: DeployStrategyRequest) -> dict[str, Any]:
+    src = saved or {}
+    sym = str(req.symbol or src.get("symbol") or "").strip().upper()
+    if not sym:
+        raise HTTPException(422, "symbol or valid result_id is required to deploy a strategy")
+    rid = req.result_id or req.saved_result_id or req.id or src.get("id")
+    cname = (req.custom_name or req.strategy_name or src.get("custom_name")
+             or src.get("strategy_name") or f"{sym} Custom Strategy")
+    tf = str(req.timeframe or src.get("timeframe") or "1h")
+    rt = req.rule_type or src.get("rule_type") or "bollinger_volume_breakout"
+    params = req.params if req.params is not None else (src.get("params") or {})
+    cap = float(req.capital_inr if req.capital_inr is not None else (src.get("capital_inr") or 50000.0))
+    lev = float(req.leverage if req.leverage is not None else (src.get("leverage") or 10.0))
+    risk = float(req.risk_pct if req.risk_pct is not None else (src.get("risk_pct") or 2.0))
+    sl_type = str(req.sl_type or src.get("sl_type") or "atr_mult")
+    sl_val = float(req.sl_value if req.sl_value is not None else (src.get("sl_value") or 2.0))
+    tp_type = str(req.tp_type or src.get("tp_type") or "atr_mult")
+    tp_val = float(req.tp_value if req.tp_value is not None else (src.get("tp_value") or 5.0))
+    trail_m = float(req.trail_mult if req.trail_mult is not None else (src.get("trail_mult") if src.get("trail_mult") is not None else 2.5))
+    trail_on = bool(req.trailing_stop if req.trailing_stop is not None else (src.get("trailing_stop", trail_m > 0)))
+    fee_mode = str(req.fee_mode or src.get("fee_mode") or "taker_maker_tp")
+    slippage_bps = float(req.slippage_bps if req.slippage_bps is not None else (src.get("slippage_bps") or 0.0))
+    use_4h = bool(req.use_4h_trend if req.use_4h_trend is not None else src.get("use_4h_trend", bool(params.get("use_4h_trend", False))))
+    use_gate = bool(req.use_cost_gate if req.use_cost_gate is not None else src.get("use_cost_gate", False))
+    return {
+        "enabled": bool(req.enabled),
+        "saved_result_id": rid,
+        "custom_name": cname,
+        "symbol": sym,
+        "timeframe": tf,
+        "rule_type": rt,
+        "params": params,
+        "capital_inr": cap,
+        "leverage": lev,
+        "risk_pct": risk,
+        "sl_type": sl_type,
+        "sl_value": sl_val,
+        "tp_type": tp_type,
+        "tp_value": tp_val,
+        "trailing_stop": trail_on,
+        "trail_mult": trail_m if trail_on else 0.0,
+        "fee_mode": fee_mode,
+        "slippage_bps": slippage_bps,
+        "use_4h_trend": use_4h,
+        "use_cost_gate": use_gate,
+        "deployed_at": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+
+
+@router.get("/deployed")
+def get_deployed_strategies() -> dict[str, Any]:
+    return deployed_summary_view(_signals())
+
+
+@router.post("/deploy")
+def deploy_strategy_to_bot(req: DeployStrategyRequest) -> dict[str, Any]:
+    saved_all: dict[str, dict[str, Any]] = {}
+    for r in _load_saved_results_for_deploy():
+        for k in ("id", "result_id"):
+            if r.get(k):
+                saved_all[str(r[k])] = r
+    raw_profiles = ee.load_bot_profiles_raw()
+    deployed_symbols: list[str] = []
+
+    if req.result_ids:
+        for rid in req.result_ids:
+            src = saved_all.get(str(rid))
+            if not src:
+                raise HTTPException(404, f"saved backtest result {rid!r} not found")
+            sub_req = DeployStrategyRequest(result_id=rid, enabled=req.enabled)
+            entry = _build_deploy_entry(src, sub_req)
+            raw_profiles[entry["symbol"]] = entry
+            deployed_symbols.append(entry["symbol"])
+    else:
+        rid = req.result_id or req.saved_result_id or req.id
+        src = None
+        for cand in (req.result_id, req.id, req.saved_result_id):
+            if cand and str(cand) in saved_all:
+                src = saved_all[str(cand)]
+                break
+        if rid and src is None and not req.symbol:
+            raise HTTPException(404, f"saved backtest result {rid!r} not found")
+        entry = _build_deploy_entry(src, req)
+        raw_profiles[entry["symbol"]] = entry
+        deployed_symbols.append(entry["symbol"])
+
+    ee.save_bot_profiles_raw(raw_profiles)
+    _cache.pop("signals", None)
+    view = deployed_summary_view(_signals())
+    return _clean({"ok": True, "deployed_symbols": deployed_symbols, **view})
+
+
+class ToggleDeployedRequest(BaseModel):
+    enabled: bool | None = None
+
+
+@router.put("/deployed/{symbol}/toggle")
+def toggle_deployed_strategy(symbol: str, req: ToggleDeployedRequest | None = None) -> dict[str, Any]:
+    sym = symbol.strip().upper()
+    raw_profiles = ee.load_bot_profiles_raw()
+    if sym not in raw_profiles:
+        raise HTTPException(404, f"no deployed strategy found for {sym}")
+    cur = bool(raw_profiles[sym].get("enabled", True))
+    new_state = (not cur) if (req is None or req.enabled is None) else bool(req.enabled)
+    raw_profiles[sym]["enabled"] = new_state
+    ee.save_bot_profiles_raw(raw_profiles)
+    _cache.pop("signals", None)
+    view = deployed_summary_view(_signals())
+    return _clean({"ok": True, "symbol": sym, "enabled": new_state, **view})
+
+
+@router.delete("/deployed/{symbol}")
+def undeploy_strategy(symbol: str) -> dict[str, Any]:
+    sym = symbol.strip().upper()
+    raw_profiles = ee.load_bot_profiles_raw()
+    if sym == "ALL":
+        raw_profiles.clear()
+    else:
+        if sym not in raw_profiles:
+            raise HTTPException(404, f"no deployed strategy found for {sym}")
+        raw_profiles.pop(sym, None)
+    ee.save_bot_profiles_raw(raw_profiles)
+    _cache.pop("signals", None)
+    view = deployed_summary_view(_signals())
+    return _clean({"ok": True, "undeployed": sym, **view})
+
+
+@router.delete("/deployed")
+def clear_all_deployed_strategies() -> dict[str, Any]:
+    ee.save_bot_profiles_raw({})
+    _cache.pop("signals", None)
+    view = deployed_summary_view({})
+    return _clean({"ok": True, "undeployed": "ALL", **view})
 
 
 def _runner(mode: str) -> lb.LiveBotRunner:

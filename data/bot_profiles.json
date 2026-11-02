@@ -1,0 +1,40 @@
+{
+  "XRPUSD": {
+    "capital_inr": 100000.0,
+    "custom_name": "XRP-1",
+    "deployed_at": "2026-10-28T18:06:48.583690+00:00",
+    "enabled": true,
+    "fee_mode": "maker_maker",
+    "leverage": 22.0,
+    "params": {
+      "adx_max": 48,
+      "atr_sl_min_pct": 0.75,
+      "bb_period": 20,
+      "bb_std": 2,
+      "breakeven_at_1r": 1,
+      "climax_mult": 2.4,
+      "cost_gate_mult": 1.4,
+      "ema_filter": 100,
+      "rsi_ob": 60,
+      "rsi_os": 40,
+      "rsi_period": 14,
+      "use_4h_trend": 1,
+      "vol_ma_period": 20,
+      "wick_ratio": 0.35
+    },
+    "risk_pct": 23.0,
+    "rule_type": "vol_climax_reversal",
+    "saved_result_id": "bt_79c217df8d",
+    "sl_type": "fixed_pct",
+    "sl_value": 1.0,
+    "slippage_bps": 0.0,
+    "symbol": "XRPUSD",
+    "timeframe": "45m",
+    "tp_type": "fixed_pct",
+    "tp_value": 2.2,
+    "trail_mult": 0.0,
+    "trailing_stop": true,
+    "use_4h_trend": false,
+    "use_cost_gate": false
+  }
+}

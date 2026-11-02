@@ -543,3 +543,126 @@ def resample_candles(df_1m: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         }
         return out
     return _orig_resample_candles(df_1m, timeframe)
+
+
+
+def missing_ranges_for_series(
+    symbol: str, series_type: SeriesType, req_start: int, req_end: int
+) -> tuple[pd.DataFrame, list[tuple[int, int]]]:
+    """Return (existing_df, missing_start_end_pairs) for [req_start, req_end]."""
+    api_symbol(symbol, series_type)
+    now_end = _last_closed_minute()
+    req_end = min(int(req_end), now_end)
+    req_start = min(int(req_start), req_end)
+    existing = load_raw_1m(symbol, series_type)
+    ranges: list[tuple[int, int]] = []
+    if existing.empty:
+        ranges.append((req_start, req_end))
+    else:
+        have_min, have_max = int(existing["time"].min()), int(existing["time"].max())
+        if req_start < have_min:
+            ranges.append((req_start, have_min - MINUTE))
+        if have_max < req_end:
+            ranges.append((have_max + MINUTE, req_end))
+    return existing, ranges
+
+
+def chunks_for_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Expand (start, end) ranges into 32h (1920m) 8h-aligned UTC chunks."""
+    out: list[tuple[int, int]] = []
+    for a, b in ranges:
+        if a > b:
+            continue
+        cs = a - a % FUNDING_INTERVAL_SECONDS
+        while cs <= b:
+            ce = cs + CHUNK_SECONDS - MINUTE
+            out.append((cs, ce))
+            cs += CHUNK_SECONDS
+    return out
+
+
+def download_1m_range(
+    symbol: str,
+    series_type: SeriesType,
+    req_start: int,
+    req_end: int,
+    progress_cb: Any = None,
+) -> DownloadResult:
+    """Download 1m candles in [req_start, req_end] with 8h-aligned chunk progress callback."""
+    path = raw_1m_path(symbol, series_type)
+    existing, ranges = missing_ranges_for_series(symbol, series_type, req_start, req_end)
+    rows_before = len(existing)
+    chunks = chunks_for_ranges(ranges)
+    if not chunks:
+        return DownloadResult(symbol, series_type, path, rows_before, rows_before, 0, 0)
+
+    sym_api = api_symbol(symbol, series_type)
+    frames: list[pd.DataFrame] = []
+    n_requests = 0
+    for idx, (cs, ce) in enumerate(chunks, start=1):
+        if progress_cb is not None:
+            progress_cb(idx, len(chunks), cs, ce, series_type)
+        rows = client().get(
+            "/v2/history/candles",
+            {"resolution": "1m", "symbol": sym_api, "start": cs, "end": ce},
+        )
+        n_requests += 1
+        if rows:
+            frames.append(pd.DataFrame.from_records(rows))
+
+    if frames:
+        df_new = _normalise_raw(pd.concat(frames, ignore_index=True))
+        lo = min(a for a, _ in ranges)
+        hi = max(b for _, b in ranges)
+        df_new = df_new[(df_new["time"] >= lo) & (df_new["time"] <= hi)]
+        merged = _merge(existing, df_new)
+        rows_fetched = len(df_new)
+    else:
+        merged = existing
+        rows_fetched = 0
+
+    merged, n_rep = _repair_gaps(symbol, series_type, merged)
+    n_requests += n_rep
+    _atomic_write_parquet(merged, path)
+    return DownloadResult(symbol, series_type, path, rows_before, len(merged), rows_fetched, n_requests)
+
+
+def repair_symbol_gaps(symbol: str) -> dict[str, Any]:
+    """Scan and repair any missing 1m timestamps across TRADE, MARK, and FUNDING Parquet files."""
+    series_out: dict[str, Any] = {}
+    total_before = 0
+    total_after = 0
+    total_added = 0
+    for st in SERIES_TYPES:
+        path = raw_1m_path(symbol, st)
+        if not path.exists():
+            series_out[st] = {"gaps_before": 0, "gaps_after": 0, "rows_added": 0, "requests": 0}
+            continue
+        df = load_raw_1m(symbol, st)
+        if df.empty:
+            series_out[st] = {"gaps_before": 0, "gaps_after": 0, "rows_added": 0, "requests": 0}
+            continue
+        g_before = find_gaps(df["time"])
+        repaired, n_req = _repair_gaps(symbol, st, df)
+        if len(repaired) != len(df):
+            _atomic_write_parquet(repaired, path)
+        g_after = find_gaps(repaired["time"])
+        added = max(0, len(repaired) - len(df))
+        total_before += g_before.gap_count
+        total_after += g_after.gap_count
+        total_added += added
+        series_out[st] = {
+            "gaps_before": g_before.gap_count,
+            "gaps_after": g_after.gap_count,
+            "missing_minutes_after": g_after.missing_minutes,
+            "rows_added": added,
+            "requests": n_req,
+        }
+    return {
+        "symbol": symbol,
+        "status": "ok",
+        "gaps_before": total_before,
+        "gaps_after": total_after,
+        "rows_added": total_added,
+        "series": series_out,
+    }
