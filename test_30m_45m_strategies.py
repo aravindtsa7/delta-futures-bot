@@ -199,6 +199,7 @@ def main() -> None:
 
     for sym in symbols:
         df_1m = datasets[sym]
+        bars_4h = dm.resample_candles(df_1m, "4h")
         spec = specs[sym]
         end = df_1m.index[-1] + pd.Timedelta(minutes=1)
         total_days = (end - df_1m.index[0]).total_seconds() / 86400.0
@@ -212,7 +213,7 @@ def main() -> None:
         for cand in CANDIDATES_30M_45M:
             tf = cand["tf"]
             bars, atr14 = resampled[(sym, tf)]
-            out = strategies.evaluate_custom_strategy(cand["rule_type"], cand["params"], bars)
+            out = strategies.evaluate_custom_strategy(cand["rule_type"], cand["params"], bars, bars_4h=bars_4h)
             sig = out["signal"]
 
             r_pct = float(cand.get("risk", 1.8))

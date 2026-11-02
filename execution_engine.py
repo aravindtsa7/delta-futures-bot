@@ -45,6 +45,7 @@ import pandas as pd
 
 import data_manager as dm
 import strategies
+from trade_rules import stop_config, advance_stop
 from backtester import Backtester, BacktestConfig, ProductSpec
 from config import settings
 from notifier import TelegramNotifier
@@ -118,9 +119,16 @@ class StrategyProfile:
     tp_value: float = TP_ATR_MULT
     trailing_stop: bool = True
     trail_mult: float = TRAIL_ATR_MULT
-    fee_mode: str = "taker_maker_tp"
-    slippage_bps: float = 0.0
+    fee_mode: str = "taker"
+    slippage_bps: float = settings.SIZING_SLIPPAGE_BPS
     deployed_at: str | None = None
+    effective_config: dict[str, Any] | None = None
+    cooldown_bars: int = COOLDOWN_BARS
+    max_daily_loss_pct: float = DAILY_LOSS_LIMIT_PCT
+    strict_lot_cap: bool = True
+    history_start: str | None = None
+    trigger_source: str = "trade"
+    exit_on_opposite_signal: bool = False
 
 
 FROZEN_PROFILES: dict[str, StrategyProfile] = {
@@ -176,6 +184,13 @@ def _profile_from_dict(symbol: str, ov: dict[str, Any]) -> StrategyProfile:
         fee_mode=str(ov.get("fee_mode") or "taker_maker_tp"),
         slippage_bps=float(ov.get("slippage_bps") or 0.0),
         deployed_at=ov.get("deployed_at"),
+        effective_config=ov.get("effective_config"),
+        cooldown_bars=int(ov.get("cooldown_bars", COOLDOWN_BARS)),
+        max_daily_loss_pct=float(ov.get("max_daily_loss_pct", DAILY_LOSS_LIMIT_PCT)),
+        strict_lot_cap=bool(ov.get("strict_lot_cap", True)),
+        history_start=ov.get("history_start"),
+        trigger_source=str(ov.get("trigger_source", "trade")),
+        exit_on_opposite_signal=bool(ov.get("exit_on_opposite_signal", False)),
     )
 
 
@@ -479,7 +494,10 @@ class StateStore:
                                  ("order_intents", "leverage", "REAL"),
                                  ("order_intents", "source", "TEXT DEFAULT 'bot'"),
                                  ("order_intents", "client_request_id", "TEXT"),
-                                 ("order_intents", "exit_reason", "TEXT")):
+                                 ("order_intents", "exit_reason", "TEXT"),
+                                 ("order_intents", "execution_config", "TEXT"),
+                                 ("open_positions", "execution_config", "TEXT"),
+                                 ("open_positions", "be_armed", "INTEGER NOT NULL DEFAULT 0")):
             if col not in self._cols(table):
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         if "filled_size_booked" not in self._cols("order_intents"):  # Step 9
@@ -529,12 +547,20 @@ class StateStore:
             if row["mode"] != mode:
                 raise RuntimeError(f"{self.path} is bound to mode {row['mode']!r}; refusing to run it as {mode!r}")
             return row
+        configs = [profile_config(prof) for prof in profiles.values() if prof.enabled]
+        capitals = {c.initial_capital_inr for c in configs}
+        daily_limits = {c.max_daily_loss_pct for c in configs}
+        rates = {c.usd_inr_rate for c in configs}
+        if len(capitals) > 1 or len(daily_limits) > 1 or len(rates) > 1:
+            raise ValueError("shared wallet profiles must agree on capital and daily loss limit")
+        capital = next(iter(capitals), CAPITAL_INR)
+        daily_limit = next(iter(daily_limits), DAILY_LOSS_LIMIT_PCT)
         with self.tx() as c:
             c.execute(
                 "INSERT INTO bot_config_state (id, mode, profiles_json, capital_inr, leverage, risk_pct, daily_loss_limit_pct,"
                 " usd_inr_rate, sizing_slippage_bps, halted, updated_at_us) VALUES (1,?,?,?,?,?,?,?,?,0,?)",
-                (mode, json.dumps({k: asdict(v) for k, v in profiles.items()}, sort_keys=True), CAPITAL_INR, LEVERAGE,
-                 RISK_PCT, DAILY_LOSS_LIMIT_PCT, settings.FIXED_USD_INR_RATE, settings.SIZING_SLIPPAGE_BPS, self.clock()))
+                (mode, json.dumps({k: asdict(v) for k, v in profiles.items()}, sort_keys=True), capital, LEVERAGE,
+                 RISK_PCT, daily_limit, next(iter(rates), settings.FIXED_USD_INR_RATE), settings.SIZING_SLIPPAGE_BPS, self.clock()))
         return self.config()
 
     def config(self) -> sqlite3.Row | None:
@@ -707,35 +733,42 @@ def sizing_config(equity_inr: float, risk_pct: float = RISK_PCT, leverage: float
                   tp_type: str = "atr_mult", tp_value: float = TP_ATR_MULT, trail_mult: float = TRAIL_ATR_MULT,
                   atr_pct: float = 1.0) -> BacktestConfig:
     """The backtest config the live sizer shares (taker fees + GST, strict lots, honoring custom SL/TP/leverage/risk)."""
-    sl_val = max(0.05, float(sl_value))
-    tp_val = max(0.05, float(tp_value))
-    ap = max(0.05, float(atr_pct or 1.0))
-    if sl_type in ("fixed_pct", "pct"):
-        if tp_type == "rr_ratio":
-            tp_pct = sl_val * tp_val
-        elif tp_type in ("atr_mult", "atr"):
-            tp_pct = tp_val * ap
-        else:
-            tp_pct = tp_val
-        stops = dict(sl_mode="pct", stop_loss_pct=sl_val, take_profit_pct=max(0.05, tp_pct))
-    else:
-        if tp_type == "rr_ratio":
-            tp_atr = sl_val * tp_val
-        elif tp_type in ("fixed_pct", "pct"):
-            tp_atr = tp_val / ap
-        else:
-            tp_atr = tp_val
-        stops = dict(sl_mode="atr", sl_atr_mult=sl_val, tp_atr_mult=max(0.1, tp_atr))
+    stops = stop_config(sl_type, sl_value, tp_type, tp_value)
     cfg = BacktestConfig(
-        initial_capital_inr=equity_inr, leverage=min(float(leverage), 100.0), risk_per_trade_pct=risk_pct,
+        initial_capital_inr=equity_inr, leverage=float(leverage), risk_per_trade_pct=risk_pct,
         max_daily_loss_pct=DAILY_LOSS_LIMIT_PCT, fee_mode="taker", trigger_source="trade", cooldown_bars=COOLDOWN_BARS,
         atr_sl_min_pct=SL_MIN_PCT, atr_sl_max_pct=SL_MAX_PCT, trailing_atr_mult=max(0.0, float(trail_mult)),
         margin_buffer=MARGIN_BUFFER, allow_min_one_lot=False, mark_fill_mode="traded",
         slippage_bps=settings.SIZING_SLIPPAGE_BPS if slippage_bps is None else slippage_bps,
         **stops,
     )
-    if float(leverage) > 100.0:
-        object.__setattr__(cfg, "leverage", float(leverage))
+    return cfg
+
+
+def profile_config(profile: StrategyProfile) -> BacktestConfig:
+    if profile.effective_config is not None:
+        return BacktestConfig(**profile.effective_config)
+    params = profile.params or {}
+    return BacktestConfig(
+        initial_capital_inr=profile.capital_inr, leverage=profile.leverage,
+        risk_per_trade_pct=profile.risk_pct, fee_mode=profile.fee_mode,
+        slippage_bps=profile.slippage_bps, cooldown_bars=profile.cooldown_bars,
+        max_daily_loss_pct=profile.max_daily_loss_pct, trigger_source=profile.trigger_source,
+        exit_on_opposite_signal=profile.exit_on_opposite_signal,
+        breakeven_at_1r=bool(params.get("breakeven_at_1r", False)),
+        atr_sl_min_pct=float(params.get("atr_sl_min_pct", .35 if profile.timeframe in ("1m", "3m", "5m") else .8)),
+        atr_sl_max_pct=float(params.get("atr_sl_max_pct", 4.0)),
+        allow_min_one_lot=not profile.strict_lot_cap,
+        trailing_atr_mult=profile.trail_mult if profile.trailing_stop else 0.0,
+        **stop_config(profile.sl_type, profile.sl_value, profile.tp_type, profile.tp_value))
+
+
+def validate_deployable(profile: StrategyProfile) -> BacktestConfig:
+    cfg = profile_config(profile)
+    if profile.timeframe not in dm.TIMEFRAME_MINUTES:
+        raise ValueError("unsupported deployment timeframe")
+    if cfg.trigger_source != "trade" or cfg.exit_on_opposite_signal:
+        raise ValueError("paper deployment currently supports trade triggers and SL/TP/BE/trailing exits; rerun with those settings")
     return cfg
 
 
@@ -766,14 +799,21 @@ def calculate_order_lots(product: ProductSpec, price: float, atr_value: float, s
 
     d = 1 if side.upper() in ("LONG", "BUY") else -1
     atr_pct = atr_value / price * 100.0
-    cfg = sizing_config(equity_inr, risk_pct, leverage, slippage_bps, sl_type=eff_sl_type, sl_value=eff_sl_val,
-                        tp_type=eff_tp_type, tp_value=eff_tp_val, trail_mult=eff_trail, atr_pct=atr_pct)
+    cfg = profile_config(profile) if profile is not None else sizing_config(
+        equity_inr, risk_pct, leverage, slippage_bps, sl_type=eff_sl_type, sl_value=eff_sl_val,
+        tp_type=eff_tp_type, tp_value=eff_tp_val, trail_mult=eff_trail, atr_pct=atr_pct)
+    if profile is not None:
+        cfg = profile_config(profile)
+        leverage, risk_pct = cfg.leverage, cfg.risk_per_trade_pct
+        eff_trail = cfg.trailing_atr_mult
     bt = Backtester(cfg)
-    rate = settings.FIXED_USD_INR_RATE
+    rate = cfg.usd_inr_rate
     sl_pct, tp_pct = cfg.stop_pcts(price, atr_value)
     sl_distance, tp_distance = price * sl_pct / 100, price * tp_pct / 100
     sl, tp = bt.levels(price, d, sl_pct, tp_pct, product)
-    trail = float(snap_to_tick(eff_trail * atr_value, product.tick_size)) if eff_trail > 0 else 0.0
+    trail = max(0.0, eff_trail * atr_value)
+    if profile is None:
+        trail = float(snap_to_tick(trail, product.tick_size))
     available_inr = equity_inr if available_inr is None else available_inr
     n, n_risk, n_cap, _ = bt.size_position(equity_inr / rate, price, sl, product, available_inr / rate)
     lpc = bt.loss_per_contract(price, sl, product)
@@ -811,7 +851,7 @@ def sync_market_data(symbols: list[str], days: int = 90) -> dict[str, int]:
 
 def load_history(symbol: str, history_start: pd.Timestamp | None = None) -> pd.DataFrame:
     hist = dm.load_unified_1m_dataset(symbol)
-    start = history_start if history_start is not None else step4b_history_start()
+    start = history_start
     if start is not None and len(hist) and start >= hist.index[0]:
         hist = hist[hist.index >= start]
     return hist
@@ -822,16 +862,21 @@ def evaluate_symbol(profile: StrategyProfile, hist: pd.DataFrame, at: pd.Timesta
     if hist is not None and len(hist):
         hist = hist.copy(deep=False)
         hist.columns = [str(c).lower() for c in hist.columns]
+    if profile.history_start is not None:
+        start = pd.Timestamp(profile.history_start)
+        if hist.empty or hist.index[0] > start:
+            raise ValueError("deployed indicator warmup history is unavailable")
+        hist = hist[hist.index >= start]
     if at is not None:
         hist = hist[hist.index < at]
     tf_min = dm.TIMEFRAME_MINUTES.get(profile.timeframe, 60)
     bars = dm.resample_candles(hist, profile.timeframe)
     if profile.rule_type and profile.rule_type in strategies.CUSTOM_RULE_TYPES:
-        out = strategies.evaluate_custom_strategy(profile.rule_type, profile.params or {}, bars)
+        out = strategies.evaluate_custom_strategy(profile.rule_type, profile.params or {}, bars, bars_4h=dm.resample_candles(hist, "4h"))
     elif profile.strategy in strategies.CUSTOM_RULE_TYPES:
-        out = strategies.evaluate_custom_strategy(profile.strategy, profile.params or {}, bars)
+        out = strategies.evaluate_custom_strategy(profile.strategy, profile.params or {}, bars, bars_4h=dm.resample_candles(hist, "4h"))
     else:
-        out = strategies.generate_signals(profile.strategy, bars)
+        out = strategies.generate_signals(profile.strategy, bars, bars_4h=dm.resample_candles(hist, "4h"))
     atr14 = strategies.atr(bars, 14)
     filters: dict[str, tuple[pd.Series, pd.Series]] = {}
     trend = None
@@ -839,7 +884,8 @@ def evaluate_symbol(profile: StrategyProfile, hist: pd.DataFrame, at: pd.Timesta
         bars_4h = dm.resample_candles(hist, HTF)
         trend = strategies.trend_filter_4h(bars, bars_4h, tf_min)
         filters["trend4h"] = (trend["allow_long"], trend["allow_short"])
-    gate = strategies.cost_gate(bars, settings.TAKER_FEE, settings.GST_ON_FEES, GATE_SLIPPAGE_BPS, GATE_MULT)
+    cfg = profile_config(profile)
+    gate = strategies.cost_gate(bars, cfg.taker_fee, cfg.gst_rate, cfg.slippage_bps, GATE_MULT)
     if profile.cost_gate:
         filters["costgate"] = (gate["allow"], gate["allow"])
     sig, _ = strategies.apply_entry_filters(out, filters) if filters else (out["signal"], {})
@@ -992,7 +1038,8 @@ class ExecutionEngine:
         """(equity, available) in INR used for sizing."""
         if self.mode == "paper":
             eq = self.realized_equity_inr()
-            used = sum(float(p["margin_usd"]) for p in self.store.positions(self.mode)) * self.rate
+            used = sum(float(p["margin_usd"]) + float(p["realized_funding_usd"])
+                       for p in self.store.positions(self.mode)) * self.rate
             return eq, eq - used
         bals = self.client.get_wallet_balances()
         usd = next((b for b in bals if b.get("asset_symbol") == "USD"), None)
@@ -1021,6 +1068,14 @@ class ExecutionEngine:
             return {"action": "skip", "reason": "signal bar already processed"}
         self.store.mark_signal_seen(self.mode, symbol, signal_bar_us)
         prof = self.profiles.get(symbol)
+        cfg = validate_deployable(prof) if prof else sizing_config(CAPITAL_INR)
+        if self.mode == "paper" and prof and (
+                cfg.initial_capital_inr != float(self.cfg_row["capital_inr"])
+                or cfg.max_daily_loss_pct != float(self.cfg_row["daily_loss_limit_pct"])
+                or cfg.usd_inr_rate != self.rate):
+            return {"action": "skip", "reason": "profile differs from existing shared wallet; reconcile wallet configuration before entry"}
+        if self.mode != "paper" and prof and cfg.fee_mode != "taker":
+            return {"action": "skip", "reason": "market-order execution requires an all-taker backtest configuration"}
         prof_tf_us = dm.TIMEFRAME_MINUTES.get(prof.timeframe, 60) * 60_000_000 if prof else self.tf_us
         entry_us = signal_bar_us + prof_tf_us
         if st is not None and st["cooldown_until_us"] is not None and entry_us < st["cooldown_until_us"]:
@@ -1030,18 +1085,19 @@ class ExecutionEngine:
             return {"action": "skip", "reason": f"account policy: {why}"}
         product = self.ensure_product(symbol)
         equity, available = self.account_equity_inr()
-        fill_ref = ref_price * (1 + direction * self.paper_slip) if self.mode == "paper" else ref_price
+        fill_ref = cfg.entry_price(ref_price, direction) if self.mode == "paper" else ref_price
         lots = calculate_order_lots(product, fill_ref, atr_value, side_name, equity, available, profile=prof)
         if lots.contracts < 1:
             self._event("INFO", "entry_skipped", symbol, lots.reason)
             return {"action": "skip", "reason": lots.reason, "sizing": lots}
-        lev = float(prof.leverage) if prof else float(LEVERAGE)
+        lev = cfg.leverage
+        snapshot = json.dumps({"config": asdict(cfg), "timeframe": prof.timeframe if prof else TIMEFRAME})
         intent = self.store.create_intent(
             intent_id=f"in-{secrets.token_hex(8)}", client_order_id=self.new_client_oid(symbol), mode=self.mode,
             symbol=symbol, product_id=product.product_id, role="ENTRY", side="buy" if direction == 1 else "sell",
             size=lots.contracts, order_type="market_order", entry_price=fill_ref, sl_price=lots.sl_price,
             tp_price=lots.tp_price, trail_amount=lots.trail_amount, signal_bar_us=signal_bar_us, atr=atr_value,
-            leverage=lev)
+            leverage=lev, execution_config=snapshot)
         if self.mode == "paper":
             return self._paper_fill_entry(intent, ref_price, lots, profile=prof)
         return self._dispatch_entry(intent)
@@ -1050,19 +1106,10 @@ class ExecutionEngine:
                           profile: StrategyProfile | None = None) -> dict[str, Any]:
         sym, d = intent["symbol"], 1 if intent["side"] == "buy" else -1
         product = self.ensure_product(sym)
-        px = raw_price * (1 + d * self.paper_slip)
-        prof = profile or self.profiles.get(sym)
-        lev = float(prof.leverage) if prof else float(intent["leverage"] or LEVERAGE)
-        risk_pct = float(prof.risk_pct) if prof else RISK_PCT
-        sl_type = prof.sl_type if prof else "atr_mult"
-        sl_val = float(prof.sl_value) if prof else SL_ATR_MULT
-        tp_type = prof.tp_type if prof else "atr_mult"
-        tp_val = float(prof.tp_value) if prof else TP_ATR_MULT
-        trail_m = (float(prof.trail_mult) if prof.trailing_stop else 0.0) if prof else TRAIL_ATR_MULT
-        atr_pct = lots.atr / px * 100.0 if px > 0 else 1.0
-        # Levels from the executed price (as the backtester does).
-        cfg = sizing_config(lots.equity_inr, risk_pct, lev, sl_type=sl_type, sl_value=sl_val,
-                            tp_type=tp_type, tp_value=tp_val, trail_mult=trail_m, atr_pct=atr_pct)
+        snapshot = json.loads(intent["execution_config"]) if intent["execution_config"] else None
+        cfg = BacktestConfig(**snapshot["config"]) if snapshot else sizing_config(lots.equity_inr)
+        px = cfg.entry_price(raw_price, d)
+        lev = cfg.leverage
         sl_pct, tp_pct = cfg.stop_pcts(px, lots.atr)
         sl, tp = Backtester(cfg).levels(px, d, sl_pct, tp_pct, product)
         qty = intent["size"] * product.contract_value
@@ -1077,8 +1124,9 @@ class ExecutionEngine:
                 contracts=intent["size"], contract_value=product.contract_value, entry_price=px, raw_entry_price=raw_price,
                 initial_sl=sl, sl_price=sl, tp_price=tp, trail_amount=lots.trail_amount, sl_order_id=None, tp_order_id=None,
                 highest_fav_price=px, opened_at_us=t, last_bar_us=t - t % 60_000_000 - 60_000_000,
-                realized_funding_usd=0.0, entry_fee_usd=qty * px * self.fee, margin_usd=qty * px / lev,
-                atr_at_signal=lots.atr, intent_id=intent["intent_id"], leverage=lev)
+                realized_funding_usd=0.0, entry_fee_usd=qty * px * cfg.with_gst(cfg.entry_fee_rate), margin_usd=qty * px / lev,
+                atr_at_signal=lots.atr, intent_id=intent["intent_id"], leverage=lev,
+                execution_config=intent["execution_config"])
         self._event("INFO", "paper_entry", sym, {"side": "LONG" if d == 1 else "SHORT", "contracts": intent["size"],
                                                   "price": px, "sl": sl, "tp": tp, "leverage": lev})
         self.notifier.notify_trade_entry(self.store.intent(intent["intent_id"]), self.store.position(self.mode, sym))
@@ -1206,7 +1254,7 @@ class ExecutionEngine:
                     trail_amount=float(it["trail_amount"] or 0), sl_order_id=None, tp_order_id=None, highest_fav_price=px,
                     opened_at_us=t, last_bar_us=t - t % 60_000_000 - 60_000_000, realized_funding_usd=0.0, entry_fee_usd=fee,
                     margin_usd=delta * cv * px / lev, atr_at_signal=float(it["atr"] or 0), intent_id=iid, leverage=lev,
-                    source=it["source"] or "bot")
+                    source=it["source"] or "bot", execution_config=it["execution_config"])
                 opened, n = True, delta
             elif p["side"] == side:
                 n0 = int(p["contracts"])
@@ -1252,7 +1300,7 @@ class ExecutionEngine:
                         "realized_funding_usd": p["realized_funding_usd"] * (1 - f), "margin_usd": p["margin_usd"] * (1 - f)})
                 else:
                     row = self._trade_row(p, px, px, reason, t, fee, oid)
-                    tid = self.store.close_position(self.mode, sym, row, self._cooldown_until(t))
+                    tid = self.store.close_position(self.mode, sym, row, self._cooldown_until(t, p))
             self.store.record_fills(rows)
             self.store.transition(iid, new_state, reason if p is not None else "exit fill without a journal position", **upd)
         if row is None:
@@ -1416,8 +1464,10 @@ class ExecutionEngine:
                                     {"intent_id": iid, "exchange": ex, "journal": j, "steps": steps})
                     out.append({"intent_id": iid, "symbol": it["symbol"], "result": "UNRESOLVED_POSITION_DELTA", "steps": steps})
                     continue
-                self.store.transition(iid, "REJECTED", "not found at exchange after grace period; " + ",".join(steps))
-                out.append({"intent_id": iid, "symbol": it["symbol"], "result": "REJECTED", "steps": steps})
+                # Absence is not terminal evidence: an accepted resting order may be invisible.
+                # Keep the entry gate closed until a positive exchange state resolves this intent.
+                self.store.update_intent(iid, error="awaiting_terminal_exchange_evidence")
+                out.append({"intent_id": iid, "symbol": it["symbol"], "result": "STILL_UNKNOWN", "steps": steps})
                 continue
             fills = [f for f in all_fills if str(f.get("order_id")) == str(order.get("id"))]
             steps.append(f"fills:{len(fills)}")
@@ -1503,21 +1553,33 @@ class ExecutionEngine:
             if sl_hit:
                 gapped = o <= sl if d == 1 else o >= sl
                 raw = (min(o, sl) if d == 1 else max(o, sl)) if gapped else sl
-                reason = "TSL" if p["initial_sl"] is None or sl != float(p["initial_sl"]) else "SL"
+                cfg = self._position_config(p)
+                be = Backtester(cfg).breakeven_price(float(p["entry_price"]), d, product)
+                reason = "BE" if p["be_armed"] and sl == be else (
+                    "TSL" if p["initial_sl"] is None or sl != float(p["initial_sl"]) else "SL")
                 return self._paper_close(symbol, raw, reason, bar_us)
             if tp_hit:
                 return self._paper_close(symbol, tp, "TP", bar_us)
-        ext = max(float(p["highest_fav_price"]), h) if d == 1 else min(float(p["highest_fav_price"]), l)
-        trail = float(p["trail_amount"] or 0)
-        better, level = False, None
-        if trail > 0:
-            level = product.round_price(ext - d * trail)
-            better = sl is None or (level > sl if d == 1 else level < sl)
-        self.store.update_position(self.mode, symbol, highest_fav_price=ext, last_bar_us=bar_us)
-        if better:
+        cfg = self._position_config(p)
+        be = Backtester(cfg).breakeven_price(float(p["entry_price"]), d, product)
+        level, ext, armed = advance_stop(
+            cfg, product, d, float(p["entry_price"]), p["initial_sl"], sl, be,
+            bool(p["be_armed"]), float(p["highest_fav_price"]), h, l, float(p["trail_amount"] or 0))
+        action = None
+        if level is not None and level != sl:
             r = self.update_stop(symbol, level)
-            return {"action": "trail", "old_sl": sl, "new_sl": r["sl_price"], "extreme": ext}
-        return None
+            if r["sl_price"] != level:
+                armed = bool(p["be_armed"])  # retain the favorable extreme, retry BE on a later bar
+            action = {"action": "trail", "old_sl": sl, "new_sl": r["sl_price"], "extreme": ext}
+        self.store.update_position(self.mode, symbol, highest_fav_price=ext, last_bar_us=bar_us,
+                                   be_armed=int(armed))
+        return action
+
+    def _position_config(self, p: Any) -> BacktestConfig:
+        if "execution_config" in p.keys() and p["execution_config"]:
+            return BacktestConfig(**json.loads(p["execution_config"])["config"])
+        return BacktestConfig(slippage_bps=self.paper_slip * 10000, trailing_atr_mult=0,
+                              breakeven_at_1r=False, fee_mode="taker")
 
     def _trade_row(self, p: Any, exit_price: float, raw_exit: float, reason: str, closed_us: int,
                    exit_fee_usd: float, exit_order_id: str | None) -> dict[str, Any]:
@@ -1540,15 +1602,22 @@ class ExecutionEngine:
                     source=p["source"] if "source" in p.keys() else "bot",
                     leverage=p["leverage"] if "leverage" in p.keys() else LEVERAGE)
 
-    def _cooldown_until(self, closed_bar_us: int) -> int:
-        return (closed_bar_us // self.tf_us + 1 + COOLDOWN_BARS) * self.tf_us
+    def _cooldown_until(self, closed_bar_us: int, position: Any = None) -> int:
+        tf_us, cooldown = self.tf_us, COOLDOWN_BARS
+        if position is not None and "execution_config" in position.keys() and position["execution_config"]:
+            snapshot = json.loads(position["execution_config"])
+            tf_us = dm.TIMEFRAME_MINUTES[snapshot["timeframe"]] * 60_000_000
+            cooldown = int(snapshot["config"]["cooldown_bars"])
+        return (closed_bar_us // tf_us + 1 + cooldown) * tf_us
 
     def _paper_close(self, symbol: str, raw_price: float, reason: str, bar_us: int, contracts: int | None = None,
                      slippage: bool = True) -> dict[str, Any]:
         """Close all (or ``contracts`` of) a paper position at ``raw_price`` (adverse slippage unless disabled)."""
         p = self.store.position(self.mode, symbol)
         d = 1 if p["side"] == "LONG" else -1
-        px = raw_price * (1 - d * self.paper_slip) if slippage else raw_price
+        cfg = self._position_config(p)
+        px = cfg.exit_price(raw_price, d, reason) if slippage else raw_price
+        fee = cfg.with_gst(cfg.exit_fee_rate(reason))
         n_all = int(p["contracts"])
         n = n_all if contracts is None else int(contracts)
         if not 1 <= n <= n_all:
@@ -1558,7 +1627,7 @@ class ExecutionEngine:
             part = {**dict(p), "contracts": n, "entry_fee_usd": p["entry_fee_usd"] * f,
                     "realized_funding_usd": p["realized_funding_usd"] * f}
             qty = n * p["contract_value"]
-            row = self._trade_row(_Row(part), px, raw_price, reason, bar_us, qty * px * self.fee, None)
+            row = self._trade_row(_Row(part), px, raw_price, reason, bar_us, qty * px * fee, None)
             tid = self.store.reduce_position(self.mode, symbol, row, {
                 "contracts": n_all - n, "entry_fee_usd": p["entry_fee_usd"] * (1 - f),
                 "realized_funding_usd": p["realized_funding_usd"] * (1 - f), "margin_usd": p["margin_usd"] * (1 - f)})
@@ -1566,8 +1635,8 @@ class ExecutionEngine:
             self.notifier.notify_trade_exit({**row, "trade_id": tid})
             return {"action": "partial_exit", "trade_id": tid, "reason": reason, "price": px, "remaining": n_all - n, **row}
         qty = p["contracts"] * p["contract_value"]
-        row = self._trade_row(p, px, raw_price, reason, bar_us, qty * px * self.fee, None)
-        tid = self.store.close_position(self.mode, symbol, row, self._cooldown_until(bar_us))
+        row = self._trade_row(p, px, raw_price, reason, bar_us, qty * px * fee, None)
+        tid = self.store.close_position(self.mode, symbol, row, self._cooldown_until(bar_us, p))
         self._event("INFO", "paper_exit", symbol, {"reason": reason, "price": px, "net_inr": row["net_pnl_inr"]})
         self.notifier.notify_trade_exit({**row, "trade_id": tid})
         return {"action": "exit", "trade_id": tid, "reason": reason, "price": px, **row}
@@ -1987,7 +2056,7 @@ class ExecutionEngine:
                     "realized_funding_usd": p["realized_funding_usd"] * (1 - f), "margin_usd": p["margin_usd"] * (1 - f)})
             else:
                 row = self._trade_row(p, px, px, reason, end, fee, oid)
-                tid = self.store.close_position(self.mode, sym, row, self._cooldown_until(end))
+                tid = self.store.close_position(self.mode, sym, row, self._cooldown_until(end, p))
             self.store.record_fills(rows)
         legs = self._resize_legs(sym) if q < n_all else self._cancel_legs(int(p["product_id"]))  # surviving legs
         action = "partial_exit" if q < n_all else "exit"
@@ -2055,10 +2124,11 @@ class ExecutionEngine:
     def check_daily_loss(self, day_start_equity_inr: float, unrealized_inr: float = 0.0) -> bool:
         """Halt until next UTC midnight when realized+unrealized equity fell 5% below the day start."""
         eq = self.realized_equity_inr() + unrealized_inr
-        if eq > day_start_equity_inr * (1 - DAILY_LOSS_LIMIT_PCT / 100):
+        daily_pct = float(self.cfg_row["daily_loss_limit_pct"])
+        if daily_pct == 0 or eq > day_start_equity_inr * (1 - daily_pct / 100):
             return False
         t = self.clock()
-        self.store.set_halt(True, f"daily loss limit {DAILY_LOSS_LIMIT_PCT}% hit", t - t % 86_400_000_000 + 86_400_000_000)
+        self.store.set_halt(True, f"daily loss limit {daily_pct}% hit", t - t % 86_400_000_000 + 86_400_000_000)
         self._event("CRITICAL", "daily_loss_halt", detail={"equity_inr": eq, "day_start_inr": day_start_equity_inr})
         return True
 
@@ -2093,6 +2163,9 @@ class ExecutionEngine:
         lev: dict[str, Any] = {}
         blocked: dict[str, str] = {}
         for s, prod in self.products.items():
+            target_leverage = profile_config(self.profiles[s]).leverage if s in self.profiles else LEVERAGE
+            if float(target_leverage).is_integer():
+                target_leverage = int(target_leverage)
             size = (exchange_sizes or {}).get(s)
             try:
                 if size is None:
@@ -2100,11 +2173,11 @@ class ExecutionEngine:
                 if size:
                     have = (self.client.get_order_leverage(prod.product_id) or {}).get("leverage")
                     lev[s] = {"leverage": have, "changed": False, "open_size": size}
-                    if have in (None, "") or float(have) != float(LEVERAGE):
-                        blocked[s] = (f"open exchange position ({size}) at {have}x, policy {LEVERAGE}x: left unchanged; "
+                    if have in (None, "") or float(have) != float(target_leverage):
+                        blocked[s] = (f"open exchange position ({size}) at {have}x, policy {target_leverage:g}x: left unchanged; "
                                       "bot entries blocked until it is flat")
                 else:
-                    lev[s] = self.client.set_order_leverage(prod.product_id, LEVERAGE)  # raises unless Delta echoes 10x
+                    lev[s] = self.client.set_order_leverage(prod.product_id, target_leverage)  # raises unless Delta echoes 10x
             except ExchangeError as exc:
                 blocked[s] = f"leverage policy failed: {exc}"
         self.account_policy = {"user_id": uid, "margin_mode": mm, "leverage": lev, "blocked": blocked,

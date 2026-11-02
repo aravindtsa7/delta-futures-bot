@@ -34,13 +34,15 @@ SYMBOLS = ["BTCUSD", "ETHUSD", "BNBUSD"]
 
 # Cache _closed_4h_regime per (id(bars), ema_custom) for ultra-fast 1m/5m grid evaluation
 _orig_closed_4h = st._closed_4h_regime
-_reg4_cache: dict[tuple[int, int], pd.DataFrame] = {}
+_reg4_cache: dict[tuple[int, int, int], pd.DataFrame] = {}
+_reg4_sources: dict[tuple[int, int, int], tuple] = {}
 
 
-def _cached_closed_4h(bars: pd.DataFrame, ema_custom: int = 100) -> pd.DataFrame:
-    key = (id(bars), int(ema_custom))
+def _cached_closed_4h(bars: pd.DataFrame, ema_custom: int = 100, bars_4h: pd.DataFrame | None = None) -> pd.DataFrame:
+    key = (id(bars), int(ema_custom), id(bars_4h))
     if key not in _reg4_cache:
-        _reg4_cache[key] = _orig_closed_4h(bars, ema_custom)
+        _reg4_sources[key] = (bars, bars_4h)
+        _reg4_cache[key] = _orig_closed_4h(bars, ema_custom, bars_4h=bars_4h)
     return _reg4_cache[key]
 
 
@@ -145,6 +147,7 @@ def main() -> None:
         warmup_start = max(df_full.index[0], start_180 - pd.Timedelta(days=45))
         df_1m = df_full[df_full.index >= warmup_start].copy()
         df_1m.attrs["symbol"] = sym
+        bars_4h = dm.resample_candles(df_1m, "4h")
         spec = bt.ProductSpec.from_metadata(sym)
         wf_edges = [start_180 + (end - start_180) * i / 3 for i in range(4)]
 
@@ -156,7 +159,7 @@ def main() -> None:
 
             for rule_type, label, params in cands:
                 p_use = dict(params)
-                out = st.evaluate_custom_strategy(rule_type, p_use, bars)
+                out = st.evaluate_custom_strategy(rule_type, p_use, bars, bars_4h=bars_4h)
                 sig = out["signal"]
                 in_win_sigs = int((sig[(bars.index >= start_180) & (bars.index < end)] != 0).sum())
                 if in_win_sigs < 6 or in_win_sigs > 600:

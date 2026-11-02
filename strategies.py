@@ -233,8 +233,8 @@ def trend_filter_4h(bars_htf: pd.DataFrame, bars_4h: pd.DataFrame, htf_minutes: 
     return merged.drop(columns=["time"], errors="ignore")
 
 
-def _closed_4h_regime(bars: pd.DataFrame, ema_custom: int = 100) -> pd.DataFrame:
-    """Causal closed-4h regime computed directly from ``bars`` (zero lookahead)."""
+def _closed_4h_regime(bars: pd.DataFrame, ema_custom: int = 100, bars_4h: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Causal regime from genuine closed 4h candles; aggregate only aligned divisors."""
     tf_map = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "45m": 45, "1h": 60, "2h": 120, "4h": 240}
     tf_attr = str(bars.attrs.get("timeframe", ""))
     if tf_attr in tf_map:
@@ -244,20 +244,17 @@ def _closed_4h_regime(bars: pd.DataFrame, ema_custom: int = 100) -> pd.DataFrame
         htf_min = max(1, int(round(float(diffs.median()))))
     else:
         htf_min = 60
-    if htf_min >= 240:
+    if bars_4h is not None:
+        b4 = bars_4h
+    elif 240 % htf_min:
+        raise ValueError("true closed 4h candles from the 1m source are required for this timeframe")
+    elif htf_min == 240:
         b4 = bars
-        last_close = b4.index + pd.Timedelta(minutes=htf_min)
     else:
-        b4 = pd.DataFrame({
-            "open": bars["open"].resample("4h", label="left", closed="left", origin="epoch").first(),
-            "high": bars["high"].resample("4h", label="left", closed="left", origin="epoch").max(),
-            "low": bars["low"].resample("4h", label="left", closed="left", origin="epoch").min(),
-            "close": bars["close"].resample("4h", label="left", closed="left", origin="epoch").last(),
-            "volume": bars["volume"].resample("4h", label="left", closed="left", origin="epoch").sum(),
-        }).dropna(subset=["close"])
-        t_open_s = pd.Series(bars.index, index=bars.index)
-        last_open = t_open_s.resample("4h", label="left", closed="left", origin="epoch").max().reindex(b4.index)
-        last_close = (last_open + pd.Timedelta(minutes=htf_min)).clip(lower=b4.index + pd.Timedelta(hours=4))
+        r = bars.resample("4h", label="left", closed="left", origin="epoch")
+        b4 = r.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        b4 = b4[r["close"].count() == 240 // htf_min]
+    last_close = b4.index + pd.Timedelta(hours=4)
     c4 = b4["close"]
     f = pd.DataFrame({
         "close_4h": c4,
@@ -537,17 +534,17 @@ CUSTOM_RULE_TYPES = (
 )
 
 
-def generate_signals(strategy: str, bars: pd.DataFrame, custom_def: dict | None = None) -> pd.DataFrame:
+def generate_signals(strategy: str, bars: pd.DataFrame, custom_def: dict | None = None, *, bars_4h: pd.DataFrame | None = None) -> pd.DataFrame:
     if custom_def is not None and "rule_type" in custom_def:
-        return evaluate_custom_strategy(custom_def["rule_type"], custom_def.get("params") or {}, bars)
+        return evaluate_custom_strategy(custom_def["rule_type"], custom_def.get("params") or {}, bars, bars_4h=bars_4h)
     if strategy in STRATEGIES:
         return STRATEGIES[strategy].generate(bars)
     if strategy in CUSTOM_RULE_TYPES:
-        return evaluate_custom_strategy(strategy, {}, bars)
+        return evaluate_custom_strategy(strategy, {}, bars, bars_4h=bars_4h)
     raise KeyError(f"unknown strategy {strategy!r}; available: {list(STRATEGIES)} + {list(CUSTOM_RULE_TYPES)}")
 
 
-def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -> pd.DataFrame:
+def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame, *, bars_4h: pd.DataFrame | None = None) -> pd.DataFrame:
     """Evaluate user-defined custom strategy rules with tunable indicator parameters (past-only, edge-triggered)."""
     c, v = bars["close"], bars["volume"]
     p = params or {}
@@ -588,7 +585,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         cost_ok = (raw_atr_ratio >= cost_mult * rt_cost).fillna(False) if cost_mult > 0 else pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -626,7 +623,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         out["vol_sma20"] = sma(v, 20)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -670,7 +667,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         cost_ok = (raw_atr_ratio >= cost_mult * float(p.get("rt_cost", 0.00138))).fillna(False) if cost_mult > 0 else pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -719,7 +716,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         cost_ok = (raw_atr_ratio >= cost_mult * float(p.get("rt_cost", 0.00138))).fillna(False) if cost_mult > 0 else pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -752,7 +749,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         out["rsi14"] = rsi(c, rsi_n)
         out["adx14"] = adx(bars, 14)["adx"]
         out["vol_sma20"] = sma(v, 20)
-        reg4 = _closed_4h_regime(bars, ema_custom=ema_4h_n)
+        reg4 = _closed_4h_regime(bars, ema_custom=ema_4h_n, bars_4h=bars_4h)
 
         d = out["st_direction"]
         e_pb = out["ema21"]
@@ -798,7 +795,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         body_ok = ((c - bars["open"]).abs() >= body_ratio * rng).fillna(False) if body_ratio > 0 else pd.Series(True, index=bars.index)
         common = (out["adx14"] >= adx_min) & (v > vol_m * out["vol_sma20"]) & comp_ok & body_ok & cost_ok
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -890,7 +887,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         cost_ok = (raw_atr_ratio >= cost_mult * float(p.get("rt_cost", 0.00158))).fillna(False) if cost_mult > 0 else pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1045,7 +1042,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
             mac_s = pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1095,7 +1092,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
             ema_s = pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_100"], reg4["allow_short_100"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1150,7 +1147,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         cost_ok = (raw_atr_ratio >= cost_mult * rt_cost).fillna(False) if cost_mult > 0 else pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1193,7 +1190,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
             mac_s = pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1247,7 +1244,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
             ema_s = pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_100"], reg4["allow_short_100"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1318,7 +1315,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         cost_ok = (raw_atr_ratio >= cost_mult * rt_cost).fillna(False) if cost_mult > 0 else pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1359,7 +1356,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         out["vol_sma20"] = sma(v, 20)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1407,7 +1404,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
             brk_s = (out["obv"] < out["obv_ema"]) & (out["obv"].shift(1) >= out["obv_ema"].shift(1))
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1456,7 +1453,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
             ema_s = pd.Series(True, index=bars.index)
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_100"], reg4["allow_short_100"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1512,7 +1509,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
             brk_s = (c.shift(1) >= out["vwap"].shift(1)) | (c.shift(1) >= out["ema21"].shift(1))
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)
@@ -1549,7 +1546,7 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame) -
         out["adx14"] = adx(bars, 14)["adx"]
 
         if use_4h:
-            reg4 = _closed_4h_regime(bars)
+            reg4 = _closed_4h_regime(bars, bars_4h=bars_4h)
             t4_l, t4_s = reg4["allow_long_200"], reg4["allow_short_200"]
         else:
             t4_l = pd.Series(True, index=bars.index)

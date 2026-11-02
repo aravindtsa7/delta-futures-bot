@@ -56,6 +56,7 @@ import pandas as pd
 
 import data_manager as dm
 import strategies
+from trade_rules import advance_stop
 from config import settings
 
 FeeMode = Literal["taker", "taker_maker_tp", "maker", "maker_maker"]
@@ -104,6 +105,9 @@ class BacktestConfig:
     take_profit_pct: float = settings.TAKE_PROFIT_PCT
     sl_atr_mult: float = 1.5
     tp_atr_mult: float = 3.5
+    # None preserves legacy coupled ATR reward:risk. Explicit modes are independent.
+    tp_mode: Literal["pct", "atr", "rr"] | None = None
+    tp_rr_ratio: float = 2.0
     atr_sl_min_pct: float = 0.8
     atr_sl_max_pct: float = 4.0
     trailing_sl_pct: float = 0.0
@@ -118,6 +122,8 @@ class BacktestConfig:
     trigger_source: TriggerSource = "trade"
     usd_inr_rate: float = settings.FIXED_USD_INR_RATE
     gst_rate: float = settings.GST_ON_FEES
+    maker_fee: float = settings.MAKER_FEE
+    taker_fee: float = settings.TAKER_FEE
     margin_buffer: float = 0.95
     min_lot_max_loss_pct: float = 5.0
     allow_min_one_lot: bool = True
@@ -125,6 +131,21 @@ class BacktestConfig:
     mark_fill_mode: MarkFillMode = "trigger"
 
     def __post_init__(self) -> None:
+        for name in ("initial_capital_inr", "leverage", "risk_per_trade_pct", "stop_loss_pct",
+                     "take_profit_pct", "sl_atr_mult", "tp_atr_mult", "tp_rr_ratio", "atr_sl_min_pct",
+                     "atr_sl_max_pct", "slippage_bps", "usd_inr_rate", "gst_rate", "max_daily_loss_pct"):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
+        if self.tp_mode not in (None, "pct", "atr", "rr"):
+            raise ValueError("invalid tp_mode")
+        if self.tp_rr_ratio <= 0 or self.tp_atr_mult <= 0:
+            raise ValueError("TP multipliers must be positive")
+        if self.initial_capital_inr <= 0 or self.usd_inr_rate <= 0:
+            raise ValueError("capital and FX rate must be positive")
+        if any(not math.isfinite(v) or v < 0 for v in (self.maker_fee, self.taker_fee, self.gst_rate)):
+            raise ValueError("fees and GST must be finite and non-negative")
+        if not 0 <= self.max_daily_loss_pct <= 100:
+            raise ValueError("daily loss limit must be in [0, 100]")
         if not 0 <= self.slippage_bps <= 100:
             raise ValueError("slippage_bps must be in [0, 100]")
         if self.mark_fill_mode not in ("trigger", "traded"):
@@ -151,12 +172,12 @@ class BacktestConfig:
     # -- fees ---------------------------------------------------------------- #
     @property
     def entry_fee_rate(self) -> float:
-        return settings.MAKER_FEE if self.fee_mode in ("maker", "maker_maker") else settings.TAKER_FEE
+        return self.maker_fee if self.fee_mode in ("maker", "maker_maker") else self.taker_fee
 
     def exit_fee_rate(self, reason: str) -> float:
         if reason == "TP" and self.fee_mode in ("taker_maker_tp", "maker", "maker_maker"):
-            return settings.MAKER_FEE
-        return settings.TAKER_FEE
+            return self.maker_fee
+        return self.taker_fee
 
     def with_gst(self, rate: float) -> float:
         return rate * (1.0 + self.gst_rate)
@@ -179,14 +200,28 @@ class BacktestConfig:
 
     def stop_pcts(self, entry: float, atr_value: float) -> tuple[float, float] | None:
         """(sl_pct, tp_pct) distances in percent; None if the ATR is not available yet."""
-        if self.sl_mode == "pct":
-            return self.stop_loss_pct, self.take_profit_pct
-        if not (atr_value > 0):
+        if (self.sl_mode == "atr" or self.tp_mode == "atr") and not (math.isfinite(atr_value) and atr_value > 0):
             return None
-        raw = self.sl_atr_mult * atr_value / entry * 100.0
-        sl_pct = min(max(raw, self.atr_sl_min_pct), self.atr_sl_max_pct)
-        # Keep the configured reward:risk when the SL distance is clamped.
-        return sl_pct, sl_pct * self.tp_atr_mult / self.sl_atr_mult
+        if self.sl_mode == "pct":
+            sl_pct = self.stop_loss_pct
+        else:
+            raw = self.sl_atr_mult * atr_value / entry * 100.0
+            sl_pct = min(max(raw, self.atr_sl_min_pct), self.atr_sl_max_pct)
+        if self.tp_mode == "pct":
+            tp_pct = self.take_profit_pct
+        elif self.tp_mode == "atr":
+            tp_pct = self.tp_atr_mult * atr_value / entry * 100.0
+        elif self.tp_mode == "rr":
+            tp_pct = sl_pct * self.tp_rr_ratio
+        else:
+            tp_pct = self.take_profit_pct if self.sl_mode == "pct" else sl_pct * self.tp_atr_mult / self.sl_atr_mult
+        return sl_pct, tp_pct
+
+    def entry_price(self, raw: float, direction: int) -> float:
+        return raw if self.fee_mode == "maker_maker" else self.exec_price(raw, direction)
+
+    def exit_price(self, raw: float, direction: int, reason: str) -> float:
+        return raw if self.fee_mode == "maker_maker" and reason == "TP" else self.exec_price(raw, -direction)
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,7 +368,7 @@ class Backtester:
         cfg = self.config
         available = equity_usd if available_usd is None else available_usd
         cv = product.contract_value
-        fe, fx = cfg.with_gst(cfg.entry_fee_rate), cfg.with_gst(settings.TAKER_FEE)
+        fe, fx = cfg.with_gst(cfg.entry_fee_rate), cfg.with_gst(cfg.taker_fee)
         loss_per_contract = self.loss_per_contract(entry, sl, product)
         risk_usd = equity_usd * cfg.risk_per_trade_pct / 100.0
         risk_contracts = math.floor(risk_usd / loss_per_contract) if loss_per_contract > 0 else 0
@@ -353,7 +388,7 @@ class Backtester:
         """USD lost per contract if the stop fills at ``sl``: price move + fees (incl. GST) + slippage."""
         cfg = self.config
         cv = product.contract_value
-        fe, fx = cfg.with_gst(cfg.entry_fee_rate), cfg.with_gst(settings.TAKER_FEE)
+        fe, fx = cfg.with_gst(cfg.entry_fee_rate), cfg.with_gst(cfg.taker_fee)
         s = cfg.slip
         return cv * abs(entry - sl) + cv * entry * fe + cv * sl * fx + cv * (entry + sl) * s
 
@@ -365,7 +400,7 @@ class Backtester:
     def breakeven_price(self, entry: float, direction: int, product: ProductSpec) -> float:
         """Stop price at which entry fee + taker exit fee (incl. GST) are exactly covered."""
         cfg = self.config
-        fe, fx = cfg.with_gst(cfg.entry_fee_rate), cfg.with_gst(settings.TAKER_FEE)
+        fe, fx = cfg.with_gst(cfg.entry_fee_rate), cfg.with_gst(cfg.taker_fee)
         if direction == 1:
             return product.ceil_price(entry * (1 + fe) / (1 - fx))
         return product.floor_price(entry * (1 - fe) / (1 + fx))
@@ -390,15 +425,33 @@ class Backtester:
         """Simulate legs sharing one wallet over the common 1m index, optionally within [start, end)."""
         cfg = self.config
         rate = cfg.usd_inr_rate
-        index = legs[0].df_1m.index
-        for leg in legs[1:]:
-            index = index.intersection(leg.df_1m.index)
+        if not legs:
+            raise ValueError("at least one leg is required")
+        if any(leg.df_1m.empty for leg in legs):
+            raise ValueError("empty leg data")
+        # Trim unequal range edges, but never intersect away another leg's exit candle.
+        lo = max(leg.df_1m.index[0] for leg in legs)
+        hi = min(leg.df_1m.index[-1] for leg in legs)
+        index = pd.date_range(lo, hi, freq="min")
         if start is not None:
             index = index[index >= start]
         if end is not None:
             index = index[index < end]
         if len(index) == 0:
             raise ValueError("empty simulation window")
+        for leg in legs:
+            source = leg.df_1m
+            if not source.index.is_unique or not source.index.is_monotonic_increasing:
+                raise ValueError(f"{leg.product.symbol}: duplicate or unordered minute data")
+            missing = index.difference(source.index)
+            if len(missing):
+                raise ValueError(f"{leg.product.symbol}: missing {len(missing)} simulation minutes; first {missing[0]}")
+            cols = ["open", "high", "low", "close"]
+            if (leg.config or cfg).trigger_source == "mark":
+                cols += ["mark_open", "mark_high", "mark_low", "mark_close"]
+            values = source.reindex(index)[cols].to_numpy(float)
+            if not np.isfinite(values).all() or (values <= 0).any():
+                raise ValueError(f"{leg.product.symbol}: invalid/missing trigger prices")
         t = index.as_unit("s").asi8
 
         states: list[_LegState] = []
@@ -491,7 +544,7 @@ class _Sim:
     def _open(self, s: _LegState, i: int, direction: int, sig_t: int) -> None:
         bt, cfg, product = s.bt, s.cfg, s.leg.product
         raw_px = s.o[i]
-        px = raw_px if cfg.fee_mode == "maker_maker" else cfg.exec_price(raw_px, direction)  # entry buys for longs, sells for shorts
+        px = cfg.entry_price(raw_px, direction)  # entry buys for longs, sells for shorts
         atr_v = s.atr_map.get(sig_t, float("nan"))
         pcts = cfg.stop_pcts(px, atr_v)
         if pcts is None or (cfg.trailing_atr_mult > 0 and not atr_v > 0):
@@ -524,7 +577,7 @@ class _Sim:
     def _close(self, s: _LegState, i: int, raw_price: float, reason: str, ambiguous: bool = False) -> None:
         cfg, rate, p = s.cfg, self.rate, s.pos
         qty = p.contracts * s.cv
-        price = raw_price if (reason == "TP" and cfg.fee_mode == "maker_maker") else cfg.exec_price(raw_price, -p.direction)  # exit sells longs, buys back shorts
+        price = cfg.exit_price(raw_price, p.direction, reason)  # exit sells longs, buys back shorts
         slippage = qty * (abs(p.entry_price - p.raw_entry_price) + abs(raw_price - price))
         exit_rate = cfg.exit_fee_rate(reason)
         gross = p.direction * qty * (price - p.entry_price)
@@ -587,9 +640,9 @@ class _Sim:
         p, ti = s.pos, int(self.t[i])
         j = i - 1
         fr, mk = (s.funding_rate[j], s.mark_close[j]) if j >= 0 else (np.nan, np.nan)
-        if j < 0 or self.t[j] != ti - 60 or np.isnan(fr) or np.isnan(mk):
+        if j < 0 or self.t[j] != ti - 60 or not np.isfinite(fr) or not np.isfinite(mk) or mk <= 0:
             self.counters["funding_missing_rate"] += 1
-            return
+            raise ValueError(f"{s.leg.product.symbol}: missing funding/mark input at {pd.Timestamp(ti, unit='s', tz='UTC')}")
         notional = p.contracts * s.cv * mk
         cash = -p.direction * notional * fr
         p.margin += cash
@@ -642,24 +695,9 @@ class _Sim:
                 self._close(s, i, p.tp, "TP")
             return
 
-        # Stop adjustments from this (already evaluated) candle apply from the next candle on.
-        product = s.leg.product
-        if cfg.breakeven_at_1r and not p.be_armed:
-            r = abs(p.entry_price - p.initial_sl)
-            reached = s.th[i] >= p.entry_price + r if d == 1 else s.tl[i] <= p.entry_price - r
-            if reached:
-                p.be_armed = True
-                p.sl = max(p.sl, p.be_price) if d == 1 else min(p.sl, p.be_price)
-        if cfg.trailing_sl_pct > 0 or p.trail_dist > 0:
-            p.extreme = max(p.extreme, s.th[i]) if d == 1 else min(p.extreme, s.tl[i])
-            candidates = []
-            if cfg.trailing_sl_pct > 0:
-                candidates.append(p.extreme * (1 - d * cfg.trailing_sl_pct / 100.0))
-            if p.trail_dist > 0:
-                candidates.append(p.extreme - d * p.trail_dist)
-            for level in candidates:
-                level = product.round_price(level)
-                p.sl = max(p.sl, level) if d == 1 else min(p.sl, level)
+        p.sl, p.extreme, p.be_armed = advance_stop(
+            cfg, s.leg.product, d, p.entry_price, p.initial_sl, p.sl, p.be_price,
+            p.be_armed, p.extreme, s.th[i], s.tl[i], p.trail_dist)
 
     # -- main loop ----------------------------------------------------------- #
     def loop(self, entry_idx: np.ndarray) -> None:
@@ -814,8 +852,8 @@ def audit_result(r: BacktestResult, tol: float = 1e-9) -> list[str]:
         traded_fill = cfg.trigger_source == "mark" and cfg.mark_fill_mode == "traded"
         slip = qty * (abs(tr.entry_price - tr.raw_entry_price) + abs(tr.raw_exit_price - tr.exit_price))
         checks = {
-            "entry_slippage": close(tr.entry_price, cfg.exec_price(tr.raw_entry_price, d)),
-            "exit_slippage": close(tr.exit_price, cfg.exec_price(tr.raw_exit_price, -d)),
+            "entry_slippage": close(tr.entry_price, cfg.entry_price(tr.raw_entry_price, d)),
+            "exit_slippage": close(tr.exit_price, cfg.exit_price(tr.raw_exit_price, d, tr.exit_reason)),
             "slippage_usd": close(slip, tr.slippage_usd),
             "risk_usd": close(tr.risk_usd, tr.contracts * bt.loss_per_contract(tr.entry_price, tr.initial_sl, p)),
             "risk_budget": cfg.allow_min_one_lot or tr.risk_usd <= tr.equity_at_entry_usd * cfg.risk_per_trade_pct / 100 * (1 + 1e-12),
@@ -866,7 +904,7 @@ def make_leg(symbol: str, strategy: str, timeframe: str, df_1m: pd.DataFrame | N
     if df_1m is None:
         df_1m = dm.load_unified_1m_dataset(symbol, days=days)
     bars = dm.resample_candles(df_1m, timeframe)
-    out = strategies.generate_signals(strategy, bars)
+    out = strategies.generate_signals(strategy, bars, bars_4h=dm.resample_candles(df_1m, "4h"))
     exits = out["exit_signal"] if "exit_signal" in out.columns else None
     return Leg(ProductSpec.from_metadata(symbol), df_1m, out["signal"], timeframe,
                strategies.atr(bars, 14), strategy, exits, config)

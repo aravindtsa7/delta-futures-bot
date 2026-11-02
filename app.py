@@ -34,6 +34,9 @@ from pydantic import BaseModel, Field, field_validator
 import data_manager as dm
 import step3c_walkforward as s3c
 import strategies
+import run_store
+from dataclasses import asdict
+from trade_rules import stop_config
 from backtester import Backtester, BacktestConfig, BacktestResult, Leg, ProductSpec, audit_result
 from config import PROJECT_ROOT, settings
 
@@ -181,7 +184,7 @@ def get_frame(symbol: str, strategy: str, tf: str,
             return _frame_cache[key]
     df = get_history(symbol, history_start)
     bars = dm.resample_candles(df, tf)
-    out = strategies.generate_signals(strategy, bars, custom_def=custom_def)
+    out = strategies.generate_signals(strategy, bars, custom_def=custom_def, bars_4h=dm.resample_candles(df, "4h"))
     item = (bars, out, strategies.atr(bars, 14))
     with _cache_lock:
         _frame_cache[key] = item
@@ -1103,7 +1106,7 @@ def _load_saved_backtests() -> list[dict[str, Any]]:
 def _save_saved_backtests(items: list[dict[str, Any]]) -> None:
     with _file_lock:
         SAVED_BACKTESTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SAVED_BACKTESTS_FILE.write_text(json.dumps(clean(items), indent=2), encoding="utf-8")
+        dm._atomic_write_bytes(SAVED_BACKTESTS_FILE, json.dumps(clean(items), indent=2).encode("utf-8"))
 
 
 class StrategyCreateRequest(BaseModel):
@@ -1252,6 +1255,8 @@ class BacktestRequest(BaseModel):
     start: datetime | None = None
     end: datetime | None = None
     history_start: datetime | None = None  # indicator warm-up start; None = all local history
+    frozen_params: bool = False
+    expected_data_hashes: dict[str, str] | None = None
     capital_inr: float | None = Field(None, gt=0)
     initial_capital_inr: float = Field(settings.INITIAL_CAPITAL_INR, gt=0)
     leverage: float = Field(10, ge=1, le=200)
@@ -1349,7 +1354,11 @@ def resolve_legs(req: BacktestRequest) -> list[dict[str, Any]]:
             raise HTTPException(422, f"{sym} is not in the symbol list; add it with + Add Coin first")
         seen.add(sym)
         leg = {**base, **{k: v for k, v in spec.model_dump().items() if v is not None}, "symbol": sym}
-        sid, sname, cdef = _resolve_strategy_def(leg["strategy"], req.strategy_id, req.rule_type, req.params)
+        if req.frozen_params and req.rule_type in strategies.CUSTOM_RULE_TYPES:
+            sid, sname = req.strategy_id or leg["strategy"], req.strategy_name or leg["strategy"]
+            cdef = {"rule_type": req.rule_type, "params": dict(req.params or {})}
+        else:
+            sid, sname, cdef = _resolve_strategy_def(leg["strategy"], req.strategy_id, req.rule_type, req.params)
         leg["strategy_id"] = sid
         leg["strategy_name"] = req.strategy_name or sname
         leg["custom_def"] = cdef
@@ -1369,24 +1378,7 @@ def leg_config(req: BacktestRequest, leg: dict[str, Any], median_atr_pct: float 
     tp_type = leg.get("tp_type") or ("fixed_pct" if sl_type == "fixed_pct" else "atr_mult")
     sl_val = float(leg["sl_value"])
     tp_val = float(leg["tp_value"])
-    atr_pct = max(0.05, float(median_atr_pct or 1.0))
-
-    if sl_type in ("fixed_pct", "pct"):
-        if tp_type == "rr_ratio":
-            tp_pct = sl_val * tp_val
-        elif tp_type in ("atr_mult", "atr"):
-            tp_pct = tp_val * atr_pct
-        else:
-            tp_pct = tp_val
-        stops = dict(sl_mode="pct", stop_loss_pct=sl_val, take_profit_pct=max(0.05, tp_pct))
-    else:
-        if tp_type == "rr_ratio":
-            tp_atr = sl_val * tp_val
-        elif tp_type in ("fixed_pct", "pct"):
-            tp_atr = tp_val / atr_pct
-        else:
-            tp_atr = tp_val
-        stops = dict(sl_mode="atr", sl_atr_mult=sl_val, tp_atr_mult=max(0.1, tp_atr))
+    stops = stop_config(sl_type, sl_val, tp_type, tp_val)
 
     em = leg["exit_mode"]
     cparams = (leg.get("custom_def") or {}).get("params") or {}
@@ -1395,7 +1387,7 @@ def leg_config(req: BacktestRequest, leg: dict[str, Any], median_atr_pct: float 
     sl_max = float(cparams.get("atr_sl_max_pct", 4.0))
     try:
         cfg = BacktestConfig(
-            initial_capital_inr=cap, leverage=min(float(req.leverage), 100.0), risk_per_trade_pct=risk,
+            initial_capital_inr=cap, leverage=float(req.leverage), risk_per_trade_pct=risk,
             max_daily_loss_pct=req.max_daily_loss_pct, fee_mode=req.fee_mode, trigger_source=req.trigger_source,
             cooldown_bars=req.cooldown_bars, breakeven_at_1r=be_flag,
             trailing_atr_mult=trail_m if "trail" in em else 0.0,
@@ -1403,8 +1395,6 @@ def leg_config(req: BacktestRequest, leg: dict[str, Any], median_atr_pct: float 
             allow_min_one_lot=not req.strict_lot_cap, mark_fill_mode=req.mark_fill_mode,
             atr_sl_min_pct=sl_min, atr_sl_max_pct=sl_max, **stops,
         )
-        if req.leverage > 100.0:
-            object.__setattr__(cfg, "leverage", float(req.leverage))
         return cfg
     except ValueError as exc:
         raise HTTPException(422, f"{leg['symbol']}: {exc}") from exc
@@ -1528,12 +1518,15 @@ def run_backtest(req: BacktestRequest) -> JSONResponse:
     if start >= end:
         raise HTTPException(422, "empty window: start must be before end")
 
+    fingerprints = {sym: run_store.fingerprint(df[df.index < end]) for sym, df in data.items()}
+    if req.expected_data_hashes is not None:
+        if {s: f["sha256"] for s, f in fingerprints.items()} != req.expected_data_hashes:
+            raise HTTPException(422, "saved run source data changed; run a new backtest instead of an exact replay")
     legs, frames, filter_stats, configs = [], {}, {}, {}
     for spec in legs_spec:
         sym = spec["symbol"]
         bars, out, atr14 = get_frame(sym, spec["strategy"], spec["timeframe"], history_start, spec.get("custom_def"))
-        med_atr_pct = float((atr14 / bars["close"] * 100.0).dropna().median() or 1.0)
-        configs[sym] = leg_config(req, spec, med_atr_pct)
+        configs[sym] = leg_config(req, spec)
         signal = out["signal"]
         if req.trend_filter_4h or req.cost_gate:
             masks = filter_masks(sym, spec["timeframe"], bars, history_start, req.trend_filter_4h, req.cost_gate,
@@ -1548,7 +1541,10 @@ def run_backtest(req: BacktestRequest) -> JSONResponse:
                         atr14, spec["strategy_name"], exits, configs[sym]))
 
     base_cfg = configs[legs_spec[0]["symbol"]]
-    result = Backtester(base_cfg).run_portfolio(legs, start, end)
+    try:
+        result = Backtester(base_cfg).run_portfolio(legs, start, end)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     errors = audit_result(result)
 
     windows = []
@@ -1602,10 +1598,29 @@ def run_backtest(req: BacktestRequest) -> JSONResponse:
         "trades": trades_payload(result.trades, base_cfg.usd_inr_rate),
         "elapsed_ms": round((time.perf_counter() - t0) * 1000),
     }
+    # Completed result is the authority for later save/deploy, not the editable form.
+    request = req.model_dump(mode="json")
+    request.update(start=start.isoformat(), end=end.isoformat(), days=None,
+                   history_start=min(df.index[0] for df in data.values()).isoformat(),
+                   frozen_params=True, rule_type=cdef0.get("rule_type"), params=cdef0.get("params") or {},
+                   expected_data_hashes={sym: fp["sha256"] for sym, fp in fingerprints.items()})
+    evidence = clean({
+        "schema_version": 2, "result": {k: v for k, v in payload.items() if k != "charts"},
+        "request": request, "effective_legs": legs_spec,
+        "leg_configs": {sym: asdict(cfg) for sym, cfg in configs.items()},
+        "history_starts": {sym: df.index[0].isoformat() for sym, df in data.items()},
+        "products": {sym: asdict(prod) for sym, prod in result.products.items()},
+        "data_fingerprints": fingerprints,
+        "code_fingerprints": run_store.code_fingerprint(),
+        "funding": result.funding.to_dict(orient="records"),
+        "equity_full": [{"time": t.isoformat(), "equity_inr": float(v)} for t, v in result.equity.items()],
+    })
+    payload["run_id"] = run_store.put(evidence)
     return JSONResponse(clean(payload))
 
 
 class SaveResultRequest(BaseModel):
+    run_id: str | None = None
     id: str | None = None
     custom_name: str | None = None
     notes: str | None = None
@@ -1645,6 +1660,23 @@ class SaveResultRequest(BaseModel):
 
 @app.post("/api/backtest/save_result")
 def save_backtest_result(req: SaveResultRequest) -> JSONResponse:
+    evidence = None
+    if req.run_id:
+        try:
+            evidence = run_store.get(req.run_id)
+        except (ValueError, OSError, EOFError) as exc:
+            raise HTTPException(422, f"backtest run unavailable: {exc}") from exc
+        r = evidence["result"]
+        if not r["audit"]["passed"]:
+            raise HTTPException(422, "cannot save a failed-audit run; fix and rerun")
+        if len(r["legs"]) != 1:
+            raise HTTPException(422, "save/deploy currently requires a single-symbol run")
+        leg = r["legs"][0]
+        req = SaveResultRequest(run_id=req.run_id, id=req.id, custom_name=req.custom_name,
+                                notes=req.notes, symbol=leg["symbol"], timeframe=leg["timeframe"],
+                                config=r["config"], window=r["window"], filters=r["filters"],
+                                use_4h_trend=r["filters"]["trend_filter_4h"],
+                                summary=r["summary"], trades=r["trades"])
     s = req.summary or {}
     c = req.config or {}
     w = req.window or {}
@@ -1695,8 +1727,17 @@ def save_backtest_result(req: SaveResultRequest) -> JSONResponse:
         "max_dd_pct": float(req.max_dd_pct if req.max_dd_pct is not None else (s.get("max_drawdown_pct") or 0.0)),
         "total_trades": int(req.total_trades if req.total_trades is not None else (s.get("total_trades") or 0)),
         "summary": s,
-        "trades": (req.trades or [])[:500],
+        "trades": req.trades or [],
     }
+    entry["verified_run"] = evidence is not None
+    if evidence is not None:
+        cfg = evidence["leg_configs"][sym]
+        entry.update(run_id=req.run_id, effective_config=cfg, request=evidence["request"],
+                     window=w, history_start=evidence["history_starts"][sym],
+                     cooldown_bars=cfg["cooldown_bars"], max_daily_loss_pct=cfg["max_daily_loss_pct"],
+                     trigger_source=cfg["trigger_source"], exit_on_opposite_signal=cfg["exit_on_opposite_signal"],
+                     audit=evidence["result"]["audit"], products=evidence["products"],
+                     data_fingerprints=evidence["data_fingerprints"], code_fingerprints=evidence["code_fingerprints"])
     items = _load_saved_backtests()
     items = [r for r in items if r.get("id") != rid]
     items.insert(0, entry)

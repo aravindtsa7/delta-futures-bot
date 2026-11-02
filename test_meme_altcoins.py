@@ -42,13 +42,15 @@ DOWNLOAD_DAYS = 60
 
 # Cache _closed_4h_regime per (id(bars), ema_custom) for fast multi-TF evaluation
 _orig_closed_4h = st._closed_4h_regime
-_reg4_cache: dict[tuple[int, int], pd.DataFrame] = {}
+_reg4_cache: dict[tuple[int, int, int], pd.DataFrame] = {}
+_reg4_sources: dict[tuple[int, int, int], tuple] = {}
 
 
-def _cached_closed_4h(bars: pd.DataFrame, ema_custom: int = 100) -> pd.DataFrame:
-    key = (id(bars), int(ema_custom))
+def _cached_closed_4h(bars: pd.DataFrame, ema_custom: int = 100, bars_4h: pd.DataFrame | None = None) -> pd.DataFrame:
+    key = (id(bars), int(ema_custom), id(bars_4h))
     if key not in _reg4_cache:
-        _reg4_cache[key] = _orig_closed_4h(bars, ema_custom)
+        _reg4_sources[key] = (bars, bars_4h)
+        _reg4_cache[key] = _orig_closed_4h(bars, ema_custom, bars_4h=bars_4h)
     return _reg4_cache[key]
 
 
@@ -255,6 +257,7 @@ def main() -> None:
         t_sym = time.perf_counter()
         df_1m = dm.load_unified_1m_dataset(sym)
         datasets[sym] = df_1m
+        bars_4h = dm.resample_candles(df_1m, "4h")
         spec = bt.ProductSpec.from_metadata(sym)
         specs[sym] = spec
         meta = dm.load_metadata(sym)
@@ -281,7 +284,7 @@ def main() -> None:
                 p_use = dict(params)
                 if tf == "5m" and rule_type in ("scalp_ema_ribbon", "meme_liq_snapback", "alt_ema_wave"):
                     p_use["cost_gate_mult"] = max(1.8, float(p_use.get("cost_gate_mult", 1.5)))
-                out = st.evaluate_custom_strategy(rule_type, p_use, bars)
+                out = st.evaluate_custom_strategy(rule_type, p_use, bars, bars_4h=bars_4h)
                 sig = out["signal"]
                 in_win_sigs = int((sig[(bars.index >= start) & (bars.index < end)] != 0).sum())
                 if in_win_sigs < 5 or in_win_sigs > 180:

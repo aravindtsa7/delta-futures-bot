@@ -221,3 +221,28 @@ The Step 4B screen asked for PF ≥ 1.20, max DD ≤ 15%, ≥ 50 trades and posi
 - **Plan:** paper-trade forward for **at least 8–12 weeks**, which is only about 40 ETH and 15 BTC trades.
 - **Compare against the backtest:** per-trade net, fill slippage (paper fills vs. the touch), exit-reason mix and drawdown.
 - **Before real capital:** run testnet for a further 2–4 weeks to prove order handling, then decide. If forward PF stays below about 1.2 after costs, the honest conclusion is "no edge". Do not re-tune on the forward data.
+
+
+## 7. Deep-review correctness repairs (base 40ba8f4)
+
+Run a new backtest and save that completed run before deploying an older saved result. Legacy results remain readable, but their client-provided metrics are not evidence for deployment. Changing the form after a run no longer changes the strategy attached to Save.
+
+Each completed API run writes a content-addressed artifact under `data/backtest_runs/`: exact request and warmup start, effective configuration, product specifications, code/data fingerprints, all trades, funding events and full minute equity. Keep this directory together with `saved_backtests.json` when backing up or moving research. The source candles are not copied into the artifact; retain the original raw dataset separately. Replay checks its source hash and refuses changed data. Code fingerprints record the version, but do not restore old code automatically.
+
+Paper deployment currently supports a single symbol per saved result, trade-price triggers and SL/TP/breakeven/trailing exits. Mark-trigger and opposite-signal exits are rejected explicitly. Multiple active profiles share one wallet and must agree on capital, FX and daily loss limit. A fresh journal adopts those settings; an existing journal is never reset automatically. An existing-wallet mismatch blocks entries until reconciled. Exchange auto-bot entries are market orders and therefore require all-taker fees; maker scenarios remain paper research assumptions.
+
+New positions persist their effective execution settings so restart or profile edits do not change an open trade's fees, stops or cooldown. Cooldown uses the deployed timeframe. Unknown exchange order outcomes remain blocked until reconciliation supplies terminal evidence; elapsed time alone does not prove rejection.
+
+Backtests now reject missing internal simulation minutes, invalid trigger prices and missing funding inputs for open positions. Mixed ATR/percentage targets use signal-time ATR. 45-minute strategies use genuine 4-hour source candles. These changes can alter historical results; the old metrics must not be carried forward as validated performance.
+
+Offline checks:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest -q test_review_repairs.py
+.venv\Scripts\python.exe step18_strategy_lab_verify.py
+.venv\Scripts\python.exe step9_repair_verify.py --skip-regression
+.venv\Scripts\python.exe step6_verify.py --skip-live --skip-regression
+```
+
+The repair suite blocks external sockets and uses temporary data paths. It checks deterministic backtest/paper parity, long/short exits and fees, restart behavior, causal strategy signals, complete saved ledgers, immutable deployment settings and source drift. Passing synthetic tests does not establish actual maker fills, profitability, real-exchange behavior or an exact replay of the old XRP report. That replay still needs the original minute candles, mark prices, funding history and matching product metadata. The live runner also retains operational guards (including loss-streak pauses), and the backtester does not model liquidation; full live/backtest equivalence is not claimed.

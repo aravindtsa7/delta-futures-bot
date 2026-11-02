@@ -596,47 +596,12 @@ async function confirmSaveBacktestResult(ev) {
   if (ev) ev.preventDefault();
   const r = state.result;
   if (!r) return;
-  const st = currentStrategyObj();
   const leg0 = r.legs[0] || {};
-  const sym = leg0.symbol || $("symbolSelect").value;
-  const tf = leg0.timeframe || $("tfSelect").value;
-  const ruleLbl = (st && (st.name || st.rule_type)) || r.config.strategy_name || leg0.strategy;
-  const customName = ($("saveResultNameInput") ? $("saveResultNameInput").value.trim() : "") || `${sym} ${tf} ${ruleLbl}`;
+  const customName = ($("saveResultNameInput") ? $("saveResultNameInput").value.trim() : "")
+    || `${leg0.symbol} ${leg0.timeframe} ${r.config.strategy_name}`;
   const notes = $("saveResultNotesInput") ? $("saveResultNotesInput").value.trim() : "";
-
-  const payload = {
-    custom_name: customName,
-    notes,
-    strategy_id: (st && st.id) || r.config.strategy_id || leg0.strategy,
-    strategy_name: customName,
-    symbol: sym,
-    timeframe: tf,
-    period_days: r.window.days,
-    rule_type: (st && st.rule_type) || r.config.rule_type || leg0.strategy,
-    params: (st && st.params) || r.config.params || {},
-    capital_inr: r.config.capital_inr || r.config.initial_capital_inr,
-    leverage: r.config.leverage,
-    risk_pct: r.config.risk_pct || r.config.risk_per_trade_pct,
-    sl_type: r.config.sl_type || $("slType").value,
-    sl_value: r.config.sl_value || Number($("slValue").value),
-    tp_type: r.config.tp_type || $("tpType").value,
-    tp_value: r.config.tp_value || Number($("tpValue").value),
-    trailing_stop: $("trailEnabled") ? $("trailEnabled").checked : (Number(r.config.trail_atr_mult) > 0),
-    trail_mult: r.config.trail_atr_mult,
-    fee_mode: r.config.fee_mode || $("feeMode").value || "taker_maker_tp",
-    slippage_bps: (r.filters && r.filters.slippage_bps !== undefined) ? r.filters.slippage_bps : Number($("slippage").value || 0),
-    use_4h_trend: !!(r.filters && r.filters.trend_filter_4h) || $("trend4h").checked,
-    use_cost_gate: !!(r.filters && r.filters.cost_gate) || $("costGate").checked,
-    strict_lot_cap: !!(r.filters && r.filters.strict_lot_cap) || $("strictLot").checked,
-    net_pnl_inr: r.summary.net_pnl_inr,
-    return_pct: r.summary.net_return_pct,
-    win_rate_pct: r.summary.win_rate_pct,
-    profit_factor: r.summary.profit_factor,
-    max_dd_pct: r.summary.max_drawdown_pct,
-    total_trades: r.summary.total_trades,
-    summary: r.summary,
-    trades: r.trades,
-  };
+  if (!r.run_id) { toast("Rerun this backtest before saving", true); return; }
+  const payload = {run_id: r.run_id, custom_name: customName, notes};
   $("saveResultBtn").disabled = true;
   if ($("saveResultConfirmBtn")) $("saveResultConfirmBtn").disabled = true;
   try {
@@ -769,7 +734,7 @@ async function restoreSavedResult(item) {
   const d = String(Math.round(item.period_days || 180));
   if ([...$("daysSelect").options].some((o) => o.value === d)) $("daysSelect").value = d;
   updateAdvSummary();
-  await runBacktest({ markSaved: true });
+  await runBacktest({ markSaved: true, requestOverride: item.request || undefined });
 }
 
 /* ------------------------------------------------------------------ status, presets */
@@ -871,7 +836,7 @@ function readRequest() {
 
 async function runBacktest(opts = {}) {
   let req;
-  try { req = readRequest(); } catch (e) { toast(e.message, true); return; }
+  try { req = opts.requestOverride || readRequest(); } catch (e) { toast(e.message, true); return; }
   if (!req.symbols.length) { toast("Select a coin", true); return; }
   $("runBtn").disabled = true;
   $("chartLoading").classList.remove("hidden");
