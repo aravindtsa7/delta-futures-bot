@@ -1,0 +1,45 @@
+{
+  "authored_local_date": "2026-11-03",
+  "timezone": "Asia/Calcutta",
+  "purpose": "Preregistered limited comparison before any candidate P&L is computed",
+  "symbols": ["BTCUSD", "ETHUSD", "DOGEUSD", "XRPUSD", "TRXUSD"],
+  "warmup_start_utc": "2026-05-07T00:00:00Z",
+  "selection_windows": [
+    {"name": "selection_A", "start": "2026-05-15T00:00:00Z", "end": "2026-06-15T00:00:00Z"},
+    {"name": "selection_B", "start": "2026-06-15T00:00:00Z", "end": "2026-08-01T00:00:00Z"}
+  ],
+  "validation_windows": [
+    {"name": "validation_August", "start": "2026-08-01T00:00:00Z", "end": "2026-09-01T00:00:00Z"},
+    {"name": "validation_September", "start": "2026-09-01T00:00:00Z", "end": "2026-10-01T00:00:00Z"}
+  ],
+  "examined_diagnostic_windows": [
+    {"name": "examined_October", "start": "2026-10-01T00:00:00Z", "end": "2026-11-01T00:00:00Z"}
+  ],
+  "continuous_validation_window": {"name": "validation_combined", "start": "2026-08-01T00:00:00Z", "end": "2026-10-01T00:00:00Z", "purpose": "One uninterrupted wallet per comparison, plus actual one-wallet five-leg portfolio; no September reset"},
+  "extended_backcast": {"symbols": ["BTCUSD", "ETHUSD", "DOGEUSD", "XRPUSD"], "warmup_start": "2025-11-08T00:00:00Z", "start": "2025-11-15T00:00:00Z", "end": "2026-05-15T00:00:00Z", "purpose": "Frozen finalist robustness only; TRX lacks these local dates; no reselection"},
+  "contamination": "October 2026 was explicitly examined in earlier range-sweep, RSI and other discovery. Earlier dates also occur in prior saved-result/research history; no genuinely untouched historical holdout is claimed. Validation is chronological and held out from this run's parameter selection only.",
+  "candidates": [
+    {"id": "trend_3m", "family": "trend pullback continuation", "rule": "ema_pullback_scalp", "timeframe": "3m", "params": {"fast_ema": 9, "slow_ema": 21, "adx_min": 18, "pullback_tol": 0.001, "rsi_period": 14, "rsi_long_min": 42, "rsi_long_max": 65, "rsi_short_min": 35, "rsi_short_max": 58, "vol_mult": 0.8, "cost_gate_mult": 0, "use_4h_trend": 0}},
+    {"id": "trend_5m", "family": "trend pullback continuation", "rule": "ema_pullback_scalp", "timeframe": "5m", "params": {"fast_ema": 9, "slow_ema": 21, "adx_min": 18, "pullback_tol": 0.001, "rsi_period": 14, "rsi_long_min": 42, "rsi_long_max": 65, "rsi_short_min": 35, "rsi_short_max": 58, "vol_mult": 0.8, "cost_gate_mult": 0, "use_4h_trend": 0}},
+    {"id": "compression_3m", "family": "volatility compression breakout", "rule": "bb_squeeze_adx", "timeframe": "3m", "params": {"bb_period": 20, "bb_std": 1.8, "adx_min": 16, "vol_mult": 1.1, "body_ratio": 0.25, "ema_filter": 50, "cost_gate_mult": 0, "use_4h_trend": 0, "squeeze_q": 0.75, "squeeze_lookback": 4, "adx_rising": 0, "bbw_expanding": 1}},
+    {"id": "compression_5m", "family": "volatility compression breakout", "rule": "bb_squeeze_adx", "timeframe": "5m", "params": {"bb_period": 20, "bb_std": 1.8, "adx_min": 16, "vol_mult": 1.1, "body_ratio": 0.25, "ema_filter": 50, "cost_gate_mult": 0, "use_4h_trend": 0, "squeeze_q": 0.75, "squeeze_lookback": 4, "adx_rising": 0, "bbw_expanding": 1}},
+    {"id": "range_3m", "family": "range-bound mean reversion", "rule": "bb_rsi_snapback", "timeframe": "3m", "regime_adx_max": 25, "params": {"bb_period": 20, "bb_std": 1.8, "rsi_period": 7, "rsi_os": 35, "rsi_ob": 65, "cost_gate_mult": 0, "use_4h_trend": 0}},
+    {"id": "range_5m", "family": "range-bound mean reversion", "rule": "bb_rsi_snapback", "timeframe": "5m", "regime_adx_max": 25, "params": {"bb_period": 20, "bb_std": 1.8, "rsi_period": 7, "rsi_os": 35, "rsi_ob": 65, "cost_gate_mult": 0, "use_4h_trend": 0}}
+  ],
+  "execution": {"initial_capital_inr": 50000, "usd_inr_rate": 85, "leverage": 10, "risk_per_trade_pct": 1, "sl_mode": "atr", "sl_atr_mult": 1.5, "tp_mode": "atr", "tp_atr_mult": 3.0, "atr_sl_min_pct": 0.15, "atr_sl_max_pct": 2.0, "fee_mode": "taker", "maker_fee": 0.0002, "taker_fee": 0.0005, "gst_rate": 0.18, "slippage_bps_tested": [2,5], "cooldown_bars": 1, "max_daily_loss_pct": 5, "allow_min_one_lot": false, "margin_buffer": 0.95, "min_lot_max_loss_pct": 5, "trigger_source": "trade", "mark_fill_mode": "trigger", "breakeven_at_1r": false, "trailing_atr_mult": 0, "trailing_sl_pct": 0, "exit_on_opposite_signal": false},
+  "selection": {
+    "frequency_target": "At least 2 completed trades per calendar day PER COIN, not pooled across coins",
+    "eligibility": "Every coin in both selection windows at 5bps: net>0, PF>=1.20, DD<=12%, completed trades/day>=2",
+    "ranking": "Lexicographic descending: all ten coin/window cases eligible; number of eligible cases; minimum net return across the ten 5bps cases; total 5bps net P&L. Candidate ID breaks exact ties ascending.",
+    "freeze": "Write frozen_selection.json and its hash before starting any validation computation. No parameter changes, coin exclusions or fallback reselection after validation. If none eligible, still test the highest-ranked candidate as a diagnostic finalist, never call it qualified."
+  },
+  "preset_gate": {
+    "independent_accounts": "Each coin in BOTH validation months at BOTH slippages: net>0, PF>=1.20, DD<=12%, trades/day>=2",
+    "shared_wallet": "One actual production portfolio, INR50000 total, fixed symbol order as listed; BOTH validation months at BOTH costs positive with PF>=1.20, DD<=12%; report per-coin frequency, require >=2/day per coin",
+    "concentration": "At 5bps validation: no single coin >50% of positive-net coin contribution; no month >75% of positive monthly contribution; net still positive after subtracting five largest winning trade P&Ls (fixed-ledger sensitivity, not a counterfactual resimulation)",
+    "holdout": "No strict untouched historical holdout available. Even a historical pass requires explicit caveat and prospective paper observation; no automatic deployment.",
+    "action": "If any gate fails: print No qualifying strategy and do NOT change Research Lab presets or deployed profiles."
+  },
+  "baseline": {"range_sweep_5m_October": {"source": "user-reported baseline, not independently reproduced because full original request absent", "signals": 834, "trades": 561, "net_pnl_inr_5x50000": -18929}, "RSI_snapback": "user reports loss; exact metrics/configuration unavailable"},
+  "robustness": "Report per-coin/per-month contributions, top-five winning-trade dependency, long/short totals, funding, costs, 2->5bps degradation, and separate INR250000 sum-of-independent-accounts from the INR50000 shared wallet. October never selects or qualifies the strategy."
+}
