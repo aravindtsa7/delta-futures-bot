@@ -506,6 +506,10 @@ STRATEGIES: dict[str, Strategy] = {
 
 
 CUSTOM_RULE_TYPES = (
+    "session_orb_breakout",
+    "ema_macd_pullback",
+    "liquidity_sweep_sfp",
+    "liquidity_sweep_mss",
     "ema_cross",
     "supertrend",
     "rsi_reversal",
@@ -549,6 +553,101 @@ def evaluate_custom_strategy(rule_type: str, params: dict, bars: pd.DataFrame, *
     c, v = bars["close"], bars["volume"]
     p = params or {}
     rt = (rule_type or "ema_cross").strip().lower()
+
+    if rt == "session_orb_breakout":
+        n = max(2, int(p.get("box_lookback", 16)))
+        start, end = int(p.get("session_start_utc", 7)), int(p.get("session_end_utc", 19))
+        if not 0 <= start < end <= 24:
+            raise ValueError("session requires 0 <= start < end <= 24 UTC")
+        if bars.index.tz is None:
+            raise ValueError("session breakout requires timezone-aware bars")
+        hour = bars.index.tz_convert("UTC").hour
+        session = (hour >= start) & (hour < end)
+        out = pd.DataFrame(index=bars.index)
+        out["orb_high"] = bars["high"].shift(1).rolling(n, min_periods=n).max()
+        out["orb_low"] = bars["low"].shift(1).rolling(n, min_periods=n).min()
+        out["ema_trend"] = ema(c, max(2, int(p.get("ema_trend", 50))))
+        out["rvol"] = rvol(bars, 20)
+        out["rsi14"] = rsi(c, max(2, int(p.get("rsi_period", 14))))
+        volume = out["rvol"] >= float(p.get("rvol_min", 1.15))
+        long = (session & (c > out["orb_high"]) & (c > bars["open"]) & (c > out["ema_trend"])
+                & volume & out["rsi14"].between(50, 74))
+        short = (session & (c < out["orb_low"]) & (c < bars["open"]) & (c < out["ema_trend"])
+                 & volume & out["rsi14"].between(26, 50))
+        # Closed-bar labels are retained; execution adds the timeframe once.
+        _finish(out, long, short)
+        return out
+
+    if rt == "ema_macd_pullback":
+        out = pd.DataFrame(index=bars.index)
+        out["ema_fast"] = ema(c, max(2, int(p.get("fast_ema", 20))))
+        out["ema_mid"] = ema(c, max(2, int(p.get("mid_ema", 50))))
+        out["ema_slow"] = ema(c, max(2, int(p.get("slow_ema", 200))))
+        out = out.join(macd(c, 12, 26, 9))
+        out["rsi14"] = rsi(c, max(2, int(p.get("rsi_period", 14))))
+        out["adx14"] = adx(bars, 14)["adx"]
+        tol = float(p.get("pullback_tol", .003))
+        if tol < 0:
+            raise ValueError("pullback_tol must be non-negative")
+        trend = out["adx14"] >= float(p.get("adx_min", 18))
+        hist = out["macd_hist"]
+        long = ((out["ema_fast"] > out["ema_mid"]) & (c > out["ema_slow"]) & trend
+                & (bars["low"].rolling(2).min() <= out["ema_fast"] * (1 + tol))
+                & (c > out["ema_fast"]) & (c > bars["open"]) & (hist > hist.shift(1))
+                & out["rsi14"].between(40, 65))
+        short = ((out["ema_fast"] < out["ema_mid"]) & (c < out["ema_slow"]) & trend
+                 & (bars["high"].rolling(2).max() >= out["ema_fast"] * (1 - tol))
+                 & (c < out["ema_fast"]) & (c < bars["open"]) & (hist < hist.shift(1))
+                 & out["rsi14"].between(35, 60))
+        _finish(out, long, short)
+        return out
+
+    if rt in ("liquidity_sweep_sfp", "liquidity_sweep_mss"):
+        # Levels exclude the current candle. Keep signals on their closed bar;
+        # the execution pipeline adds the timeframe once (never backdate them).
+        n = max(2, int(p.get("swing_lookback", 20 if rt.endswith("sfp") else 24)))
+        ssl = bars["low"].shift(1).rolling(n, min_periods=n).min()
+        bsl = bars["high"].shift(1).rolling(n, min_periods=n).max()
+        span = bars["high"] - bars["low"]
+        a = atr(bars, 14)
+        rv = rvol(bars, 20)
+        volume_ok = rv >= float(p.get("rvol_min", 1.2))
+        out = pd.DataFrame({"ssl": ssl, "bsl": bsl, "atr14": a, "rvol": rv}, index=bars.index)
+        if rt == "liquidity_sweep_sfp":
+            wick = float(p.get("wick_ratio", .38))
+            depth = float(p.get("max_pierce_atr", 1.8)) * a
+            strength = rsi(c, max(2, int(p.get("rsi_period", 14))))
+            out["rsi14"] = strength
+            long = ((bars["low"] < ssl) & ((ssl - bars["low"]) <= depth)
+                    & (c > ssl) & ((np.minimum(bars["open"], c) - bars["low"]) >= wick * span)
+                    & volume_ok & (strength <= float(p.get("rsi_max_long", 60))))
+            short = ((bars["high"] > bsl) & ((bars["high"] - bsl) <= depth)
+                     & (c < bsl) & ((bars["high"] - np.maximum(bars["open"], c)) >= wick * span)
+                     & volume_ok & (strength >= float(p.get("rsi_min_short", 40))))
+        else:
+            window = max(1, int(p.get("sweep_window", 3)))
+            body = float(p.get("body_ratio", .48)) * span
+            # Literal requested rolling-window rule includes the current bar.
+            # Both the rolling raid and displacement are known only at its close.
+            ssl, bsl = ssl.shift(1), bsl.shift(1)
+            out["ssl_prior"], out["bsl_prior"] = ssl, bsl
+            long = ((bars["low"].rolling(window).min() < ssl) & (c > bars["open"])
+                    & (c > ssl) & (c > bars["high"].shift(1))
+                    & ((c - bars["open"]) >= body) & volume_ok)
+            short = ((bars["high"].rolling(window).max() > bsl) & (c < bars["open"])
+                     & (c < bsl) & (c < bars["low"].shift(1))
+                     & ((bars["open"] - c) >= body) & volume_ok)
+        long, short = long & (span > 0), short & (span > 0)
+        if bool(int(p.get("use_cost_gate", 0))):
+            # Taker entry + maker TP, GST and adverse slippage on both fills.
+            cost = float(p.get("rt_cost", (.0005 + .0002) * 1.18 + .0004))
+            allowed = a / c >= float(p.get("cost_gate_mult", 1.0)) * cost
+            long, short = long & allowed, short & allowed
+        if bool(int(p.get("use_4h_trend", 0))):
+            regime = _closed_4h_regime(bars, bars_4h=bars_4h)
+            long, short = long & regime["allow_long_100"], short & regime["allow_short_100"]
+        _finish(out, long, short)
+        return out
 
     if rt in ("bb_squeeze_adx", "bb_squeeze_quick_tp"):
         bb_n = max(5, int(p.get("bb_period", 20)))

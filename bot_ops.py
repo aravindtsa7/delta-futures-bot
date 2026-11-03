@@ -9,6 +9,7 @@ Status is read through a read-only SQLite connection (WAL allows it while the bo
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 import math
 import os
 import sqlite3
@@ -437,9 +438,8 @@ class DeployStrategyRequest(BaseModel):
 
 def _build_deploy_entry(saved: dict[str, Any] | None, req: DeployStrategyRequest) -> dict[str, Any]:
     src = dict(saved or {})
-    if saved is not None:
-        if not saved.get("run_id") or not saved.get("verified_run"):
-            raise HTTPException(422, "legacy result has no verified run evidence; rerun and save before deployment")
+    verified = bool(saved and saved.get("run_id") and saved.get("verified_run"))
+    if verified:
         # Reload the content-addressed server result; editable library summaries are not authority.
         try:
             evidence = run_store.get(saved["run_id"])
@@ -514,6 +514,24 @@ def _build_deploy_entry(saved: dict[str, Any] | None, req: DeployStrategyRequest
                                "trigger_source", "exit_on_opposite_signal", "strict_lot_cap", "run_id") if k in src},
     }
     try:
+        if not verified:
+            # Legacy records remain deployable, without claiming their defaults
+            # reproduce a verified historical run. Keep the saved file intact.
+            aliases = ("max_daily_loss_pct", "daily_loss_limit_pct", "daily_loss_stop_pct")
+            source_config = src.get("config") or {}
+            for name in aliases:
+                if src.get(name) is not None:
+                    entry["max_daily_loss_pct"] = float(src[name])
+                    break
+            cfg = asdict(ee.profile_config(ee._profile_from_dict(sym, entry)))
+            for name in ("usd_inr_rate", "gst_rate", "maker_fee", "taker_fee", "margin_buffer"):
+                value = src.get(name, source_config.get(name))
+                if value is not None:
+                    cfg[name] = float(value)
+            if src.get("fx") is not None and src.get("usd_inr_rate") is None:
+                cfg["usd_inr_rate"] = float(src["fx"])
+            entry["effective_config"] = cfg
+            entry["run_evidence_status"] = "legacy_defaults"
         ee.validate_deployable(ee._profile_from_dict(sym, entry))
     except (TypeError, ValueError) as exc:
         raise HTTPException(422, str(exc)) from exc
@@ -527,6 +545,13 @@ def get_deployed_strategies() -> dict[str, Any]:
 
 @router.post("/deploy")
 def deploy_strategy_to_bot(req: DeployStrategyRequest) -> dict[str, Any]:
+    # Serialize the entire read/merge/normalize/write operation: concurrent
+    # single-row clicks must not overwrite another symbol's completed deploy.
+    with _op_lock:
+        return _deploy_strategy_to_bot(req)
+
+
+def _deploy_strategy_to_bot(req: DeployStrategyRequest) -> dict[str, Any]:
     saved_all: dict[str, dict[str, Any]] = {}
     for r in _load_saved_results_for_deploy():
         for k in ("id", "result_id"):
@@ -557,21 +582,45 @@ def deploy_strategy_to_bot(req: DeployStrategyRequest) -> dict[str, Any]:
         raw_profiles[entry["symbol"]] = entry
         deployed_symbols.append(entry["symbol"])
 
-    _validate_active_wallet(raw_profiles)
+    _validate_active_wallet(raw_profiles, deployed_symbols[-1])
     ee.save_bot_profiles_raw(raw_profiles)
     _cache.pop("signals", None)
     view = deployed_summary_view(_signals())
     return _clean({"ok": True, "deployed_symbols": deployed_symbols, **view})
 
 
-def _validate_active_wallet(raw_profiles: dict[str, Any]) -> None:
+def _validate_active_wallet(raw_profiles: dict[str, Any], preferred_symbol: str | None = None) -> None:
+    """Normalize enabled profiles to the latest deploy's shared wallet only.
+
+    Preserve each symbol's strategy, sizing percentage and execution settings;
+    paused profiles are normalized when enabled. Never reset a journal wallet.
+    """
     try:
-        active = [ee.profile_config(ee._profile_from_dict(sym, ov))
-                  for sym, ov in raw_profiles.items() if ov.get("enabled", True)]
+        active = {sym: ee.profile_config(ee._profile_from_dict(sym, ov))
+                  for sym, ov in raw_profiles.items() if ov.get("enabled", True)}
+        if not active:
+            return
+        anchor = preferred_symbol if preferred_symbol in active else max(
+            active, key=lambda sym: str(raw_profiles[sym].get("deployed_at") or ""))
+        latest = active[anchor]
+        wallet = dict(initial_capital_inr=latest.initial_capital_inr,
+                      usd_inr_rate=latest.usd_inr_rate, max_daily_loss_pct=latest.max_daily_loss_pct)
+        for sym, cfg in active.items():
+            profile = raw_profiles[sym]
+            effective = asdict(cfg)
+            previous = {key: effective[key] for key in wallet}
+            effective.update(wallet)
+            # Revalidate before any on-disk mutation.
+            profile.update(effective_config=effective, capital_inr=latest.initial_capital_inr,
+                           usd_inr_rate=latest.usd_inr_rate, fx=latest.usd_inr_rate,
+                           max_daily_loss_pct=latest.max_daily_loss_pct,
+                           daily_loss_limit_pct=latest.max_daily_loss_pct,
+                           daily_loss_stop_pct=latest.max_daily_loss_pct)
+            ee.profile_config(ee._profile_from_dict(sym, profile))
+            if previous != wallet:
+                profile["wallet_normalization"] = {"source_symbol": anchor, "previous": previous, "wallet": wallet}
     except (ValueError, TypeError) as exc:
         raise HTTPException(422, str(exc)) from exc
-    if len({(c.initial_capital_inr, c.max_daily_loss_pct, c.usd_inr_rate) for c in active}) > 1:
-        raise HTTPException(422, "active strategies must share the same wallet capital, FX and daily loss limit")
 
 
 class ToggleDeployedRequest(BaseModel):
@@ -588,7 +637,7 @@ def toggle_deployed_strategy(symbol: str, req: ToggleDeployedRequest | None = No
     new_state = (not cur) if (req is None or req.enabled is None) else bool(req.enabled)
     raw_profiles[sym]["enabled"] = new_state
     if new_state:
-        _validate_active_wallet(raw_profiles)
+        _validate_active_wallet(raw_profiles, sym)
     ee.save_bot_profiles_raw(raw_profiles)
     _cache.pop("signals", None)
     view = deployed_summary_view(_signals())
