@@ -315,7 +315,9 @@ def test_save_authority_full_ledger_and_deploy(monkeypatch):
     assert entry['history_start']==f.index[0].isoformat()
     with pytest.raises(HTTPException):
         bot_ops._build_deploy_entry(saved,bot_ops.DeployStrategyRequest(result_id=saved['id'],risk_pct=99))
-    with pytest.raises(HTTPException):bot_ops._build_deploy_entry({'id':'legacy','symbol':'XRPUSD'},bot_ops.DeployStrategyRequest(result_id='legacy'))
+    legacy=bot_ops._build_deploy_entry({'id':'legacy','symbol':'XRPUSD'},bot_ops.DeployStrategyRequest(result_id='legacy'))
+    assert legacy['symbol']=='XRPUSD' and legacy['run_evidence_status']=='legacy_defaults'
+    assert legacy['effective_config']['initial_capital_inr']==50000
     artifact=run_store.root()/(r['run_id']+'.json.gz');artifact.write_bytes(b'corrupt')
     with pytest.raises(HTTPException):app.save_backtest_result(app.SaveResultRequest(run_id=r['run_id']))
 

@@ -36,7 +36,7 @@
 
       <div class="field" id="singleSymbolField">
         <label for="symbolSelect">Coin</label>
-        <select id="symbolSelect"></select>
+        <select id="symbolSelect"><option value="TRXUSD">TRXUSD</option><option value="XAUTUSD">XAUTUSD (Gold)</option></select>
       </div>
       <div class="field hidden" id="portfolioSymbolsField">
         <span class="label">Symbols (one ₹ wallet)</span>
@@ -381,6 +381,8 @@
           <label for="stratSymbolInput">Assigned Coin</label>
           <select id="stratSymbolInput">
             <option value="ALL">ALL (Available on every coin)</option>
+            <option value="TRXUSD">TRXUSD only</option>
+            <option value="XAUTUSD">XAUTUSD (Gold) only</option>
             <option value="ETHUSD">ETHUSD only</option>
             <option value="BTCUSD">BTCUSD only</option>
             <option value="BNBUSD">BNBUSD only</option>
@@ -397,6 +399,10 @@
         <div class="field">
           <label for="stratRuleInput">Indicator Rule Type</label>
           <select id="stratRuleInput">
+            <option value="session_orb_breakout">Session Opening Range Breakout</option>
+            <option value="ema_macd_pullback">Triple EMA + MACD Pullback</option>
+            <option value="liquidity_sweep_sfp">🎯 Liquidity Sweep: Swing Failure / Wick Reclaim</option>
+            <option value="liquidity_sweep_mss">🎯 Liquidity Sweep: Displacement / Structure Shift</option>
             <option value="vol_obv_breakout">📊 Volume: OBV Trend &amp; EMA Cross Breakout</option>
             <option value="vol_climax_reversal">📊 Volume: Climax / Institutional Absorption Reversal</option>
             <option value="vol_vwap_expansion">📊 Volume: VWAP Value Area Breakout + 2x RVOL Burst</option>
@@ -794,6 +800,8 @@
         <input id="slSearchInput" type="text" placeholder="Search by Custom Name or notes…" style="width:220px">
         <select id="slCoinFilter" title="Filter by Coin">
           <option value="">All Coins</option>
+          <option value="TRXUSD">TRXUSD</option>
+          <option value="XAUTUSD">XAUTUSD (Gold)</option>
           <option value="BTCUSD">BTCUSD</option>
           <option value="ETHUSD">ETHUSD</option>
           <option value="DOGEUSD">DOGEUSD</option>

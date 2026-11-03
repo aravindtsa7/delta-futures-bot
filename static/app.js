@@ -35,6 +35,41 @@ const OVERLAY_STYLE = {
 };
 
 const RULE_PARAM_DEFS = {
+  session_orb_breakout: [
+    { key: "box_lookback", label: "Prior Range Bars", def: 16, step: 1, min: 2 },
+    { key: "session_start_utc", label: "Session Start Hour UTC", def: 7, step: 1, min: 0 },
+    { key: "session_end_utc", label: "Session End Hour UTC", def: 19, step: 1, min: 1 },
+    { key: "ema_trend", label: "Trend EMA", def: 50, step: 1, min: 2 },
+    { key: "rvol_min", label: "Minimum RVOL", def: 1.15, step: 0.05, min: 0 },
+    { key: "rsi_period", label: "RSI Period", def: 14, step: 1, min: 2 },
+  ],
+  ema_macd_pullback: [
+    { key: "fast_ema", label: "Fast EMA", def: 20, step: 1, min: 2 },
+    { key: "mid_ema", label: "Middle EMA", def: 50, step: 1, min: 2 },
+    { key: "slow_ema", label: "Slow EMA", def: 200, step: 1, min: 2 },
+    { key: "pullback_tol", label: "EMA Touch Tolerance", def: 0.003, step: 0.001, min: 0 },
+    { key: "rsi_period", label: "RSI Period", def: 14, step: 1, min: 2 },
+    { key: "adx_min", label: "Minimum ADX", def: 18, step: 1, min: 0 },
+  ],
+  liquidity_sweep_sfp: [
+    { key: "swing_lookback", label: "Prior Swing Bars", def: 20, step: 1, min: 2 },
+    { key: "wick_ratio", label: "Min Rejection Wick / Range", def: 0.38, step: 0.01, min: 0 },
+    { key: "rvol_min", label: "Min Relative Volume", def: 1.2, step: 0.1, min: 0 },
+    { key: "max_pierce_atr", label: "Max Sweep Depth / ATR", def: 1.8, step: 0.1, min: 0 },
+    { key: "rsi_period", label: "RSI Period", def: 14, step: 1, min: 2 },
+    { key: "rsi_max_long", label: "Max Long RSI", def: 60, step: 1, min: 0 },
+    { key: "rsi_min_short", label: "Min Short RSI", def: 40, step: 1, min: 0 },
+    { key: "use_cost_gate", label: "Cost Gate (1=on, 0=off)", def: 0, step: 1, min: 0 },
+    { key: "use_4h_trend", label: "Closed 4h Trend (1=on, 0=off)", def: 0, step: 1, min: 0 },
+  ],
+  liquidity_sweep_mss: [
+    { key: "swing_lookback", label: "Prior Swing Bars", def: 24, step: 1, min: 2 },
+    { key: "sweep_window", label: "Sweep Window Bars", def: 3, step: 1, min: 1 },
+    { key: "body_ratio", label: "Min Displacement Body / Range", def: 0.48, step: 0.01, min: 0 },
+    { key: "rvol_min", label: "Min Relative Volume", def: 1.2, step: 0.1, min: 0 },
+    { key: "use_cost_gate", label: "Cost Gate (1=on, 0=off)", def: 0, step: 1, min: 0 },
+    { key: "use_4h_trend", label: "Closed 4h Trend (1=on, 0=off)", def: 0, step: 1, min: 0 },
+  ],
   vol_obv_breakout: [
     { key: "obv_span", label: "OBV EMA Span", def: 20, step: 1, min: 5 },
     { key: "rvol_min", label: "Min RVOL ×", def: 1.3, step: 0.1, min: 0.8 },
@@ -397,7 +432,10 @@ async function loadCustomStrategies(symbol = null, selectId = null) {
   const sym = symbol || $("symbolSelect").value || "ETHUSD";
   const r = await api(`/api/strategies?symbol=${encodeURIComponent(sym)}`);
   state.customStrategies = r.strategies || [];
-  const opts = state.customStrategies.map((s) => [s.id, `${s.name}${s.symbol && s.symbol !== "ALL" ? ` (${s.symbol})` : ""}`]);
+  const opts = state.customStrategies.map((s) => {
+    const suffix = s.symbol && s.symbol !== "ALL" && !s.name.startsWith(`${s.symbol} `) ? ` (${s.symbol})` : "";
+    return [s.id, `${s.name}${suffix}`];
+  });
   setOptions($("strategySelect"), opts, !selectId);
   if (selectId && [...$("strategySelect").options].some((o) => o.value === selectId)) {
     $("strategySelect").value = selectId;
@@ -429,6 +467,27 @@ function applySelectedStrategyDefaults() {
   if (st.trail_mult !== undefined) $("trailAtr").value = st.trail_mult;
   if (st.fee_mode) $("feeMode").value = st.fee_mode;
   if (st.slippage_bps !== undefined) $("slippage").value = String(Math.round(st.slippage_bps));
+  if (st.verification && (st.rule_type?.startsWith("liquidity_sweep_") || st.verification.generator === "test_trx_xau_strategies.py")) {
+    $("trailEnabled").checked = false;
+    $("triggerSource").value = "trade";
+    $("dailyLoss").value = st.verification.max_daily_loss_pct;
+    $("trend4h").checked = false;
+    $("costGate").checked = !!st.verification.cost_gate;
+    $("strictLot").checked = true;
+  }
+  // Explicit preset values override switches left over from another strategy.
+  if (st.trailing_stop !== undefined) $("trailEnabled").checked = !!st.trailing_stop;
+  if (st.trigger_source !== undefined) $("triggerSource").value = st.trigger_source;
+  if (st.max_daily_loss_pct !== undefined) $("dailyLoss").value = st.max_daily_loss_pct;
+  if (st.use_4h_trend !== undefined) $("trend4h").checked = !!st.use_4h_trend;
+  if (st.use_cost_gate !== undefined) $("costGate").checked = !!st.use_cost_gate;
+  if (st.strict_lot_cap !== undefined) $("strictLot").checked = !!st.strict_lot_cap;
+  if (st.backtest_window) {
+    $("daysSelect").value = "custom";
+    $("startDate").value = st.backtest_window.start.slice(0, 10);
+    $("endDate").value = st.backtest_window.end.slice(0, 10);
+    toggleCustomRange();
+  }
   updateAdvSummary();
   updateOverviewHeaderPreview();
 }
@@ -818,6 +877,8 @@ function readRequest() {
     trend_filter_4h: $("trend4h").checked,
     cost_gate: $("costGate").checked,
     strict_lot_cap: $("strictLot").checked,
+    cooldown_bars: st?.cooldown_bars ?? 1,
+    mark_fill_mode: st?.mark_fill_mode ?? "trigger",
     walk_forward_windows: 3,
     include_chart: true,
   };
@@ -831,6 +892,7 @@ function readRequest() {
     const a = $("endSelect").value === "step3c" ? state.anchor : $("endSelect").value === "step4b" ? state.anchor4b : null;
     if (a) { req.end = a.end; req.history_start = a.warmup_start; }
   }
+  if (st?.history_start) req.history_start = st.history_start;
   return req;
 }
 
@@ -2359,7 +2421,7 @@ function renderStrategyLabLibrary() {
 
 function deployPayload(row) {
   const id = row.id || row.result_id;
-  return { ...row, result_id: id, id, symbol: row.symbol, enabled: true };
+  return { result_id: id, enabled: true };
 }
 
 async function deploySavedStrategyToBot(itemOrId) {

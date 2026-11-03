@@ -291,6 +291,7 @@ def status() -> JSONResponse:
         "coverage": {s: coverage(s) for s in syms},
         "strategies": [{"name": s.name, "description": s.description} for s in strategies.STRATEGIES.values()],
         "custom_strategies": _load_custom_strategies(),
+        "custom_rule_types": list(strategies.CUSTOM_RULE_TYPES),
         "timeframes": TIMEFRAMES,
         "exit_modes": EXIT_MODES,
         "fee_modes": ["taker_maker_tp", "maker_maker", "taker", "maker"],
@@ -1147,7 +1148,8 @@ def list_strategies(symbol: str | None = None) -> JSONResponse:
     items = _load_custom_strategies()
     if symbol and symbol.strip().upper() != "ALL":
         sym = symbol.strip().upper()
-        items = [s for s in items if str(s.get("symbol", "ALL")).upper() in (sym, "ALL")]
+        items = [s for s in items if str(s.get("symbol", "ALL")).strip().upper() in (sym, "ALL")]
+        items.sort(key=lambda s: str(s.get("symbol", "ALL")).strip().upper() != sym)
     return JSONResponse(clean({"strategies": items}))
 
 
