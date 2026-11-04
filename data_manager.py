@@ -28,6 +28,7 @@ import pandas as pd
 import requests
 
 from config import settings
+from dataset_lock import dataset_lock
 
 log = logging.getLogger(__name__)
 
@@ -289,6 +290,21 @@ def load_raw_1m(symbol: str, series_type: SeriesType) -> pd.DataFrame:
     return pd.read_parquet(path, engine="pyarrow")
 
 
+def _commit_candles(symbol: str, series_type: SeriesType, incoming: pd.DataFrame) -> pd.DataFrame:
+    """Merge fetched closed candles with the CURRENT file, under the cross-process lock.
+
+    Downloads run outside the lock. Existing closed candles win overlaps, so a
+    delayed response cannot replace a newer writer's candles or truncate history.
+    All supported download and repair writers use this commit path.
+    """
+    path = raw_1m_path(symbol, series_type)
+    with dataset_lock(path):
+        current = load_raw_1m(symbol, series_type)
+        merged = _merge(incoming, current)
+        _atomic_write_parquet(merged, path)
+        return merged
+
+
 def download_1m_series(symbol: str, series_type: SeriesType, days: int | None = None) -> DownloadResult:
     """Download (or incrementally extend) the 1m series and persist it as Parquet.
 
@@ -327,7 +343,7 @@ def download_1m_series(symbol: str, series_type: SeriesType, days: int | None = 
     if ranges:
         merged, n_rep = _repair_gaps(symbol, series_type, merged)
         n_requests += n_rep
-        _atomic_write_parquet(merged, path)
+        merged = _commit_candles(symbol, series_type, merged)
 
     log.info(
         "%s %s: %d -> %d rows (fetched %d in %d requests)",
@@ -368,7 +384,7 @@ def repair_series(symbol: str, series_type: SeriesType) -> int:
     df = load_raw_1m(symbol, series_type)
     fixed, n = _repair_gaps(symbol, series_type, df)
     if n:
-        _atomic_write_parquet(fixed, path)
+        fixed = _commit_candles(symbol, series_type, fixed)
     return find_gaps(fixed["time"]).gap_count
 
 
@@ -623,7 +639,7 @@ def download_1m_range(
 
     merged, n_rep = _repair_gaps(symbol, series_type, merged)
     n_requests += n_rep
-    _atomic_write_parquet(merged, path)
+    merged = _commit_candles(symbol, series_type, merged)
     return DownloadResult(symbol, series_type, path, rows_before, len(merged), rows_fetched, n_requests)
 
 
@@ -645,7 +661,7 @@ def repair_symbol_gaps(symbol: str) -> dict[str, Any]:
         g_before = find_gaps(df["time"])
         repaired, n_req = _repair_gaps(symbol, st, df)
         if len(repaired) != len(df):
-            _atomic_write_parquet(repaired, path)
+            repaired = _commit_candles(symbol, st, repaired)
         g_after = find_gaps(repaired["time"])
         added = max(0, len(repaired) - len(df))
         total_before += g_before.gap_count

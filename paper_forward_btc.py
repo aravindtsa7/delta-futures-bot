@@ -165,7 +165,7 @@ def main():
     started=time.time();seen=set()
     class ObservedRunner(lb.LiveBotRunner):
         def _try_hour_signal(self,symbol):
-            requested=self.pending_hour.get(symbol)
+            requested=(self.pending_hour.get(symbol) or [None])[-1]
             super()._try_hour_signal(symbol)
             evaluation=self.last_eval.get(symbol)
             if evaluation is None or requested is None:return

@@ -526,12 +526,41 @@
         <button id="botFlatten" class="btn btn-danger">⚠ Emergency Flatten All Positions</button>
       </div>
       <div id="botMsg" class="bot-msg hint"></div>
+      <div id="botProcessStatus" class="hint" role="status">Runner process: UNKNOWN; awaiting verification.</div>
     </section>
 
     <section class="kpis" id="botKpis" aria-label="Bot telemetry"></section>
 
+    <section class="panel bot-card hidden" id="paperAccountCard">
+      <div class="bot-card-head"><h3>Paper Account Settings</h3><label>Session <select id="paperSessionSelect"><option value="">Active paper account</option></select></label></div>
+      <div id="paperAccountApplied" class="hint"></div>
+      <div id="paperAccountLifecycle" class="hint" role="status">Verifying process and persisted account…</div>
+      <div class="bot-controls">
+        <label>Paper Capital ₹ <input id="paperCapitalInput" type="number" min="0" step="any" aria-label="Paper Capital in rupees"></label>
+        <label>Daily Loss Limit % <input id="paperDailyLossInput" type="number" min="0" max="100" step="any" aria-label="Paper daily loss percentage"></label>
+        <button type="button" id="paperLimitSave" class="btn">Update Daily Loss Limit</button>
+        <button type="button" id="paperSessionNew" class="btn btn-primary">Start New Paper Session</button>
+        <button type="button" id="paperAccountRetry" class="btn hidden">Retry pending operation</button>
+        <button type="button" id="paperDraftReload" class="btn btn-ghost">Reload Applied Values</button>
+        <span id="paperAccountBlockers" class="hint" role="status"></span>
+      </div>
+      <div id="paperAccountDraft" class="hint"></div>
+      <div class="hint">Capital changes require a new session. Saving a daily limit preserves the balance, daily baseline, history and existing halt; it does not resume trading. A new session archives this journal and begins stopped.</div>
+      <div id="paperAccountError" class="hint" role="alert"></div>
+    </section>
+
     <section class="panel bot-card">
-      <div class="bot-card-head"><h3>Live Signal Status</h3><span class="muted">latest CLOSED 1h bar · 4h regime from the latest closed 4h bar · local 1m history</span></div>
+      <div class="bot-card-head"><h3>Recorded Runner Evaluations</h3><span class="muted">Journal evidence; timestamps in UTC. Refused entries are not orders.</span></div>
+      <div id="botAccounting" class="hint"></div>
+      <div class="table-wrap"><table id="botEvaluations" class="data"></table></div>
+      <details><summary>Evaluation history and saved configurations</summary>
+        <div class="bot-controls"><button id="paperEvalPrev" class="btn">Newer evaluations</button><button id="paperEvalNext" class="btn">Older evaluations</button></div>
+        <div class="table-wrap"><table id="paperEvalHistory" class="data"></table></div>
+      </details>
+      <details><summary>Settlement accounting history</summary><div class="table-wrap"><table id="paperFundingHistory" class="data"></table></div></details>
+    </section>
+    <section class="panel bot-card">
+      <div class="bot-card-head"><h3>Dashboard Recalculation</h3><span class="muted">Latest complete local candle for each deployed timeframe; not proof of runner evaluation.</span></div>
       <div class="table-wrap"><table id="botSignals" class="data"></table></div>
     </section>
 

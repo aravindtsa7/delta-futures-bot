@@ -12,6 +12,7 @@ __pycache__/
 
 # --- Large raw candle data (re-downloadable via data_manager.py) ---
 data/raw_1m/*.parquet
+data/raw_1m/*.lock
 
 # --- Runtime state: journals, locks, backups, control channel ---
 data/*.db
@@ -19,6 +20,8 @@ data/*.db-wal
 data/*.db-shm
 data/*.lock
 data/backups/
+data/paper_sessions/
+data/*.paper-account-pending.json
 data/live_bot.lock
 data/bot_control/
 data/test_bot_control/

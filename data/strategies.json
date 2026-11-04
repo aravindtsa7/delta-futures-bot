@@ -77,6 +77,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 100000.0,
+        "net": 2536.1482395869107,
+        "pf": 1.6123663940616113,
+        "dd": 4.599157925423274,
+        "win_rate": 77.77777777777779,
+        "avg_win": 953.9574046619426,
+        "trades": 9,
+        "half1": 54.21078492514331,
+        "half2": 2480.145573828629,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -111,6 +123,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 50000.0,
+        "net": 1268.1921630885954,
+        "pf": 1.612504396209925,
+        "dd": 4.5985213441327275,
+        "win_rate": 77.77777777777779,
+        "avg_win": 476.95644562442305,
+        "trades": 9,
+        "half1": 27.154741020060595,
+        "half2": 1240.1414816519657,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -145,6 +169,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 100000.0,
+        "net": 1093.8559483670078,
+        "pf": 1.5319549830846337,
+        "dd": 3.8305664727599678,
+        "win_rate": 77.77777777777779,
+        "avg_win": 450.02145030085796,
+        "trades": 9,
+        "half1": 231.67565039430139,
+        "half2": 859.9286661065623,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -179,6 +215,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 50000.0,
+        "net": 546.9004742076665,
+        "pf": 1.5319293883807068,
+        "dd": 3.830340263901868,
+        "win_rate": 77.77777777777779,
+        "avg_win": 225.00647837287735,
+        "trades": 9,
+        "half1": 115.82793717313832,
+        "half2": 429.9157205384547,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -213,6 +261,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 100000.0,
+        "net": 3237.1769148615294,
+        "pf": 1.7621854890509436,
+        "dd": 3.4002504022624973,
+        "win_rate": 80.0,
+        "avg_win": 935.550838150109,
+        "trades": 10,
+        "half1": 323.9354258573557,
+        "half2": 2903.952917841302,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -247,6 +307,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 50000.0,
+        "net": 1618.3041348611528,
+        "pf": 1.7621002523361309,
+        "dd": 3.4002481646483522,
+        "win_rate": 80.0,
+        "avg_win": 467.7229333762432,
+        "trades": 10,
+        "half1": 162.0335084471241,
+        "half2": 1451.944099188699,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -281,6 +353,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 100000.0,
+        "net": 2635.8776324804558,
+        "pf": 1.8891359666407743,
+        "dd": 4.364331846684317,
+        "win_rate": 88.23529411764706,
+        "avg_win": 373.3610625752266,
+        "trades": 17,
+        "half1": 2150.7543419830326,
+        "half2": 474.97086703581937,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -315,6 +399,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 50000.0,
+        "net": 1317.7585141913116,
+        "pf": 1.8891005180705212,
+        "dd": 4.363871129982445,
+        "win_rate": 88.23529411764706,
+        "avg_win": 186.65893160224172,
+        "trades": 17,
+        "half1": 1075.2372410290377,
+        "half2": 237.5904205287809,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -349,6 +445,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 100000.0,
+        "net": 3442.34868684207,
+        "pf": 2.683016618151649,
+        "dd": 2.5461629739395955,
+        "win_rate": 90.9090909090909,
+        "avg_win": 548.7693129502765,
+        "trades": 11,
+        "half1": 1220.7415690488078,
+        "half2": 2194.855042152912,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -383,6 +491,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 50000.0,
+        "net": 1721.2499448463375,
+        "pf": 2.683309524859887,
+        "dd": 2.5458295792353525,
+        "win_rate": 90.9090909090909,
+        "avg_win": 274.3789126990873,
+        "trades": 11,
+        "half1": 610.4463859497056,
+        "half2": 1097.3840158727985,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -417,6 +537,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 100000.0,
+        "net": 3123.1913759242384,
+        "pf": "Infinity",
+        "dd": 2.2142232879388737,
+        "win_rate": 100.0,
+        "avg_win": 520.5318959873732,
+        "trades": 6,
+        "half1": 1761.4938586030407,
+        "half2": 1338.1071997546032,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -451,6 +583,18 @@
     "slippage_bps": 2.0,
     "verification": {
       "generator": "test_trx_xau_strategies.py",
+      "metrics": {
+        "capital": 50000.0,
+        "net": 1561.4803717106522,
+        "pf": "Infinity",
+        "dd": 2.2139352934737855,
+        "win_rate": 100.0,
+        "avg_win": 260.2467286184421,
+        "trades": 6,
+        "half1": 880.6834304892832,
+        "half2": 669.0206033937117,
+        "passed": true
+      },
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
@@ -962,6 +1106,20 @@
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
+      "full": {
+        "net": 4157.296575500523,
+        "pf": 1.7355104790360516,
+        "dd": 5.772903480447663,
+        "trades": 16,
+        "win_rate": 56.25,
+        "avg_win": 1089.9507480237482,
+        "half1": 1258.8218840087477,
+        "half2": 2388.944958211885,
+        "passed": true,
+        "capital": 50000.0,
+        "leverage": 15,
+        "risk_pct": 2.0
+      },
       "selection": "retrospective two-half stability screen; not untouched validation",
       "max_daily_loss_pct": 5.0,
       "cooldown_bars": 1
@@ -1001,6 +1159,20 @@
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
+      "full": {
+        "net": 8384.213769605944,
+        "pf": 1.724788988935423,
+        "dd": 5.902291522317212,
+        "trades": 16,
+        "win_rate": 56.25,
+        "avg_win": 2216.890373375742,
+        "half1": 2516.440850037017,
+        "half2": 4869.525939357246,
+        "passed": true,
+        "capital": 100000.0,
+        "leverage": 15,
+        "risk_pct": 2.0
+      },
       "selection": "retrospective two-half stability screen; not untouched validation",
       "max_daily_loss_pct": 5.0,
       "cooldown_bars": 1
@@ -1040,6 +1212,20 @@
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
+      "full": {
+        "net": 3858.172688966051,
+        "pf": 2.800366980621317,
+        "dd": 4.807825964997018,
+        "trades": 11,
+        "win_rate": 45.45454545454545,
+        "avg_win": 1200.2330102707022,
+        "half1": 2774.382022793818,
+        "half2": 1018.3709845290896,
+        "passed": true,
+        "capital": 50000.0,
+        "leverage": 15,
+        "risk_pct": 2.0
+      },
       "selection": "retrospective two-half stability screen; not untouched validation",
       "max_daily_loss_pct": 5.0,
       "cooldown_bars": 1
@@ -1079,6 +1265,20 @@
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
+      "full": {
+        "net": 7650.088943862345,
+        "pf": 2.7660682715044387,
+        "dd": 4.846020862287642,
+        "trades": 11,
+        "win_rate": 45.45454545454545,
+        "avg_win": 2396.3590358575048,
+        "half1": 5548.378121288686,
+        "half2": 2017.5291254607341,
+        "passed": true,
+        "capital": 100000.0,
+        "leverage": 15,
+        "risk_pct": 2.0
+      },
       "selection": "retrospective two-half stability screen; not untouched validation",
       "max_daily_loss_pct": 5.0,
       "cooldown_bars": 1
@@ -1121,6 +1321,20 @@
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
+      "full": {
+        "net": 3658.8611986487795,
+        "pf": 1.7246522902814843,
+        "dd": 6.535021512032436,
+        "trades": 13,
+        "win_rate": 53.84615384615385,
+        "avg_win": 1243.9982656313518,
+        "half1": 1488.0519592730789,
+        "half2": 2117.534472735882,
+        "passed": true,
+        "capital": 50000.0,
+        "leverage": 15,
+        "risk_pct": 2.0
+      },
       "selection": "retrospective two-half stability screen; not untouched validation",
       "max_daily_loss_pct": 5.0,
       "cooldown_bars": 1
@@ -1163,6 +1377,20 @@
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
+      "full": {
+        "net": 7335.39325602367,
+        "pf": 1.7252087148959399,
+        "dd": 6.550759546116081,
+        "trades": 13,
+        "win_rate": 53.84615384615385,
+        "avg_win": 2492.8950230943046,
+        "half1": 2976.1039185461577,
+        "half2": 4244.035772298058,
+        "passed": true,
+        "capital": 100000.0,
+        "leverage": 15,
+        "risk_pct": 2.0
+      },
       "selection": "retrospective two-half stability screen; not untouched validation",
       "max_daily_loss_pct": 5.0,
       "cooldown_bars": 1
@@ -1202,6 +1430,20 @@
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
+      "full": {
+        "net": 3075.223866606355,
+        "pf": 2.4587345178539968,
+        "dd": 3.343286093843304,
+        "trades": 7,
+        "win_rate": 57.14285714285714,
+        "avg_win": 1295.8422143319478,
+        "half1": 2375.1270153117152,
+        "half2": 667.607748035251,
+        "passed": true,
+        "capital": 50000.0,
+        "leverage": 15,
+        "risk_pct": 2.0
+      },
       "selection": "retrospective two-half stability screen; not untouched validation",
       "max_daily_loss_pct": 5.0,
       "cooldown_bars": 1
@@ -1241,6 +1483,20 @@
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
+      "full": {
+        "net": 6153.916737121376,
+        "pf": 2.4589488897834473,
+        "dd": 3.343180491195185,
+        "trades": 7,
+        "win_rate": 57.14285714285714,
+        "avg_win": 2592.9912340538644,
+        "half1": 4751.207913321332,
+        "half2": 1337.7306172812675,
+        "passed": true,
+        "capital": 100000.0,
+        "leverage": 15,
+        "risk_pct": 2.0
+      },
       "selection": "retrospective two-half stability screen; not untouched validation",
       "max_daily_loss_pct": 5.0,
       "cooldown_bars": 1
@@ -1280,6 +1536,20 @@
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
+      "full": {
+        "net": 4338.786342538216,
+        "pf": 1.5056453965597332,
+        "dd": 8.119837254811502,
+        "trades": 20,
+        "win_rate": 50.0,
+        "avg_win": 1291.9476233236476,
+        "half1": 2375.0582025775357,
+        "half2": 1872.8687770775525,
+        "passed": true,
+        "capital": 50000.0,
+        "leverage": 15,
+        "risk_pct": 2.0
+      },
       "selection": "retrospective two-half stability screen; not untouched validation",
       "max_daily_loss_pct": 5.0,
       "cooldown_bars": 1
@@ -1319,6 +1589,20 @@
       "start": "2026-10-03 00:00:00+00:00",
       "end": "2026-11-02 00:00:00+00:00",
       "history_start": "2026-09-03 00:00:00+00:00",
+      "full": {
+        "net": 8679.731424104395,
+        "pf": 1.505637900590702,
+        "dd": 8.120763283517523,
+        "trades": 20,
+        "win_rate": 50.0,
+        "avg_win": 2584.563495697734,
+        "half1": 4752.641155207386,
+        "half2": 3750.3339848331207,
+        "passed": true,
+        "capital": 100000.0,
+        "leverage": 15,
+        "risk_pct": 2.0
+      },
       "selection": "retrospective two-half stability screen; not untouched validation",
       "max_daily_loss_pct": 5.0,
       "cooldown_bars": 1

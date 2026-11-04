@@ -50,6 +50,7 @@ def deployment(monkeypatch,tmp_path):
     monkeypatch.setattr(httpx.HTTPTransport,'handle_request',forbidden)
     monkeypatch.setattr(httpx.AsyncHTTPTransport,'handle_async_request',forbidden)
     monkeypatch.setattr(ops,'_signals',lambda:{})
+    monkeypatch.setitem(ops.PATHS,'db',tmp_path/'paper.db')
     monkeypatch.setattr(ee,'BOT_PROFILES_FILE',tmp_path/'profiles.json')
     monkeypatch.setattr(ops,'SAVED_BACKTESTS_FILE',tmp_path/'saved.json')
     monkeypatch.setattr(ops.run_store,'root',lambda:tmp_path/'runs')
@@ -88,7 +89,7 @@ def test_four_saved_strategies_single_and_batch(deployment):
     assert response.json()['active_count']==response.json()['total_count']==4
     assert set(response.json()['profiles'])=={x['symbol'] for x in saved}
 
-def test_wallet_aliases_normalize_without_losing_other_profiles(deployment):
+def test_wallet_mismatch_refused_without_mutating_other_profiles(deployment):
     client,saved,path=deployment
     legacy=dict(saved[-1]);legacy.pop('run_id',None);legacy.pop('effective_config',None)
     legacy.update(id='legacy-wallet',symbol='XRPUSD',capital_inr=75000,fx=90,daily_loss_stop_pct=0)
@@ -98,13 +99,11 @@ def test_wallet_aliases_normalize_without_losing_other_profiles(deployment):
     paused=dict(existing,symbol='ADAUSD',enabled=False,capital_inr=12345)
     ee.save_bot_profiles_raw({'BTCUSD':existing,'ADAUSD':paused})
     response=client.post('/api/bot/deploy',json={'result_id':'legacy-wallet'})
-    assert response.status_code==200,response.text
+    assert response.status_code==409,response.text
+    assert response.json()['detail']['code']=='shared_wallet_mismatch'
     raw=ee.load_bot_profiles_raw()
-    assert set(raw)=={'BTCUSD','ADAUSD','XRPUSD'} and raw['ADAUSD']==paused
-    assert raw['BTCUSD']['keep_user_field']=='untouched'
-    for symbol in ('BTCUSD','XRPUSD'):
-        cfg=ee.profile_config(ee._profile_from_dict(symbol,raw[symbol]))
-        assert (cfg.initial_capital_inr,cfg.usd_inr_rate,cfg.max_daily_loss_pct)==(75000,90,0)
+    assert raw=={'BTCUSD':existing,'ADAUSD':paused}
+
 
 def test_concurrent_merges_and_failed_batch_is_atomic(deployment):
     _,saved,path=deployment

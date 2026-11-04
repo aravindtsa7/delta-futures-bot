@@ -382,11 +382,12 @@ class DeltaWebSocketManager:
         return self.generation
 
     # -- message processing (synchronous, deterministic) ---------------------------- #
-    def handle_message(self, m: dict[str, Any], generation: int, source: str = "public") -> None:
+    def handle_message(self, m: dict[str, Any], generation: int, source: str = "public",
+                       received_at: float | None = None) -> None:
         if generation != self.generation:
             self.stats.dropped_stale_generation += 1
             return
-        self._last_rx = self.clock()
+        received_at = self.clock() if received_at is None else received_at
         t = str(m.get("type", "?"))
         st = self.stats
         st.messages[t] = st.messages.get(t, 0) + 1
@@ -424,7 +425,7 @@ class DeltaWebSocketManager:
                 self._emit("on_ticker", tk)
         elif t == "ob_l1":
             q = normalize_quote(m)
-            self.last_quote[q["symbol"]] = {**q, "rx": self._last_rx}
+            self.last_quote[q["symbol"]] = {**q, "rx": received_at}
             self._emit("on_quote", q)
         elif t in PRIVATE_CHANNELS or t in ("v2/user_trades",):
             snapshot = m.get("action") == "snapshot" or m.get("type", "").endswith("snapshot")
@@ -449,11 +450,14 @@ class DeltaWebSocketManager:
         try:
             while True:
                 raw = await conn.recv()
-                await q.put((gen, socket, raw))
+                received_at = self.clock()
+                if gen == self.generation:
+                    self._last_rx = received_at
+                await q.put((gen, socket, raw, received_at))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - any transport failure ends the generation
-            await q.put((gen, socket, ConnectionLost(f"{socket}: {type(exc).__name__}: {exc}")))
+            await q.put((gen, socket, ConnectionLost(f"{socket}: {type(exc).__name__}: {exc}"), self.clock()))
 
     async def _pump(self, until: Callable[[], bool], timeout_s: float, what: str) -> None:
         """Dispatch incoming frames until ``until()`` holds (raise on timeout / lost connection)."""
@@ -465,7 +469,7 @@ class DeltaWebSocketManager:
                     raise WatchdogTimeout(f"no frame for {self.watchdog_s:.0f}s")
                 raise TimeoutError(f"timed out waiting for {what}")
             try:
-                gen, socket, raw = await asyncio.wait_for(self._queue.get(), timeout=min(remaining, 0.25))
+                gen, socket, raw, received_at = await asyncio.wait_for(self._queue.get(), timeout=min(remaining, 0.25))
             except asyncio.TimeoutError:
                 continue
             if isinstance(raw, Exception):
@@ -478,9 +482,9 @@ class DeltaWebSocketManager:
                 self.stats.errors.append(f"non-JSON frame on {socket}")
                 continue
             if self.offload:  # handler work (REST / SQLite) off the event loop; frames stay strictly ordered
-                await asyncio.to_thread(self.handle_message, msg, gen, socket)
+                await asyncio.to_thread(self.handle_message, msg, gen, socket, received_at)
             else:
-                self.handle_message(msg, gen, socket)
+                self.handle_message(msg, gen, socket, received_at)
             if self._reconnect_reason is not None and gen != self.generation:
                 return
 

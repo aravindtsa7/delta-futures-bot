@@ -9,6 +9,8 @@ Status is read through a read-only SQLite connection (WAL allows it while the bo
 from __future__ import annotations
 
 import json
+from functools import wraps
+from contextlib import contextmanager
 from dataclasses import asdict
 import math
 import os
@@ -23,9 +25,11 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import backup_state
+import paper_accounts
+from dataset_lock import dataset_lock
 import data_manager as dm
 import run_store
 import execution_engine as ee
@@ -48,9 +52,21 @@ EXEC_MODES = ("paper", "testnet", "live")
 _proc: subprocess.Popen | None = None
 _proc_log: Path | None = None
 _proc_bot_pid: int | None = None  # pid holding the lock (the venv launcher spawns the real interpreter as a child)
-_op_lock = threading.Lock()
+_op_lock = threading.RLock()
+_stopping = threading.Event()
+_runner_probe_lock = threading.Lock()
 _notifiers: dict[str, TelegramNotifier] = {}
 _cache: dict[str, Any] = {}
+
+
+@contextmanager
+def _startup_operation():
+    if not _op_lock.acquire(blocking=False):
+        raise HTTPException(409, 'Another bot/account operation is in progress. Retry after it finishes.')
+    try:
+        yield
+    finally:
+        _op_lock.release()
 
 
 def configure(**paths: Path) -> None:
@@ -99,11 +115,11 @@ def set_active_mode(mode: str) -> int:
 
 
 def status_mode() -> str:
-    """Journal shown on the dashboard: the running loop's mode, else the Manual Trade mode."""
+    """Default Bot Operations journal when no mode parameter is supplied: running loop's mode, else paper."""
     run, info = runner()
     if run and (info or {}).get("mode") in EXEC_MODES:
         return info["mode"]
-    return active_mode()
+    return "paper"
 
 
 def notifier(mode: str | None = None) -> TelegramNotifier:
@@ -140,22 +156,84 @@ def us_iso(us: int | None) -> str | None:
 # Runner detection / read-only journal access
 # --------------------------------------------------------------------------- #
 def runner() -> tuple[bool, dict[str, Any] | None]:
-    held = lb.InstanceLock.is_held(PATHS["lock"])
-    return held, (lb.InstanceLock.read_info(PATHS["lock"]) if held else None)
+    # Concurrent probes briefly acquire the same OS byte lock. Serialize them
+    # so one probe cannot mistake another probe for an active runner.
+    with _runner_probe_lock:
+        held = lb.InstanceLock.is_held(PATHS["lock"])
+        return held, (lb.InstanceLock.read_info(PATHS["lock"]) if held else None)
 
 
-def ro_conn(mode: str | None = None) -> sqlite3.Connection | None:
-    db = mode_db(mode or status_mode())
+def _pid_alive(pid: int) -> bool:
+    if sys.platform != 'win32':
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE; no terminate rights
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:  # no such PID
+            return False
+        raise OSError(error, 'Cannot verify runner process termination')
+    try:
+        result = kernel.WaitForSingleObject(handle, 0)
+        if result not in (0, 258):
+            raise OSError('Cannot verify runner process termination')
+        return result == 258
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def process_state() -> dict[str, Any]:
+    """Process evidence only: never infer exit from a halt or a stop acknowledgement."""
+    try:
+        held, info = runner()
+        if held:
+            if (info or {}).get('mode') == 'paper-account-settings':
+                return dict(state='unknown',running=None,pid=None,mode=None,
+                            error='Paper account update in progress; waiting for lifecycle verification.')
+            return dict(state='stopping' if _stopping.is_set() else 'running', running=True,
+                        pid=(info or {}).get('pid'), mode=(info or {}).get('mode'), error=None)
+        info = lb.InstanceLock.read_info(PATHS['lock']) or {}
+        pid = info.get('pid') if info.get('mode') in EXEC_MODES else None
+        # Account operations use the same lifecycle fence, but are not runners.
+        if pid and pid != os.getpid() and _pid_alive(int(pid)):
+            return dict(state='stopping', running=True, pid=pid, mode=info.get('mode'),
+                        error='Runner lock released; waiting for process termination.')
+        return dict(state='stopped', running=False, pid=None, mode=None, error=None)
+    except Exception as exc:
+        return dict(state='unknown', running=None, pid=None, mode=None,
+                    error=f'Process verification failed: {exc}')
+
+
+def ro_conn(mode: str | None = None, db_path: Path | None = None) -> sqlite3.Connection | None:
+    db = db_path or mode_db(mode or status_mode())
     if not db.exists():
         return None
     con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=5)
     con.row_factory = sqlite3.Row
     try:  # a writer may have created the file but not the schema yet (events is the last table created)
         ready = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
-    except sqlite3.DatabaseError:
-        ready = None
+    except sqlite3.DatabaseError as exc:
+        con.close()
+        raise HTTPException(503, f"Journal {db.name} could not be verified: {exc}") from exc
     if not ready:
         con.close()
+        try:
+            non_empty = db.stat().st_size > 0
+        except OSError:
+            non_empty = False
+        if non_empty:
+            raise HTTPException(503, f"Journal {db.name} is incomplete or unreadable.")
         return None
     return con
 
@@ -269,11 +347,21 @@ def loss_streak(trades: list[sqlite3.Row], floor_us: int) -> int:
     return n
 
 
-def read_status(with_market: bool = True, with_signals: bool = True, mode: str | None = None) -> dict[str, Any]:
+def read_status(with_market: bool = True, with_signals: bool = True, mode: str | None = None,
+                paper_session_id: str | None = None, evaluation_offset: int = 0) -> dict[str, Any]:
     run, info = runner()
-    jmode = mode or status_mode()
+    proc = process_state()
+    if proc.get("state") == "stopping" and not run:
+        run = True
+        info = info or {"pid": proc.get("pid"), "mode": proc.get("mode")}
+    jmode = mode if mode in EXEC_MODES else status_mode()
     jdb = mode_db(jmode)
+    archived = paper_accounts.archive(mode_db('paper'), paper_session_id) if paper_session_id else None
+    if archived:
+        jmode, jdb, run, info = 'paper', archived, False, None
+        with_market = with_signals = False
     base: dict[str, Any] = {
+        "process": proc,
         "runner": {"running": run, "pid": (info or {}).get("pid"), "mode": (info or {}).get("mode"),
                    "started": (info or {}).get("started"), "managed_by_dashboard": bool(_proc and _proc.poll() is None),
                    "log_file": str(_proc_log) if _proc_log else None},
@@ -282,8 +370,9 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
                      "testnet_keys": bool(settings.TESTNET_API_KEY and settings.TESTNET_API_SECRET),
                      "telegram_configured": bool(settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID)},
         "db": str(jdb), "db_exists": jdb.exists(), "journal_mode": jmode,
+        "paper_session_catalog": paper_accounts.describe(mode_db('paper')) if jmode=='paper' else None,
     }
-    con = ro_conn(jmode)
+    con = ro_conn(jmode, jdb)
     if con is None:
         cap = ee.CAPITAL_INR
         sigs = _signals() if with_market and with_signals else {}
@@ -301,7 +390,7 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
         return _clean(base)
     try:
         cfg = con.execute("SELECT * FROM bot_config_state WHERE id=1").fetchone()
-        mode = cfg["mode"] if cfg else ((info or {}).get("mode") or "paper")
+        mode = cfg["mode"] if cfg else jmode
         rate = float(cfg["usd_inr_rate"]) if cfg else settings.FIXED_USD_INR_RATE
         capital = float(cfg["capital_inr"]) if cfg else ee.CAPITAL_INR
         trades = con.execute("SELECT * FROM trade_history WHERE mode=? ORDER BY trade_id", (mode,)).fetchall()
@@ -322,6 +411,17 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
             last_ready_stale = False
         floor = con.execute("SELECT max(at_us) FROM events WHERE kind='loss_streak_halt' AND mode=?", (mode,)).fetchone()[0] or 0
         unknown = con.execute("SELECT count(*) FROM order_intents WHERE mode=? AND state='OUTCOME_UNKNOWN'", (mode,)).fetchone()[0]
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        evaluations = con.execute(
+            "SELECT * FROM signal_evaluations WHERE id IN (SELECT max(id) FROM signal_evaluations WHERE mode=? GROUP BY symbol)",
+            (mode,)).fetchall() if 'signal_evaluations' in tables else []
+        accounting = con.execute("SELECT * FROM funding_settlements WHERE mode=? AND status='PENDING' ORDER BY at_us",
+                                 (mode,)).fetchall() if 'funding_settlements' in tables else []
+        session_start = con.execute("SELECT at_us FROM events WHERE id=?", (started,)).fetchone()
+        evaluation_history = con.execute('SELECT * FROM signal_evaluations WHERE mode=? ORDER BY id DESC LIMIT 101 OFFSET ?',
+                                         (mode,evaluation_offset)).fetchall() if 'signal_evaluations' in tables else []
+        funding_history = con.execute('SELECT * FROM funding_events WHERE mode=? ORDER BY at_us DESC',(mode,)).fetchall()
+        settlement_history = con.execute('SELECT * FROM funding_settlements WHERE mode=? ORDER BY at_us DESC',(mode,)).fetchall() if 'funding_settlements' in tables else []
     finally:
         con.close()
     now_us = int(time.time() * 1e6)
@@ -352,13 +452,16 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
     today_closed = sum(float(t["net_pnl_inr"]) for t in trades if t["closed_at_us"] >= midnight_us)
     day_start = realized - today_closed
     total = realized + unreal
-    halted = bool(cfg and cfg["halted"] and (cfg["halt_until_us"] is None or now_us < cfg["halt_until_us"]))
+    account = (paper_accounts.describe(jdb) if archived else base['paper_session_catalog']) if mode=='paper' else None
+    if account:
+        day_start = account['daily_baseline_inr']
+    halted = bool(cfg and cfg["halted"] and (archived or cfg["halt_until_us"] is None or now_us < cfg["halt_until_us"]))
     rdet = json.loads(last_ready["detail"]) if last_ready and last_ready["detail"] else {}
     sdet = json.loads(last_state["detail"]) if last_state and last_state["detail"] else {}
     last_known = sdet.get("to")
     base.update(
         mode=mode,
-        readiness_state=(last_known or "BOOTING") if run else "STOPPED",
+        readiness_state='ARCHIVED' if archived else ((last_known or "BOOTING") if run else "STOPPED"),
         last_known_state=last_known,
         entries_paused=bool(cfg["entries_paused"]) if cfg and "entries_paused" in cfg.keys() else False,
         daily_halted=halted, halt_reason=cfg["halt_reason"] if halted else None,
@@ -371,8 +474,8 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
                 "total_equity_inr": total, "available_margin_inr": realized - sum(p["margin_usd"] for p in positions) * rate,
                 "used_margin_inr": sum(p["margin_usd"] for p in positions) * rate,
                 "today_pnl_inr": total - day_start, "today_pnl_pct": (total / day_start - 1) * 100 if day_start else 0.0,
-                "day_start_equity_inr": day_start, "daily_loss_limit_pct": ee.DAILY_LOSS_LIMIT_PCT,
-                "daily_loss_limit_inr": day_start * ee.DAILY_LOSS_LIMIT_PCT / 100, "closed_trades": len(trades),
+                "day_start_equity_inr": day_start, "daily_loss_limit_pct": cfg['daily_loss_limit_pct'] if cfg else ee.DAILY_LOSS_LIMIT_PCT,
+                "daily_loss_limit_inr": day_start * (cfg['daily_loss_limit_pct'] if cfg else ee.DAILY_LOSS_LIMIT_PCT) / 100, "closed_trades": len(trades),
                 "closed_net_inr": closed, "usd_inr_rate": rate},
         positions=pos_out,
         intents=[{**dict(i), "created_at": us_iso(i["created_at_us"]), "updated_at": us_iso(i["updated_at_us"]),
@@ -382,7 +485,22 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
         events=[{"id": e["id"], "at": us_iso(e["at_us"]), "level": e["level"], "kind": e["kind"], "symbol": e["symbol"],
                  "detail": e["detail"]} for e in events if e["kind"] != "state"][:40],
         signals=(sigs := _signals() if with_market and with_signals else {}),
-        deployed_strategies=(dep := deployed_summary_view(sigs))["deployed"],
+        paper_account=account,
+        historical_session=bool(archived),
+        selected_paper_session_id=paper_session_id or (account or {}).get('session_id'),
+        evaluation_history=[{**dict(e),'bar_close':us_iso(e['bar_close_us']),
+                             'evaluated_at':us_iso(e['evaluated_at_us'])} for e in evaluation_history[:100]],
+        evaluation_offset=evaluation_offset, more_evaluations=len(evaluation_history)>100,
+        funding_history=[dict(r) for r in funding_history],
+        settlement_history=[dict(r) for r in settlement_history],
+        runner_evaluations={e['symbol']: {**dict(e), 'detail': json.loads(e['detail']),
+                            'evaluated_at': us_iso(e['evaluated_at_us']), 'bar_close': us_iso(e['bar_close_us']),
+                            'from_current_run': bool(session_start and e['evaluated_at_us'] >= session_start[0]),
+                            'source': 'runner journal'} for e in evaluations},
+        accounting_status='PENDING' if accounting else 'RECONCILED',
+        pending_funding=[dict(a) for a in accounting],
+        wallet_provisional=bool(accounting),
+        deployed_strategies=(dep := deployed_summary_view(sigs) if not archived else {'deployed':{}})["deployed"],
         deployed_summary=dep,
     )
     return _clean(base)
@@ -392,8 +510,83 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
 # Endpoints
 # --------------------------------------------------------------------------- #
 @router.get("/status")
-def bot_status() -> dict[str, Any]:
-    return read_status()
+def bot_status(paper_session_id: str | None = None, evaluation_offset: int = 0,
+               mode: Literal['paper','testnet','live'] | None = None) -> dict[str, Any]:
+    try:
+        if evaluation_offset < 0:
+            raise HTTPException(422, 'Evaluation offset must be nonnegative.')
+        return read_status(mode=mode, paper_session_id=paper_session_id, evaluation_offset=evaluation_offset)
+    except paper_accounts.AccountError as exc:
+        raise HTTPException(exc.status, exc.detail) from exc
+
+
+class PaperAccountRequest(BaseModel):
+    daily_loss_limit_pct: float
+    expected_session_id: str
+    expected_revision: int = Field(ge=0)
+    request_id: str = Field(pattern=r'^[A-Za-z0-9_-]{8,100}$')
+
+
+class NewPaperSessionRequest(PaperAccountRequest):
+    capital_inr: float
+    confirmed_equity_inr: float
+
+
+@router.get('/paper/sessions')
+def paper_sessions(paper_session_id: str | None = None) -> dict[str, Any]:
+    try:
+        catalog = paper_accounts.describe(mode_db('paper'))
+        archived = paper_accounts.archive(mode_db('paper'),paper_session_id) if paper_session_id else None
+        return _clean({**catalog, 'paper_account':paper_accounts.describe(archived) if archived else catalog,
+                       'historical_session':bool(archived)})
+    except paper_accounts.AccountError as exc:
+        raise HTTPException(exc.status, exc.detail) from exc
+
+
+@router.get('/process')
+def bot_process() -> dict[str, Any]:
+    return {**process_state(), 'checked_at':pd.Timestamp.now(tz='UTC').isoformat()}
+
+
+def _paper_account_operation(operation: str, req: PaperAccountRequest) -> dict[str, Any]:
+    with _op_lock:
+        lock = None
+        try:
+            process = process_state()
+            if process['state'] != 'stopped':
+                raise HTTPException(409, process['error'] or 'Stop Bot Process and wait for confirmed termination before changing Paper Account Settings.')
+            prev_info = lb.InstanceLock.read_info(PATHS['lock']) or {}
+            prev_pid = prev_info.get('pid') if prev_info.get('mode') in EXEC_MODES else None
+            lock = lb.InstanceLock(PATHS['lock'], 'paper-account-settings')
+            if prev_pid and int(prev_pid) != os.getpid() and _pid_alive(int(prev_pid)):
+                raise HTTPException(409, 'Runner lock released; waiting for process termination.')
+            result = paper_accounts.apply(mode_db('paper'), ee.BOT_PROFILES_FILE, PATHS['backups'],
+                                          operation, req.model_dump())
+            _cache.pop('signals',None)
+            return result
+        except (lb.BotAlreadyRunningError, ee.StateStoreLockedError) as exc:
+            raise HTTPException(409, 'Stop the runner and other paper journal writers before changing Paper Account Settings.') from exc
+        except paper_accounts.AccountError as exc:
+            raise HTTPException(exc.status, exc.detail) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if paper_accounts.pending_path(mode_db('paper')).exists():
+                raise HTTPException(503, 'Paper account operation is pending recovery. Retry the same operation in Paper Account Settings. Startup remains blocked.') from exc
+            raise HTTPException(422, f'Paper account operation failed before applying settings: {exc}') from exc
+        finally:
+            if lock is not None:
+                lock.release()
+
+
+@router.put('/paper/account/daily-loss')
+def update_paper_daily_loss(req: PaperAccountRequest) -> dict[str, Any]:
+    return _paper_account_operation('daily_limit',req)
+
+
+@router.post('/paper/sessions')
+def new_paper_session(req: NewPaperSessionRequest) -> dict[str, Any]:
+    return _paper_account_operation('new_session',req)
 
 
 SAVED_BACKTESTS_FILE = settings.data_path / "saved_backtests.json"
@@ -410,6 +603,7 @@ def _load_saved_results_for_deploy() -> list[dict[str, Any]]:
 
 
 class DeployStrategyRequest(BaseModel):
+    mode: Literal['paper','testnet','live'] | None = None
     result_id: str | None = None
     saved_result_id: str | None = None
     id: str | None = None
@@ -547,7 +741,11 @@ def get_deployed_strategies() -> dict[str, Any]:
 def deploy_strategy_to_bot(req: DeployStrategyRequest) -> dict[str, Any]:
     # Serialize the entire read/merge/normalize/write operation: concurrent
     # single-row clicks must not overwrite another symbol's completed deploy.
-    with _op_lock:
+    with _op_lock, dataset_lock(ee.BOT_PROFILES_FILE):
+        try:
+            paper_accounts.assert_ready(mode_db('paper'))
+        except paper_accounts.AccountError as exc:
+            raise HTTPException(exc.status,exc.detail) from exc
         return _deploy_strategy_to_bot(req)
 
 
@@ -582,43 +780,56 @@ def _deploy_strategy_to_bot(req: DeployStrategyRequest) -> dict[str, Any]:
         raw_profiles[entry["symbol"]] = entry
         deployed_symbols.append(entry["symbol"])
 
-    _validate_active_wallet(raw_profiles, deployed_symbols[-1])
+    paper_mode = (req.mode or status_mode()) == 'paper'
+    if paper_mode:
+        con = ro_conn('paper')
+        try:
+            wallet = con.execute('SELECT * FROM bot_config_state WHERE id=1').fetchone() if con else None
+            if wallet:
+                for sym in deployed_symbols:
+                    entry = raw_profiles[sym]
+                    cfg = ee.profile_config(ee._profile_from_dict(sym,entry))
+                    effective = asdict(cfg)
+                    effective.update(initial_capital_inr=wallet['capital_inr'],max_daily_loss_pct=wallet['daily_loss_limit_pct'])
+                    entry.update(capital_inr=wallet['capital_inr'],max_daily_loss_pct=wallet['daily_loss_limit_pct'],
+                                 daily_loss_limit_pct=wallet['daily_loss_limit_pct'],daily_loss_stop_pct=wallet['daily_loss_limit_pct'],
+                                 effective_config=effective,
+                                 paper_account_runtime_override={'capital_inr':wallet['capital_inr'],
+                                                                 'daily_loss_limit_pct':wallet['daily_loss_limit_pct']})
+        finally:
+            if con is not None: con.close()
+    _validate_active_wallet(raw_profiles, deployed_symbols[-1], use_paper_wallet=paper_mode)
     ee.save_bot_profiles_raw(raw_profiles)
     _cache.pop("signals", None)
     view = deployed_summary_view(_signals())
     return _clean({"ok": True, "deployed_symbols": deployed_symbols, **view})
 
 
-def _validate_active_wallet(raw_profiles: dict[str, Any], preferred_symbol: str | None = None) -> None:
-    """Normalize enabled profiles to the latest deploy's shared wallet only.
-
-    Preserve each symbol's strategy, sizing percentage and execution settings;
-    paused profiles are normalized when enabled. Never reset a journal wallet.
-    """
+def _validate_active_wallet(raw_profiles: dict[str, Any], preferred_symbol: str | None = None, *, use_paper_wallet: bool = True) -> None:
+    """Refuse incompatible deployments; never rewrite a persisted wallet or peers."""
     try:
         active = {sym: ee.profile_config(ee._profile_from_dict(sym, ov))
                   for sym, ov in raw_profiles.items() if ov.get("enabled", True)}
-        if not active:
-            return
-        anchor = preferred_symbol if preferred_symbol in active else max(
-            active, key=lambda sym: str(raw_profiles[sym].get("deployed_at") or ""))
-        latest = active[anchor]
-        wallet = dict(initial_capital_inr=latest.initial_capital_inr,
-                      usd_inr_rate=latest.usd_inr_rate, max_daily_loss_pct=latest.max_daily_loss_pct)
+        con = ro_conn("paper") if use_paper_wallet else None
+        try:
+            row = con.execute("SELECT * FROM bot_config_state WHERE id=1").fetchone() if con else None
+            wallet = ({"initial_capital_inr": row["capital_inr"], "usd_inr_rate": row["usd_inr_rate"],
+                       "max_daily_loss_pct": row["daily_loss_limit_pct"]} if row else None)
+        finally:
+            if con is not None:
+                con.close()
+        if wallet is None and active:
+            first = next(iter(active.values()))
+            wallet = {k: getattr(first, k) for k in
+                      ("initial_capital_inr", "usd_inr_rate", "max_daily_loss_pct")}
         for sym, cfg in active.items():
-            profile = raw_profiles[sym]
-            effective = asdict(cfg)
-            previous = {key: effective[key] for key in wallet}
-            effective.update(wallet)
-            # Revalidate before any on-disk mutation.
-            profile.update(effective_config=effective, capital_inr=latest.initial_capital_inr,
-                           usd_inr_rate=latest.usd_inr_rate, fx=latest.usd_inr_rate,
-                           max_daily_loss_pct=latest.max_daily_loss_pct,
-                           daily_loss_limit_pct=latest.max_daily_loss_pct,
-                           daily_loss_stop_pct=latest.max_daily_loss_pct)
-            ee.profile_config(ee._profile_from_dict(sym, profile))
-            if previous != wallet:
-                profile["wallet_normalization"] = {"source_symbol": anchor, "previous": previous, "wallet": wallet}
+            mismatches = {k: {"profile": getattr(cfg, k), "wallet": value}
+                          for k, value in wallet.items() if getattr(cfg, k) != value}
+            if mismatches:
+                raise HTTPException(409, {"code": "shared_wallet_mismatch", "symbol": sym,
+                    "mismatches": mismatches,
+                    "action": "Rerun/save with the existing paper wallet capital, FX and daily loss limit, "
+                              "then deploy. Deployment never changes shared wallet risk settings."})
     except (ValueError, TypeError) as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -627,7 +838,20 @@ class ToggleDeployedRequest(BaseModel):
     enabled: bool | None = None
 
 
+def _profile_mutation(fn):
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        with _op_lock, dataset_lock(ee.BOT_PROFILES_FILE):
+            try:
+                paper_accounts.assert_ready(mode_db('paper'))
+                return fn(*args, **kwargs)
+            except paper_accounts.AccountError as exc:
+                raise HTTPException(exc.status,exc.detail) from exc
+    return guarded
+
+
 @router.put("/deployed/{symbol}/toggle")
+@_profile_mutation
 def toggle_deployed_strategy(symbol: str, req: ToggleDeployedRequest | None = None) -> dict[str, Any]:
     sym = symbol.strip().upper()
     raw_profiles = ee.load_bot_profiles_raw()
@@ -637,7 +861,7 @@ def toggle_deployed_strategy(symbol: str, req: ToggleDeployedRequest | None = No
     new_state = (not cur) if (req is None or req.enabled is None) else bool(req.enabled)
     raw_profiles[sym]["enabled"] = new_state
     if new_state:
-        _validate_active_wallet(raw_profiles, sym)
+        _validate_active_wallet(raw_profiles, sym, use_paper_wallet=True)
     ee.save_bot_profiles_raw(raw_profiles)
     _cache.pop("signals", None)
     view = deployed_summary_view(_signals())
@@ -645,6 +869,7 @@ def toggle_deployed_strategy(symbol: str, req: ToggleDeployedRequest | None = No
 
 
 @router.delete("/deployed/{symbol}")
+@_profile_mutation
 def undeploy_strategy(symbol: str) -> dict[str, Any]:
     sym = symbol.strip().upper()
     raw_profiles = ee.load_bot_profiles_raw()
@@ -661,6 +886,7 @@ def undeploy_strategy(symbol: str) -> dict[str, Any]:
 
 
 @router.delete("/deployed")
+@_profile_mutation
 def clear_all_deployed_strategies() -> dict[str, Any]:
     ee.save_bot_profiles_raw({})
     _cache.pop("signals", None)
@@ -689,9 +915,32 @@ def _journal_mode(mode: str | None = None) -> str | None:
         con.close()
 
 
+class BotActionRequest(BaseModel):
+    mode: Literal["paper", "testnet", "live"] | None = None
+    paper_session_id: str | None = None
+
+
+def _action_target(req: BotActionRequest | None, *, paper_only: bool = False) -> str:
+    if req and req.paper_session_id:
+        raise HTTPException(409, "Archived paper session is read-only. Select Active paper account.")
+    run, info = runner()
+    active_runner_mode = (info or {}).get("mode") if run and (info or {}).get("mode") in EXEC_MODES else None
+    requested = req.mode if (req and req.mode in EXEC_MODES) else None
+    if active_runner_mode and requested and requested != active_runner_mode:
+        raise HTTPException(
+            409,
+            f"Runner is active in {active_runner_mode.upper()} mode; switch Bot Operations mode to {active_runner_mode.upper()} or stop the runner first.",
+        )
+    target = requested or active_runner_mode or "paper"
+    if paper_only and target != "paper":
+        raise HTTPException(409, f"Run 1 Cycle is paper-only (selected mode: {target}).")
+    return target
+
+
 @router.post("/step")
-def bot_step() -> dict[str, Any]:
+def bot_step(req: BotActionRequest | None = None) -> dict[str, Any]:
     """One synchronous reconciliation + signal evaluation cycle (paper), only when no loop is running."""
+    _action_target(req, paper_only=True)
     with _op_lock:
         if runner()[0]:
             raise HTTPException(409, "a bot loop holds live_bot.lock; it is already evaluating every closed bar")
@@ -714,20 +963,28 @@ def bot_step() -> dict[str, Any]:
 
 class StartRequest(BaseModel):
     mode: Literal["paper", "testnet", "live"] = "paper"
+    paper_session_id: str | None = None
 
 
 @router.post("/start")
 def bot_start(req: StartRequest | None = None) -> dict[str, Any]:
     global _proc, _proc_log, _proc_bot_pid
+    if req and req.paper_session_id:
+        raise HTTPException(409, "Archived paper session is read-only. Select Active paper account.")
     mode = (req or StartRequest()).mode
     if (why := lb.auto_bot_live_refusal(mode)) is not None:
         raise HTTPException(403, f"live auto-bot refused: {why}")
     if mode == "testnet" and not (settings.TESTNET_API_KEY and settings.TESTNET_API_SECRET):
         raise HTTPException(400, "testnet mode needs DELTA_TESTNET_API_KEY / DELTA_TESTNET_API_SECRET in .env")
-    with _op_lock:
+    with _startup_operation():
         run, info = runner()
         if run:
             raise HTTPException(409, f"a bot runner already holds live_bot.lock: {info}")
+        if mode == 'paper':
+            try:
+                paper_accounts.assert_ready(mode_db('paper'))
+            except paper_accounts.AccountError as exc:
+                raise HTTPException(exc.status,exc.detail) from exc
         jm = _journal_mode(mode)
         if jm not in (None, mode):
             raise HTTPException(409, f"journal {mode_db(mode).name} is bound to mode {jm!r}, not {mode!r}")
@@ -765,11 +1022,23 @@ def _send(cmd: str, timeout: float, args: dict[str, Any] | None = None) -> dict[
 
 
 @router.post("/stop")
-def bot_stop() -> dict[str, Any]:
+def bot_stop(req: BotActionRequest | None = None) -> dict[str, Any]:
+    if req and req.paper_session_id:
+        raise HTTPException(409, "Archived paper session is read-only. Select Active paper account.")
+    _stopping.set()
+    try:
+        return _stop_runner()
+    finally:
+        _stopping.clear()
+
+
+def _stop_runner() -> dict[str, Any]:
     global _proc
     run, info = runner()
     if not run:
-        return {"stopped": False, "reason": "no bot runner is active"}
+        process = process_state()
+        return {'stopped':process['state']=='stopped','process':process,
+                'reason':process['error'] or 'no bot runner is active'}
     forced = False
     try:
         ack = _send("stop", 20)
@@ -798,15 +1067,20 @@ def bot_stop() -> dict[str, Any]:
         except subprocess.TimeoutExpired:
             _proc.kill()
     released = not runner()[0]
-    return {"stopped": released, "pid": (info or {}).get("pid"), "ack": ack, "forced_terminate": forced, "exit_code": code,
+    process = process_state()
+    for _ in range(30):
+        if process['state'] != 'stopping': break
+        time.sleep(.1)
+        process = process_state()
+    return {"stopped": process['state']=='stopped', 'process':process, "pid": (info or {}).get("pid"), "ack": ack, "forced_terminate": forced, "exit_code": code,
             "lock_released": released, "note": "exchange-resident SL/TP orders are left in place"}
 
 
-def _toggle_pause(paused: bool) -> dict[str, Any]:
+def _toggle_pause(paused: bool, req: BotActionRequest | None = None) -> dict[str, Any]:
+    m = _action_target(req)
     if runner()[0]:
-        return {"via": "control_channel", **_send("pause" if paused else "resume", 15)}
+        return {"via": "control_channel", "mode": m, **_send("pause" if paused else "resume", 15)}
     with _op_lock:
-        m = status_mode()
         store = ee.StateStore(mode_db(m))
         try:
             if store.config() is None:
@@ -819,25 +1093,26 @@ def _toggle_pause(paused: bool) -> dict[str, Any]:
             store.close()
     notifier(m).notify_bot_lifecycle("Pause" if paused else "Resume", None, "STOPPED",
                                      "new entries paused" if paused else "new entries allowed")
-    return {"via": "journal", "ok": True, "entries_paused": paused}
+    return {"via": "journal", "ok": True, "mode": m, "entries_paused": paused}
 
 
 @router.post("/pause")
-def bot_pause() -> dict[str, Any]:
-    return _toggle_pause(True)
+def bot_pause(req: BotActionRequest | None = None) -> dict[str, Any]:
+    return _toggle_pause(True, req)
 
 
 @router.post("/resume")
-def bot_resume() -> dict[str, Any]:
-    return _toggle_pause(False)
+def bot_resume(req: BotActionRequest | None = None) -> dict[str, Any]:
+    return _toggle_pause(False, req)
 
 
 @router.post("/flatten")
-def bot_flatten() -> dict[str, Any]:
+def bot_flatten(req: BotActionRequest | None = None) -> dict[str, Any]:
+    target = _action_target(req)
     if runner()[0]:
-        return _clean({"via": "control_channel", **_send("flatten", 90, {"reason": "MANUAL_FLATTEN"})})
+        return _clean({"via": "control_channel", "mode": target, **_send("flatten", 90, {"reason": "MANUAL_FLATTEN"})})
     with _op_lock:
-        jm = _journal_mode(status_mode()) or status_mode()
+        jm = _journal_mode(target) or target
         if jm == "live" and not settings.is_live:
             raise HTTPException(403, "journal is live but live trading is disabled")
         bot = _runner(jm)
@@ -845,18 +1120,20 @@ def bot_flatten() -> dict[str, Any]:
             rep = bot.emergency_flatten_all("MANUAL_FLATTEN")
         finally:
             bot.close()
-    return _clean({"via": "direct", **rep})
+    return _clean({"via": "direct", "mode": jm, **rep})
 
 
 @router.post("/backup")
-def bot_backup() -> dict[str, Any]:
-    db = mode_db(status_mode())
+def bot_backup(req: BotActionRequest | None = None) -> dict[str, Any]:
+    target = _action_target(req)
+    db = mode_db(target)
     if not db.exists():
         raise HTTPException(404, f"{db} does not exist yet (run a cycle first)")
-    return _clean(backup_state.backup(db, PATHS["backups"]))
+    return _clean({"mode": target, **backup_state.backup(db, PATHS["backups"])})
 
 
 @router.post("/test-telegram")
-def bot_test_telegram() -> dict[str, Any]:
-    rec = notifier().send_test()
-    return {"status": rec["status"], "error": rec.get("error"), "text": rec.get("text")}
+def bot_test_telegram(req: BotActionRequest | None = None) -> dict[str, Any]:
+    target = _action_target(req)
+    rec = notifier(target).send_test()
+    return {"status": rec["status"], "mode": target, "error": rec.get("error"), "text": rec.get("text")}

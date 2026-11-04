@@ -40,13 +40,51 @@ While a loop runs, it is the **only writer** of its journal. The dashboard sends
 - **Starting up:** the bot moves through `BOOTING → CONNECTING → AUTHENTICATING → SUBSCRIBING → SNAPSHOTTING → RECONCILING → OBSERVED_READY`, and enters new trades only in `OBSERVED_READY` with no halt and no pause.
 - **Subscriptions are checked per channel and symbol.** If any required public subscription is rejected or never acknowledged, the socket phase is `DEGRADED_REST_FALLBACK` (never `READY`) and the bot runs on its REST candle/quote fallback. In testnet/live, missing private channels (`orders`, `positions`, `v2/user_trades`) keep the bot `DEGRADED`: no new entries.
 - **Every reconciliation (testnet/live)** also: resolves unknown order outcomes, books partial / resting fills, applies the account policy (isolated margin + 10x, confirmed by Delta's answer; a product holding a position at another leverage is left alone and blocked for bot entries until flat), and confirms each position's SL/TP legs (same product, opposite side, reduce-only, size = position, stop on the right side of the price). Unconfirmed protection → `DEGRADED` with `missing_confirmed_protection:<symbol>`; a missing leg is re-attached at most every 5 minutes, in between it is only read back.
+- **PAPER readiness recovery:** after a degraded synchronization, completed-candle processing and the REST poller retry full reconciliation at most once per minute, including when healthy WebSocket candles mean no REST fallback rows are needed. Every deployed/managed symbol must have current history; missing symbols/data remain blocking. Transport recovery, unresolved intents and other readiness checks are not bypassed. Recovery observations cannot place historical orders.
 - **Daily-loss baseline:** the 00:00 UTC equity (including open positions marked to market) is saved in the journal (`system_meta`), so a restart later the same day keeps the same 5% breaker baseline.
 - **Each closed 1m bar:** trailing stop, exits and funding.
-- **Each 1h close:** the frozen signals (ETHUSD Variant C, BTCUSD Variant D). An entry is acted on only within 5 minutes of the close.
+- **Each deployed timeframe close:** evaluate closed bars causally. An entry is eligible only within 5 minutes and before the next strategy candle closes. Restart/reconciliation catch-up records missed evaluations in order but never submits historical signals as new orders.
+- **Evaluation evidence:** Bot Operations shows recorded runner evaluations separately from dashboard recalculations. The journal's `signal_evaluations` records candle identity, configuration hash/snapshot, signal, decision, refusal reason and time. A processed/refused signal is not an order; order intents remain authoritative. Interrupted decisions stay visible and are not automatically retried.
+- **Shared paper wallet:** Paper deployments inherit the active journal's capital and daily-loss percentage. Strategy, sizing, leverage and FX remain unchanged; incompatible FX still returns HTTP 409 before profiles are saved. Deployment never changes the wallet's risk settings. Testnet/live deployments do not inherit Paper settings.
+- **Settlement accounting:** missing historical funding or prior-minute MARK creates a durable `funding_settlements` obligation. Protective management continues; wallet P&L is provisional and new automatic entries are blocked. Synchronization retries booking when the exact historical inputs arrive, including after a position closes. Charges are idempotent; current ticks never substitute for missing historical settlement inputs.
 - **One instance only:** a second instance is refused (`BotAlreadyRunningError`).
 - **Keeping it running:** to survive reboots, run the `--loop` command from Windows Task Scheduler ("At startup", "Restart on failure"), or start it from the dashboard. Use one or the other.
 
 ## 3. `.env` configuration
+
+### Paper Account Settings
+
+Open **Bot Operations**, select **Paper**, and use the **Paper Account Settings** card. Applied values come from the persisted wallet; editable drafts and their calculated allowances are shown separately. The daily allowance uses the persisted UTC daily opening equity (initial capital only before a daily baseline exists).
+
+The selected Bot Operations mode is independent of Manual Trade's mode and of the running process. Stopping Paper never switches this screen to another journal. Persisted account/session information (`/api/bot/paper/sessions`) and process verification (`/api/bot/process`) load independently of runtime status or market synchronization. The card remains visible before startup, after stop, on hard refresh, and when runtime status fails.
+
+Runner `RUNNING`/`STOPPING`/`STOPPED`/`UNKNOWN` and account `HALTED` are separate facts. A halt does not imply process exit. Mutations require verified `STOPPED`; unknown process state fails closed and displays the verification error. Stop waits for actual process termination, then the UI refreshes eligibility without reloading the page. Positions, unresolved order intents and funding obligations are shown as specific blockers.
+
+Draft inputs survive polling and failed API calls. If the applied session/revision changes while editing, saving is blocked; use **Reload Applied Values**, review the new settings and edit again. On first launch with no journal, enter both values and use **Start New Paper Session** to initialize a stopped account without running a strategy or synchronizing market data.
+
+- **Update Daily Loss Limit** updates the wallet and every deployed runtime profile, including paused profiles. It preserves capital, FX, balance, daily baseline, trades, evaluations and the existing halt. Saving a larger limit does not resume a halted session.
+- **Start New Paper Session** confirms the old equity and new capital, creates a fresh account with the entered capital/percentage, and leaves it **stopped**. Start the runner manually when ready. Strategy parameters, leverage, sizing and saved backtests are preserved.
+- Both operations require a stopped runner, no positions, no nonterminal order intents and no unresolved settlement funding. The API fences runner startup and other journal/profile writers. The journal and profiles are backed up consistently before changes.
+- The **Session** selector opens archived journals read-only in this screen, including trades, recorded evaluations (paged) and funding accounting. Archives retain the complete old SQLite journal, configuration, fills and events. Keep `data/backups/` and `data/paper_sessions/` with the active DB and profiles when backing up.
+- A failed partial update is fail-closed: startup and profile changes remain blocked. **Retry pending operation** replays the same request ID/settings and completes recovery without another reset or duplicate session. Do not delete recovery files manually.
+
+Offline verification (temporary journals, no `.env`, external HTTP blocked):
+
+```powershell
+.venv\Scripts\python.exe -B verify_paper_runtime.py
+.venv\Scripts\python.exe -B verify_paper_runtime.py --existing
+node --check static/app.js
+node test_paper_account_settings_ui.js
+node test_paper_account_lifecycle_ui.js
+node test_paper_runtime_ui.js
+node test_btc_paper_preset.js
+node test_paper_account_browser.js
+node test_paper_account_browser.js --empty
+```
+
+The last two checks launch installed headless Chrome/Edge with a disposable browser profile and a temporary API/account. They exercise served HTML, CSS, JavaScript, the normal stop control channel, settings persistence, new-session creation and archived viewing. The fixture process only holds a lifecycle lock; it never runs market/order logic. Screenshots/results go to the system temporary directory, outside Git. These browser tests do not establish live signal-to-fill behavior.
+
+The audited five-trade session remains historical evidence. Its forced exits used cached prices; they are not independently verified executable market fills. Account settings and synthetic regressions do not remove that limitation.
 
 Copy `.env.example` to `.env` (same folder). `.env` holds secrets: never commit or share it.
 

@@ -205,10 +205,15 @@ def load_bot_profiles_raw() -> dict[str, dict[str, Any]]:
 
 
 def save_bot_profiles_raw(data: dict[str, dict[str, Any]]) -> None:
-    BOT_PROFILES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = BOT_PROFILES_FILE.with_name(BOT_PROFILES_FILE.name + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, BOT_PROFILES_FILE)
+    from dataset_lock import dataset_lock
+    import paper_accounts
+    with dataset_lock(BOT_PROFILES_FILE):
+        if any(BOT_PROFILES_FILE.parent.glob('*.paper-account-pending.json')):
+            raise paper_accounts.AccountError(409, 'Paper account recovery is pending; retry it before changing profiles.')
+        BOT_PROFILES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BOT_PROFILES_FILE.with_name(BOT_PROFILES_FILE.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, BOT_PROFILES_FILE)
 
 
 def all_deployed_profiles() -> dict[str, StrategyProfile]:
@@ -431,6 +436,22 @@ CREATE TABLE IF NOT EXISTS symbol_state (
     last_signal_bar_us INTEGER, cooldown_until_us INTEGER,
     PRIMARY KEY (mode, symbol)
 );
+CREATE TABLE IF NOT EXISTS signal_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mode TEXT NOT NULL, symbol TEXT NOT NULL, bar_open_us INTEGER NOT NULL,
+    bar_close_us INTEGER NOT NULL, evaluated_at_us INTEGER NOT NULL,
+    strategy TEXT NOT NULL, config_id TEXT NOT NULL, config_json TEXT NOT NULL,
+    raw_signal INTEGER, decision TEXT NOT NULL, skip_reason TEXT,
+    intent_id TEXT, detail TEXT NOT NULL,
+    UNIQUE(mode, symbol, bar_close_us, config_id)
+);
+CREATE TABLE IF NOT EXISTS funding_settlements (
+    mode TEXT NOT NULL, symbol TEXT NOT NULL, intent_id TEXT NOT NULL, at_us INTEGER NOT NULL,
+    side TEXT NOT NULL, contracts INTEGER NOT NULL, contract_value REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING', reason TEXT, rate REAL, mark_price REAL,
+    cashflow_usd REAL, booked_at_us INTEGER,
+    PRIMARY KEY(mode, symbol, intent_id, at_us)
+);
 CREATE TABLE IF NOT EXISTS booked_fills (
     fill_id TEXT PRIMARY KEY, intent_id TEXT, order_id TEXT, symbol TEXT, role TEXT, side TEXT,
     size INTEGER, price REAL, fee_usd REAL, created_at TEXT
@@ -446,11 +467,16 @@ CREATE TABLE IF NOT EXISTS events (
 class StateStore:
     def __init__(self, path: Path | str, clock: Callable[[], int] = now_us):
         self.path = Path(path)
+        import paper_accounts
+        paper_accounts.assert_ready(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.clock = clock
         self._lock = _ProcessLock(self.path.with_name(self.path.name + ".lock"))
         self._tx_depth = 0
         try:
+            # Recheck after acquiring the writer fence: a recoverable account
+            # operation may have begun after the optimistic check above.
+            paper_accounts.assert_ready(self.path)
             # check_same_thread=False: the runner offloads REST work to worker threads (it serialises access itself)
             self.conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=10, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
@@ -917,6 +943,10 @@ def evaluate_symbol(profile: StrategyProfile, hist: pd.DataFrame, at: pd.Timesta
         "gate_threshold": float(GATE_MULT * gate["rt_cost_frac"].iloc[-1]), "cost_gate_pass": bool(gate["allow"].iloc[-1]),
         "cond_long": bool(out["cond_long"].iloc[-1]), "cond_short": bool(out["cond_short"].iloc[-1]),
         "signal": s, "fresh_signal": s != 0, "signal_side": {1: "LONG", -1: "SHORT"}.get(s), "n_bars": len(bars),
+        "raw_signal": int(out['signal'].iloc[-1]),
+        "entry_filters": {'cost_gate_enabled':profile.cost_gate, 'cost_gate_pass':bool(gate['allow'].iloc[-1]),
+                          'trend_4h_enabled':profile.trend_filter_4h,
+                          'trend_long_pass':bool(tr['allow_long']), 'trend_short_pass':bool(tr['allow_short'])},
         "signals_total": int((sig != 0).sum()),
     }
 
@@ -952,6 +982,15 @@ class ExecutionEngine:
         self.store, self.mode, self.client, self.clock, self.profiles, self.sleep = store, mode, client, clock, profiles, sleep
         self.notifier = notifier if notifier is not None else TelegramNotifier.from_settings(mode)
         self.cfg_row = store.init_config(mode, profiles)
+        # A process can die between durable evaluation evidence and its final
+        # decision. Do not treat that record as a fresh signal after restart.
+        with store.tx() as cx:
+            cx.execute("UPDATE signal_evaluations SET decision='interrupted', "
+                       "skip_reason='previous run interrupted; inspect linked order intent before retrying', "
+                       "intent_id=(SELECT intent_id FROM order_intents i WHERE i.mode=signal_evaluations.mode "
+                       "AND i.symbol=signal_evaluations.symbol AND i.signal_bar_us=signal_evaluations.bar_open_us "
+                       "AND i.role='ENTRY' ORDER BY i.created_at_us DESC LIMIT 1) "
+                       "WHERE mode=? AND decision='evaluating'", (mode,))
         self.rate = float(self.cfg_row["usd_inr_rate"])
         if mode == "paper":
             self.products = products or {s: ProductSpec.from_metadata(s) for s in profiles}
@@ -1058,6 +1097,8 @@ class ExecutionEngine:
         if self.entries_paused():
             self._event("INFO", "entry_paused", symbol, {"signal_bar": to_ts(signal_bar_us)})
             return {"action": "skip", "reason": "entries paused"}
+        if self.pending_funding():
+            return {"action": "skip", "reason": "unresolved settlement funding; restore historical funding/MARK data and reconcile"}
         if (b := self.symbol_blocked(symbol)) is not None:
             self._event("WARN", "entry_blocked", symbol, b)
             return {"action": "skip", "reason": f"blocked: {b}"}
@@ -1517,26 +1558,108 @@ class ExecutionEngine:
         self.store.update_position(self.mode, symbol, sl_price=confirmed)
         return {"sl_price": confirmed, "order": o}
 
+    def pending_funding(self) -> list[sqlite3.Row]:
+        return self.store.q("SELECT * FROM funding_settlements WHERE mode=? AND status='PENDING' ORDER BY at_us",
+                            (self.mode,))
+
+    def _book_funding(self, settlement: sqlite3.Row, rate: float | None, mark: float | None) -> bool:
+        """Resolve an immutable exposure snapshot, even after its position has closed.
+
+        The status change, funding event and wallet/closed-trade adjustments are
+        one transaction. Retrying after a crash/restart cannot charge twice.
+        """
+        if rate is None or mark is None or not math.isfinite(rate) or not math.isfinite(mark) or mark <= 0:
+            return False
+        key = (self.mode, settlement['symbol'], settlement['intent_id'], settlement['at_us'])
+        with self.store.tx() as cx:
+            row = cx.execute("SELECT * FROM funding_settlements WHERE mode=? AND symbol=? AND intent_id=? AND at_us=?", key).fetchone()
+            if row['status'] == 'BOOKED':
+                return False
+            trades = cx.execute("SELECT * FROM trade_history WHERE mode=? AND symbol=? AND entry_intent_id=? "
+                                "AND closed_at_us>=? ORDER BY trade_id", key).fetchall()
+            pos = self.store.position(self.mode, row['symbol'])
+            if pos is not None and pos['intent_id'] != row['intent_id']:
+                pos = None
+            capacity = sum(t['contracts'] for t in trades) + (pos['contracts'] if pos else 0)
+            if capacity < row['contracts']:
+                cx.execute("UPDATE funding_settlements SET reason='exposure allocation unavailable' "
+                           "WHERE mode=? AND symbol=? AND intent_id=? AND at_us=?", key)
+                return False
+            unit_cash = (-1 if row['side'] == 'LONG' else 1) * row['contract_value'] * mark * rate
+            remaining = row['contracts']
+            for trade in trades:
+                count = min(remaining, trade['contracts'])
+                cash = count * unit_cash
+                fx = trade['usd_inr_rate']
+                cx.execute("UPDATE trade_history SET funding_usd=funding_usd+?, funding_inr=funding_inr+?, "
+                           "net_pnl_usd=net_pnl_usd+?, net_pnl_inr=net_pnl_inr+? WHERE trade_id=?",
+                           (cash, cash*fx, cash, cash*fx, trade['trade_id']))
+                remaining -= count
+                if not remaining:
+                    break
+            if remaining:
+                cash = remaining * unit_cash
+                cx.execute("UPDATE open_positions SET realized_funding_usd=realized_funding_usd+? WHERE mode=? AND symbol=?",
+                           (cash, self.mode, row['symbol']))
+            cash = row['contracts'] * unit_cash
+            cx.execute("UPDATE trade_history SET equity_after_inr=equity_after_inr+? WHERE mode=? AND closed_at_us>=?",
+                       (cash*self.rate, self.mode, row['at_us']))
+            anchor_date = self.store.meta_get('utc_day_anchor_date')
+            anchor_usd = self.store.meta_get('utc_day_start_equity_usd')
+            if anchor_date and anchor_usd is not None and pd.Timestamp(anchor_date, tz='UTC').value//1000 > row['at_us']:
+                # A prior day's delayed charge belongs in today's opening equity,
+                # rather than masquerading as a new loss against today's breaker.
+                self.store.meta_set(utc_day_start_equity_usd=float(anchor_usd)+cash)
+            cx.execute("INSERT INTO funding_events(mode,symbol,at_us,rate,mark_price,contracts,cashflow_usd) VALUES(?,?,?,?,?,?,?)",
+                       (self.mode,row['symbol'],row['at_us'],rate,mark,row['contracts'],cash))
+            cx.execute("UPDATE funding_settlements SET status='BOOKED',reason=NULL,rate=?,mark_price=?,cashflow_usd=?,booked_at_us=? "
+                       "WHERE mode=? AND symbol=? AND intent_id=? AND at_us=?", (rate,mark,cash,self.clock(),*key))
+            self._event('INFO', 'funding_resolved', row['symbol'], {'at_us':row['at_us'],'cashflow_usd':cash})
+        return True
+
+    def _funding_due(self, p: sqlite3.Row, at_us: int, rate: float | None, mark: float | None) -> None:
+        with self.store.tx() as cx:
+            cur = cx.execute("INSERT OR IGNORE INTO funding_settlements(mode,symbol,intent_id,at_us,side,contracts,contract_value,reason) "
+                             "VALUES(?,?,?,?,?,?,?,'settlement funding or prior-minute MARK unavailable')",
+                             (self.mode,p['symbol'],p['intent_id'],at_us,p['side'],p['contracts'],p['contract_value']))
+            row = cx.execute("SELECT * FROM funding_settlements WHERE mode=? AND symbol=? AND intent_id=? AND at_us=?",
+                             (self.mode,p['symbol'],p['intent_id'],at_us)).fetchone()
+            if row['status'] == 'PENDING' and not self._book_funding(row, rate, mark) and cur.rowcount:
+                self._event('WARN','funding_pending',p['symbol'],{'at_us':at_us,'reason':row['reason']})
+
+    def retry_funding(self, inputs: Callable) -> int:
+        booked = 0
+        for row in self.pending_funding():
+            try:
+                rate, mark = inputs(row['symbol'], row['at_us']//1_000_000)
+                booked += self._book_funding(row, rate, mark)
+            except Exception as exc:
+                self._event('WARN','funding_retry_failed',row['symbol'],str(exc))
+        return booked
+
     def on_bar(self, symbol: str, bar_us: int, o: float, h: float, l: float, c: float,
                funding_rate: float | None = None, mark_close: float | None = None,
                mark: float | None = None) -> dict[str, Any] | None:
         """Process one CLOSED 1m trade candle for an open position (backtester semantics):
         funding at 8h boundaries, SL-first exits (paper only), then trail from the NEXT candle on.
         ``funding_rate`` / ``mark_close`` are the settlement inputs: the values of the minute BEFORE bar_us."""
+        for row in self.pending_funding():
+            if row['symbol'] == symbol and row['at_us'] == bar_us:
+                self._book_funding(row, funding_rate, mark_close)
         p = self.store.position(self.mode, symbol)
         if p is None or bar_us <= p["last_bar_us"]:
             return None
         d = 1 if p["side"] == "LONG" else -1
         product = self.ensure_product(symbol)
         t_s = bar_us // 1_000_000
-        have_funding = funding_rate is not None and mark_close is not None and not (math.isnan(funding_rate) or math.isnan(mark_close))
-        if t_s % dm.FUNDING_INTERVAL_SECONDS == 0 and bar_us > p["opened_at_us"] and have_funding:
-            cash = -d * p["contracts"] * p["contract_value"] * mark_close * funding_rate
-            with self.store.tx() as cx:
-                cx.execute("UPDATE open_positions SET realized_funding_usd = realized_funding_usd + ? WHERE mode=? AND symbol=?",
-                           (cash, self.mode, symbol))
-                cx.execute("INSERT INTO funding_events (mode, symbol, at_us, rate, mark_price, contracts, cashflow_usd) "
-                           "VALUES (?,?,?,?,?,?,?)", (self.mode, symbol, bar_us, funding_rate, mark_close, p["contracts"], cash))
+        interval = dm.FUNDING_INTERVAL_SECONDS * 1_000_000
+        first = max(p['last_bar_us'], p['opened_at_us']) // interval + 1
+        for settlement_us in range(first * interval, (bar_us // interval) * interval + 1, interval):
+            # A gap over a settlement minute is an accounting obligation too.
+            # Current candle inputs must never stand in for an older settlement.
+            self._funding_due(p, settlement_us,
+                              funding_rate if settlement_us == bar_us else None,
+                              mark_close if settlement_us == bar_us else None)
             p = self.store.position(self.mode, symbol)
         sl = None if p["sl_price"] is None else float(p["sl_price"])
         tp = None if p["tp_price"] is None else float(p["tp_price"])
@@ -1657,14 +1780,11 @@ class ExecutionEngine:
         if p is None or t_us <= p["last_bar_us"]:
             return None
         b_us = (t_us // 1_000_000 // dm.FUNDING_INTERVAL_SECONDS) * dm.FUNDING_INTERVAL_SECONDS * 1_000_000
-        if b_us > p["last_bar_us"] and b_us > p["opened_at_us"] and funding_rate is not None and mark:
-            d = 1 if p["side"] == "LONG" else -1
-            cash = -d * p["contracts"] * p["contract_value"] * mark * funding_rate
-            with self.store.tx() as cx:
-                cx.execute("UPDATE open_positions SET realized_funding_usd = realized_funding_usd + ? WHERE mode=? AND symbol=?",
-                           (cash, self.mode, symbol))
-                cx.execute("INSERT INTO funding_events (mode, symbol, at_us, rate, mark_price, contracts, cashflow_usd) "
-                           "VALUES (?,?,?,?,?,?,?)", (self.mode, symbol, b_us, funding_rate, mark, p["contracts"], cash))
+        first = max(p['last_bar_us'], p['opened_at_us']) // (dm.FUNDING_INTERVAL_SECONDS*1_000_000)
+        for boundary in range((first+1)*dm.FUNDING_INTERVAL_SECONDS*1_000_000,
+                              b_us+1,dm.FUNDING_INTERVAL_SECONDS*1_000_000):
+            # A present-day tick is not the historical prior-minute settlement mark.
+            self._funding_due(p,boundary,None,None)
         return self.on_bar(symbol, t_us, last, last, last, last, None, None, mark=mark)
 
     # -- manual trading (Step 8) ----------------------------------------------------------- #

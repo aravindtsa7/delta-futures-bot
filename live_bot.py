@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+from dataclasses import asdict
 import functools
 import json
 import logging
@@ -245,11 +247,14 @@ class RestMarketData:
         return self._hist[sym]
 
     def evaluate(self, sym: str, hour_close_s: int | None = None) -> dict[str, Any] | None:
-        self.sync([sym])
+        h = self._hist.get(sym)
+        if hour_close_s is None or h is None or h.empty or int(h.index[-1].timestamp()) < hour_close_s - 60:
+            self.sync([sym])
         h = self._hist.get(sym)
         if h is None or len(h) == 0:
             return None  # no_data -> FLAT
-        s = ee.evaluate_symbol(self.profiles[sym], h)
+        at = pd.Timestamp(hour_close_s, unit='s', tz='UTC') if hour_close_s is not None else None
+        s = ee.evaluate_symbol(self.profiles[sym], h, at=at)
         if hour_close_s is not None and int(s["bar_close"].value // 10**9) != hour_close_s:
             return None  # REST has not published that hour yet
         return s
@@ -323,13 +328,15 @@ class LiveBotRunner:
         self.transitions: list[dict[str, Any]] = [{"t": clock(), "from": None, "to": "BOOTING", "reason": "init"}]
         self.last_minute: dict[str, int] = {}
         self.last_close: dict[str, float] = {}
-        self.pending_hour: dict[str, int] = {}
+        self.pending_hour: dict[str, list[int]] = {}
+        self.recovery_closes: set[tuple[str, int]] = set()
         self.last_eval: dict[str, dict[str, Any]] = {}
         self.entries: list[dict[str, Any]] = []
         self.blocked_signals: list[dict[str, Any]] = []
         self.actions: list[dict[str, Any]] = []
         self.minute_gaps = 0
         self.reconciliations: list[dict[str, Any]] = []
+        self._last_readiness_attempt = float('-inf')
         self.disconnects_since_ready = 0
         self.day: int | None = None
         self.day_start_equity: float | None = None
@@ -447,6 +454,7 @@ class LiveBotRunner:
     # -- reconciliation ---------------------------------------------------------------- #
     @_locked
     def run_reconciliation(self, reason: str) -> dict[str, Any]:
+        self._last_readiness_attempt = self.clock()
         self.transition("RECONCILING", reason)
         now = int(self.clock())
         summary: dict[str, Any] = {"reason": reason, "ws_generation": self.ws.generation, "at": now, "issues": []}
@@ -496,21 +504,28 @@ class LiveBotRunner:
             except ExchangeError as exc:
                 issues.append(f"account_policy_failed: {exc}")
         cov = self.market.sync(self.symbols)
+        self.engine.retry_funding(self.market.funding_inputs)
+        # Synchronization can take minutes. Never declare freshness using its start time.
+        now = int(self.clock())
+        summary['at'] = now
         summary["data"] = cov
         latest_closed = now - now % 60 - 60
         self.data_blocked = {}
         summary["data_warnings"] = []
-        for sym, c in cov.items():
+        # Every subscribed/deployed or managed symbol is required. A partial
+        # sync response must not silently certify the rest of the roster.
+        for sym in self.symbols:
+            c = cov.setdefault(sym, {'status':'no_data', 'gaps':{}})
+            if c.get('last_1m') is None:
+                issues.append(f'{sym}: required history unavailable')
+                continue
             if any(c["gaps"].values()):  # thin coins have minutes without trades: warn, do not block
                 summary["data_warnings"].append(f"{sym}: historical 1m gaps {c['gaps']}")
             if c["last_1m"] < latest_closed - 60:
                 why = f"{sym}: history ends {to_utc(c['last_1m'])}, expected >= {to_utc(latest_closed - 60)}"
-                if sym in ee.FROZEN_PROFILES:
-                    issues.append(why)
-                else:  # an added coin with stale data blocks only its own entries
-                    self.data_blocked[sym] = why
-                    summary["data_warnings"].append(why + " (entries on this symbol blocked)")
-        self._catch_up(cov)
+                self.data_blocked[sym] = why
+                issues.append(why)
+        self._catch_up({sym:c for sym,c in cov.items() if c.get('last_1m') is not None})
         self.reconciliations.append(summary)
         if issues:
             self.transition("DEGRADED", "; ".join(issues))
@@ -522,9 +537,46 @@ class LiveBotRunner:
             for sym in list(self.pending_hour):
                 self._try_hour_signal(sym)
         summary["state"] = self.state
+        self._last_readiness_attempt = self.clock()
         self.store.event("INFO", "readiness", None, {k: v for k, v in summary.items() if k != "data"} | {
-            "data": {s: {"last_1m": to_utc(c["last_1m"]), "gaps": c["gaps"]} for s, c in cov.items()}}, self.mode)
+            "data": {s: {"last_1m": to_utc(c['last_1m']) if c.get('last_1m') is not None else None,
+                         "gaps": c.get('gaps',{})} for s, c in cov.items()}}, self.mode)
         return summary
+
+    @_locked
+    def _revalidate_paper_readiness(self) -> None:
+        """Retry latched data readiness without waiting for a socket reconnect.
+
+        Run the COMPLETE reconciliation, not a state clear or a single-symbol
+        freshness check. The poller also calls this when WS candles are healthy
+        and no REST fallback rows are needed. Never certify a disconnected or
+        incomplete transport generation; its normal handshake must recover it.
+        """
+        if self.mode != 'paper' or not self.reconciliations:
+            return
+        if self.state != 'DEGRADED' and not getattr(self, 'data_blocked', {}):
+            return
+        if self.state not in ('DEGRADED', 'OBSERVED_READY'):
+            return
+        if self.clock() - self._last_readiness_attempt < 60:
+            return
+        if (self.ws.phase not in ('READY','DEGRADED_REST_FALLBACK') or not self.ws._conns
+                or self.ws._reconnect_reason is not None
+                or self.clock() - self.ws._last_rx >= self.ws.watchdog_s):
+            return
+        # Also throttle failed sync attempts; they remain DEGRADED and retryable.
+        self._last_readiness_attempt = self.clock()
+        try:
+            self.run_reconciliation('automatic PAPER readiness revalidation')
+        except Exception as exc:
+            why = f'readiness revalidation failed: {type(exc).__name__}: {exc}'
+            self.transition('DEGRADED', why)
+            self._last_readiness_attempt = self.clock()
+            failed = {'reason':'automatic PAPER readiness revalidation', 'at':int(self.clock()),
+                      'issues':[why], 'state':'DEGRADED', 'data':{}, 'ws_generation':self.ws.generation}
+            self.reconciliations.append(failed)
+            self.store.event('WARN','readiness',None,failed,self.mode)
+            self.store.event('WARN','readiness_retry_failed',None,str(exc),self.mode)
 
     def _ref_mark(self, sym: str) -> float | None:
         t = self.ws.last_ticker.get(sym) or {}
@@ -612,7 +664,16 @@ class LiveBotRunner:
                             self.actions.append({"symbol": sym, "catch_up": True, **a})
                     self.last_close[sym] = cl
                     if self._is_tf_boundary(sym, bar_s + 60):
-                        self.pending_hour[sym] = bar_s + 60
+                        self._queue_close(sym, bar_s + 60, recovery=True)
+            # Recover evaluation identities across restarts, including when flat.
+            cursor = self.store.one('SELECT max(bar_close_us) AS t FROM signal_evaluations WHERE mode=? AND symbol=?',
+                                    (self.mode, sym))['t']
+            tf = self._tf_seconds(sym)
+            latest = c['last_1m'] + 60
+            latest -= latest % tf
+            first = int(cursor // 1_000_000) + tf if cursor is not None else latest
+            for close in range(first, latest + 1, tf):
+                self._queue_close(sym, close, recovery=True)
             self.last_minute[sym] = max(self.last_minute.get(sym, 0), c["last_1m"])
 
     # -- minute / timeframe processing --------------------------------------------------------- #
@@ -643,41 +704,99 @@ class LiveBotRunner:
         if self.mode == "paper" and self.engine.pending_limits(symbol):
             for f in self.engine.check_pending_limits(symbol, bar_s * 1_000_000 + 59_000_000, l, h):
                 self.actions.append({"symbol": symbol, "bar": bar_s, "source": source, "limit_fill": True, **f})
+        if self.engine.pending_funding():
+            self.engine.retry_funding(self.market.funding_inputs)
         self._risk_checks(bar_s)
         if self.state == "HALTED" and not self.daily_halted:
             self.run_reconciliation("halt expired")
         if self._is_tf_boundary(symbol, bar_s + 60):
-            self.pending_hour[symbol] = bar_s + 60
+            self._queue_close(symbol, bar_s + 60)
+        self._revalidate_paper_readiness()
         if symbol in self.pending_hour:
             self._try_hour_signal(symbol)
 
+    def _queue_close(self, symbol: str, close: int, *, recovery: bool = False) -> None:
+        queue = self.pending_hour.setdefault(symbol, [])
+        if close not in queue:
+            queue.append(close)
+            queue.sort()
+            if recovery:
+                self.recovery_closes.add((symbol, close))
+
+    def _evaluation_record(self, symbol: str, close: int, s: dict | None) -> tuple[int, bool]:
+        profile = self.profiles[symbol]
+        config = json.dumps(asdict(profile), sort_keys=True, default=str)
+        config_id = hashlib.sha256(config.encode()).hexdigest()
+        strategy = profile.rule_type or profile.strategy
+        with self.store.tx() as cx:
+            cur = cx.execute(
+                "INSERT OR IGNORE INTO signal_evaluations(mode,symbol,bar_open_us,bar_close_us,evaluated_at_us,"
+                "strategy,config_id,config_json,raw_signal,decision,detail) VALUES(?,?,?,?,?,?,?,?,?,'evaluating',?)",
+                (self.mode,symbol,(close-self._tf_seconds(symbol))*1_000_000,close*1_000_000,
+                 int(self.clock()*1_000_000),strategy,config_id,config,
+                 int(s.get('raw_signal',s['signal'])) if s is not None else None,json.dumps(s or {},default=str)))
+            row = cx.execute('SELECT id FROM signal_evaluations WHERE mode=? AND symbol=? AND bar_close_us=? AND config_id=?',
+                             (self.mode,symbol,close*1_000_000,config_id)).fetchone()
+            return row['id'], bool(cur.rowcount)
+
+    def _finish_evaluation(self, eid: int, result: dict) -> None:
+        with self.store.tx() as cx:
+            cx.execute('UPDATE signal_evaluations SET decision=?,skip_reason=?,intent_id=? WHERE id=?',
+                       (result.get('action','error'),result.get('reason'),result.get('intent_id'),eid))
+
     def _try_hour_signal(self, symbol: str) -> None:
-        hour_close = self.pending_hour[symbol]
-        if self.clock() - hour_close > ENTRY_MAX_DELAY_S:
-            self.pending_hour.pop(symbol)
-            self.store.event("WARN", "signal_window_missed", symbol, {"hour_close": to_utc(hour_close)}, self.mode)
-            return
-        s = self.market.evaluate(symbol, hour_close)
-        if s is None:
-            return  # hour not published by REST yet; retried on the next closed minute
-        self.pending_hour.pop(symbol)
-        self.last_eval[symbol] = s
-        if not s["fresh_signal"]:
-            return
-        rec = {"symbol": symbol, "hour_close": hour_close, "side": s["signal_side"], "state": self.state,
-               "halted": self.daily_halted}
-        if symbol in getattr(self, "data_blocked", {}):
-            rec["reason"] = self.data_blocked[symbol]
-            self.blocked_signals.append(rec)
-            self.store.event("WARN", "entry_blocked_data", symbol, rec, self.mode)
-            return
-        if not self.can_enter():
-            self.blocked_signals.append(rec)
-            self.store.event("WARN", "entry_blocked_state", symbol, rec, self.mode)
-            return
-        bar_us = int(pd.Timestamp(s["bar_open"]).value // 1000)
-        res = self.engine.on_signal(symbol, s["signal"], bar_us, s["atr14"], self._ref_price(symbol, s["signal"]))
-        self.entries.append({**rec, "result": res})
+        queue = self.pending_hour[symbol]
+        while queue:
+            close = queue[0]
+            if close > self.clock():
+                return
+            s = None
+            error = None
+            try:
+                s = self.market.evaluate(symbol, close)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            if s is None and error is None and self.clock() - close < self._tf_seconds(symbol):
+                return  # await complete local candles; never use a newer bar for this close
+            if s is not None and int(pd.Timestamp(s['bar_close']).timestamp()) != close:
+                s, error = None, 'requested candle unavailable; evaluator returned another candle'
+            eid, created = self._evaluation_record(symbol, close, s)
+            queue.pop(0)
+            recovery = (symbol, close) in self.recovery_closes
+            self.recovery_closes.discard((symbol, close))
+            if not created:
+                continue  # crash/restart evidence is not permission to submit again
+            if s is not None:
+                self.last_eval[symbol] = s
+            result = {'action':'not_evaluated','reason':error or 'completed candle data unavailable'}
+            attempted = False
+            if s is not None:
+                stale = self.clock() - close > ENTRY_MAX_DELAY_S or self.clock() - close >= self._tf_seconds(symbol)
+                if recovery or stale:
+                    result = {'action':'missed','reason':'recovery observation; no historical order' if recovery else 'entry window expired'}
+                elif not s['fresh_signal']:
+                    result = ({'action':'skip','reason':'entry filters rejected raw signal: '+json.dumps(s.get('entry_filters',{}))}
+                              if s.get('raw_signal',0) else {'action':'no_signal','reason':'no fresh condition edge'})
+                elif symbol in getattr(self, 'data_blocked', {}):
+                    result = {'action':'skip','reason':self.data_blocked[symbol]}
+                elif not self.can_enter():
+                    result = {'action':'skip','reason':f'runner state {self.state}; halted={self.daily_halted}'}
+                else:
+                    attempted = True
+                    try:
+                        result = self.engine.on_signal(symbol,s['signal'],int(pd.Timestamp(s['bar_open']).value//1000),
+                                                       s['atr14'],self._ref_price(symbol,s['signal']))
+                    except Exception as exc:
+                        result = {'action':'error','reason':f'{type(exc).__name__}: {exc}'}
+                if s['fresh_signal']:
+                    rec = {'symbol':symbol,'hour_close':close,'side':s['signal_side'],'state':self.state,
+                           'halted':self.daily_halted,'result':result}
+                    if attempted:
+                        self.entries.append(rec)
+                    if result['action'] in ('skip','missed'):
+                        self.blocked_signals.append({**rec,'reason':result['reason']})
+            self._finish_evaluation(eid,result)
+        self.pending_hour.pop(symbol, None)
 
     def _ref_price(self, symbol: str, direction: int) -> float:
         q = self.ws.last_quote.get(symbol)
@@ -728,6 +847,10 @@ class LiveBotRunner:
     def _risk_checks(self, bar_s: int) -> None:
         if self.daily_halted:
             return
+        if self.store.meta_get('utc_day_anchor_date') == to_utc(bar_s//86400*86400)[:10]:
+            anchor = self.store.meta_get('utc_day_start_equity_usd')
+            if anchor is not None:
+                self.day_start_equity = float(anchor)*self.engine.rate
         eq = self.equity_inr()
         daily_pct = float(self.engine.cfg_row["daily_loss_limit_pct"])
         limit = self.day_start_equity * (1 - daily_pct / 100)
@@ -773,7 +896,7 @@ class LiveBotRunner:
             self.last_eval[sym] = s
             close_s = int(pd.Timestamp(s["bar_close"]).value // 10**9)
             if s["fresh_signal"] and self.clock() - close_s <= ENTRY_MAX_DELAY_S:
-                self.pending_hour[sym] = close_s
+                self._queue_close(sym, close_s)
                 self._try_hour_signal(sym)
         return summary
 
@@ -805,6 +928,7 @@ class LiveBotRunner:
                         self.on_minute_close(sym, bar_s, o, h, l, c, "rest_poll")
             except Exception as exc:  # noqa: BLE001 - keep polling
                 log.warning("REST poll %s failed: %s", sym, exc)
+        self._revalidate_paper_readiness()
 
     async def run_async(self, duration: float | None = None) -> None:
         if (why := auto_bot_live_refusal(self.mode)) is not None:
