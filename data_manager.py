@@ -30,7 +30,7 @@ import requests
 from config import settings
 from dataset_lock import dataset_lock
 
-log = logging.getLogger(__name__)
+log = logger = logging.getLogger(__name__)
 
 SeriesType = Literal["TRADE", "MARK", "FUNDING"]
 SERIES_TYPES: tuple[SeriesType, ...] = ("TRADE", "MARK", "FUNDING")
@@ -479,7 +479,7 @@ def load_unified_1m_dataset(symbol: str, days: int | None = None) -> pd.DataFram
     if missing_mark:
         log.warning("%s: %d trade rows have no MARK candle", symbol, missing_mark)
     if missing_funding:
-        log.warning("%s: %d trade rows have no funding value in their 8h window", symbol, missing_funding)
+        logger.debug("%s: %d trade rows have no funding value in their 8h window", symbol, missing_funding)
 
     df.index = pd.to_datetime(df.index, unit="s", utc=True)
     df.index.name = "time"

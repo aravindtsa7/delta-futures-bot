@@ -215,6 +215,17 @@ class ControlChannel:
         return None
 
 
+def _epoch_s(ts: Any) -> int:
+    if isinstance(ts, (int, float)):
+        return int(ts)
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    else:
+        t = t.tz_convert("UTC")
+    return int(t.timestamp())
+
+
 # --------------------------------------------------------------------------- #
 # Market data (REST, parquet history) used for reconciliation, signals and the poll fallback
 # --------------------------------------------------------------------------- #
@@ -255,7 +266,7 @@ class RestMarketData:
             return None  # no_data -> FLAT
         at = pd.Timestamp(hour_close_s, unit='s', tz='UTC') if hour_close_s is not None else None
         s = ee.evaluate_symbol(self.profiles[sym], h, at=at)
-        if hour_close_s is not None and int(s["bar_close"].value // 10**9) != hour_close_s:
+        if hour_close_s is not None and _epoch_s(s["bar_close"]) != hour_close_s:
             return None  # REST has not published that hour yet
         return s
 
@@ -330,6 +341,7 @@ class LiveBotRunner:
         self.last_close: dict[str, float] = {}
         self.pending_hour: dict[str, list[int]] = {}
         self.recovery_closes: set[tuple[str, int]] = set()
+        self._eval_retry_after: dict[tuple[str, int], float] = {}
         self.last_eval: dict[str, dict[str, Any]] = {}
         self.entries: list[dict[str, Any]] = []
         self.blocked_signals: list[dict[str, Any]] = []
@@ -671,7 +683,11 @@ class LiveBotRunner:
             tf = self._tf_seconds(sym)
             latest = c['last_1m'] + 60
             latest -= latest % tf
-            first = int(cursor // 1_000_000) + tf if cursor is not None else latest
+            if cursor is not None:
+                cursor_s = int(cursor // 1_000_000)
+                first = ((cursor_s // tf) + 1) * tf
+            else:
+                first = latest
             for close in range(first, latest + 1, tf):
                 self._queue_close(sym, close, recovery=True)
             self.last_minute[sym] = max(self.last_minute.get(sym, 0), c["last_1m"])
@@ -750,6 +766,9 @@ class LiveBotRunner:
             close = queue[0]
             if close > self.clock():
                 return
+            retry_after = self._eval_retry_after.get((symbol, close), float("-inf"))
+            if self.clock() < retry_after and self.clock() - close < self._tf_seconds(symbol):
+                return
             s = None
             error = None
             try:
@@ -757,11 +776,13 @@ class LiveBotRunner:
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
             if s is None and error is None and self.clock() - close < self._tf_seconds(symbol):
+                self._eval_retry_after[(symbol, close)] = self.clock() + 5.0
                 return  # await complete local candles; never use a newer bar for this close
-            if s is not None and int(pd.Timestamp(s['bar_close']).timestamp()) != close:
+            if s is not None and _epoch_s(s['bar_close']) != close:
                 s, error = None, 'requested candle unavailable; evaluator returned another candle'
             eid, created = self._evaluation_record(symbol, close, s)
             queue.pop(0)
+            self._eval_retry_after.pop((symbol, close), None)
             recovery = (symbol, close) in self.recovery_closes
             self.recovery_closes.discard((symbol, close))
             if not created:
@@ -784,7 +805,7 @@ class LiveBotRunner:
                 else:
                     attempted = True
                     try:
-                        result = self.engine.on_signal(symbol,s['signal'],int(pd.Timestamp(s['bar_open']).value//1000),
+                        result = self.engine.on_signal(symbol,s['signal'],_epoch_s(s['bar_open'])*1_000_000,
                                                        s['atr14'],self._ref_price(symbol,s['signal']))
                     except Exception as exc:
                         result = {'action':'error','reason':f'{type(exc).__name__}: {exc}'}

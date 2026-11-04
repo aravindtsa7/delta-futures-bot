@@ -893,9 +893,16 @@ def evaluate_symbol(profile: StrategyProfile, hist: pd.DataFrame, at: pd.Timesta
         if hist.empty or hist.index[0] > start:
             raise ValueError("deployed indicator warmup history is unavailable")
         hist = hist[hist.index >= start]
+    tf_min = dm.TIMEFRAME_MINUTES.get(profile.timeframe, 60)
+    tf_s = tf_min * 60
+    if at is None and hist is not None and len(hist):
+        last_closed_1m_close = int(hist.index[-1].timestamp()) + 60
+        cutoff_s = (last_closed_1m_close // tf_s) * tf_s
+        snapped = pd.Timestamp(cutoff_s, unit="s", tz="UTC")
+        if (hist.index < snapped).any():
+            at = snapped
     if at is not None:
         hist = hist[hist.index < at]
-    tf_min = dm.TIMEFRAME_MINUTES.get(profile.timeframe, 60)
     bars = dm.resample_candles(hist, profile.timeframe)
     if profile.rule_type and profile.rule_type in strategies.CUSTOM_RULE_TYPES:
         out = strategies.evaluate_custom_strategy(profile.rule_type, profile.params or {}, bars, bars_4h=dm.resample_candles(hist, "4h"))
