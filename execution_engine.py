@@ -90,7 +90,7 @@ TRANSITIONS: dict[str, set[str]] = {
 BLOCKING_STATES = ("DISPATCHING", "OUTCOME_UNKNOWN", "ACKNOWLEDGED", "PARTIALLY_FILLED")
 UNRESOLVED_STATES = ("DISPATCHING", "OUTCOME_UNKNOWN")
 # Only these margin-mode rejections are benign, and only after a readback shows isolated (F09).
-BENIGN_MARGIN_CODES = ("margin_mode_already_set", "already_in_isolated_margin_mode", "already_isolated")
+BENIGN_MARGIN_CODES = ("margin_mode_already_set", "already_in_isolated_margin_mode", "already_in_selected_margin_mode", "already_isolated", "no_change", "same_margin_mode")
 
 
 class EntryBlockedError(ExchangeError):
@@ -1945,8 +1945,22 @@ class ExecutionEngine:
             r = self.client.set_margin_mode("isolated")
         except DeltaAPIError as exc:
             text = json.dumps(exc.error).lower()
-            if not (str(exc.code or "").lower() in BENIGN_MARGIN_CODES or "already in isolated" in text
-                    or any(c in text for c in BENIGN_MARGIN_CODES)):
+            code = str(exc.code or "").lower()
+            is_benign = (
+                code in BENIGN_MARGIN_CODES
+                or "already in isolated" in text
+                or "already isolated" in text
+                or "already in selected margin mode" in text
+                or "same margin mode" in text
+                or any(c in text for c in BENIGN_MARGIN_CODES)
+            )
+            if not is_benign:
+                try:
+                    mode_check = self.read_margin_mode()
+                except ExchangeError:
+                    mode_check = None
+                if "subaccount_user_id" in text and mode_check == "isolated":
+                    return {"margin_mode": "isolated", "changed": False, "verified_by": "readback", "note": str(exc.error)}
                 raise
             mode = self.read_margin_mode()
             if mode != "isolated":

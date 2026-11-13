@@ -309,6 +309,7 @@ class DeltaRestClientAdapter:
         )
         self._http = httpx.Client(transport=transport, timeout=eff_timeout)
         self._products: dict[int, ProductInfo] = {}
+        self._user_id: str | None = None
         self.request_log: list[dict[str, Any]] = []  # method, path, attempt, status (no secrets)
 
     @classmethod
@@ -459,10 +460,45 @@ class DeltaRestClientAdapter:
 
     # -- authenticated reads -------------------------------------------------- #
     def get_trading_preferences(self) -> dict[str, Any]:
-        return self._get("/v2/users/trading_preferences", auth=True)
+        res = self._get("/v2/users/trading_preferences", auth=True)
+        if isinstance(res, dict):
+            uid = res.get("user_id") if res.get("user_id") not in (None, "") else res.get("id")
+            if uid not in (None, ""):
+                self._user_id = str(uid)
+        return res
 
     def get_wallet_balances(self) -> list[dict[str, Any]]:
-        return self._get("/v2/wallet/balances", auth=True)
+        rows = self._get("/v2/wallet/balances", auth=True)
+        if isinstance(rows, list):
+            for b in rows:
+                if isinstance(b, dict) and b.get("user_id") not in (None, ""):
+                    self._user_id = str(b["user_id"])
+                    break
+        return rows
+
+    def get_user_id(self) -> str | None:
+        if self._user_id:
+            return self._user_id
+        for fn in (
+            self.get_wallet_balances,
+            lambda: self._get("/v2/profile", auth=True),
+            self.get_trading_preferences,
+        ):
+            try:
+                res = fn()
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(res, list):
+                for b in res:
+                    if isinstance(b, dict) and b.get("user_id") not in (None, ""):
+                        self._user_id = str(b["user_id"])
+                        return self._user_id
+            elif isinstance(res, dict):
+                uid = res.get("user_id") if res.get("user_id") not in (None, "") else res.get("id")
+                if uid not in (None, ""):
+                    self._user_id = str(uid)
+                    return self._user_id
+        return self._user_id
 
     def get_position(self, product_id: int) -> dict[str, Any]:
         """Real-time position: {'size': signed int, 'entry_price': str|None, ...}."""
@@ -501,6 +537,8 @@ class DeltaRestClientAdapter:
 
     # -- account / risk mutations ------------------------------------------- #
     def set_margin_mode(self, margin_mode: str = "isolated", subaccount_user_id: int | str | None = None) -> dict[str, Any]:
+        if subaccount_user_id is None:
+            subaccount_user_id = self.get_user_id()
         body: dict[str, Any] = {"margin_mode": margin_mode}
         if subaccount_user_id is not None:
             body["subaccount_user_id"] = str(subaccount_user_id)
