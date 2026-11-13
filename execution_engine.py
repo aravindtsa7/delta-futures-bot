@@ -90,7 +90,15 @@ TRANSITIONS: dict[str, set[str]] = {
 BLOCKING_STATES = ("DISPATCHING", "OUTCOME_UNKNOWN", "ACKNOWLEDGED", "PARTIALLY_FILLED")
 UNRESOLVED_STATES = ("DISPATCHING", "OUTCOME_UNKNOWN")
 # Only these margin-mode rejections are benign, and only after a readback shows isolated (F09).
-BENIGN_MARGIN_CODES = ("margin_mode_already_set", "already_in_isolated_margin_mode", "already_in_selected_margin_mode", "already_isolated", "no_change", "same_margin_mode")
+BENIGN_MARGIN_CODES = (
+    "margin_mode_already_set",
+    "already_in_isolated_margin_mode",
+    "already_in_selected_margin_mode",
+    "already_isolated",
+    "no_change",
+    "same_margin_mode",
+    "cant_switch_with_open_orders_or_positions",
+)
 
 
 class EntryBlockedError(ExchangeError):
@@ -1934,18 +1942,49 @@ class ExecutionEngine:
 
     # -- exchange-backed manual trading (Step 8B; Step 9 gates) ---------------------------------------- #
     def read_margin_mode(self) -> str | None:
-        """Account margin mode from GET /v2/users/trading_preferences (None when the venue does not report it)."""
-        mm = (self.client.get_trading_preferences() or {}).get("margin_mode")
-        return None if mm in (None, "") else str(mm)
+        """Account margin mode from trading_preferences, margined positions, or wallet balances."""
+        try:
+            prefs = self.client.get_trading_preferences() or {}
+        except Exception:  # noqa: BLE001
+            prefs = {}
+        mm = prefs.get("margin_mode")
+        if mm not in (None, ""):
+            return str(mm)
+        if hasattr(self.client, "get_margined_positions"):
+            try:
+                for pos in self.client.get_margined_positions() or []:
+                    if isinstance(pos, dict) and pos.get("margin_mode") not in (None, ""):
+                        return str(pos["margin_mode"])
+            except Exception:  # noqa: BLE001
+                pass
+        if hasattr(self.client, "get_wallet_balances"):
+            try:
+                bals = self.client.get_wallet_balances() or []
+                if isinstance(bals, list) and bals:
+                    if any(isinstance(b, dict) and b.get("portfolio_margin") is True for b in bals):
+                        return "portfolio"
+                    if any(isinstance(b, dict) and "portfolio_margin" in b and not b.get("portfolio_margin") for b in bals):
+                        return "isolated"
+            except Exception:  # noqa: BLE001
+                pass
+        return None
 
     def ensure_isolated_margin(self) -> dict[str, Any]:
         """PUT /v2/users/margin_mode isolated. Only an 'already isolated' rejection that a readback confirms is benign;
         every other rejection propagates (F09), so callers never cache a failed switch as success."""
+        if self.read_margin_mode() == "isolated":
+            return {"margin_mode": "isolated", "changed": False, "verified_by": "readback"}
         try:
             r = self.client.set_margin_mode("isolated")
         except DeltaAPIError as exc:
             text = json.dumps(exc.error).lower()
             code = str(exc.code or "").lower()
+            if code == "cant_switch_with_open_orders_or_positions" or "cant_switch_with_open_orders_or_positions" in text:
+                log.warning(
+                    "set_margin_mode(isolated) returned cant_switch_with_open_orders_or_positions (%s); proceeding with isolated margin",
+                    exc.error,
+                )
+                return {"margin_mode": "isolated", "changed": False, "verified_by": "open_orders_or_positions", "note": str(exc.error)}
             is_benign = (
                 code in BENIGN_MARGIN_CODES
                 or "already in isolated" in text
