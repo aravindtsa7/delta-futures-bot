@@ -65,7 +65,18 @@ OVERLAY_COLS = ["ema9", "ema21", "ema50", "ema55", "ema100", "ema200", "ema_fast
                 "vwap", "bb_upper", "bb_mid", "bb_lower", "kc_upper", "kc_lower", "dc_high", "dc_low"]
 MAX_EQUITY_POINTS = 4000
 
-app = FastAPI(title="Delta Futures Lab", version="1.0")
+from contextlib import asynccontextmanager  # noqa: E402
+
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    try:
+        yield
+    finally:
+        manual_trade.shutdown_manual_trade()
+
+
+app = FastAPI(title="Delta Futures Lab", version="1.0", lifespan=_app_lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 import bot_ops  # noqa: E402  (Step 7: /api/bot/* operations router)

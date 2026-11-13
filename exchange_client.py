@@ -299,7 +299,15 @@ class DeltaRestClientAdapter:
         self._key, self._secret = api_key or "", api_secret or ""
         self._now, self._sleep = now, sleep
         self.budget = budget or shared_budget(self.base_url)
-        self._http = httpx.Client(transport=transport, timeout=timeout or settings.HTTP_TIMEOUT_SECONDS)
+        if transport is None:
+            try:
+                transport = httpx.HTTPTransport(local_address="0.0.0.0")
+            except Exception:  # noqa: BLE001
+                transport = httpx.HTTPTransport()
+        eff_timeout = timeout if isinstance(timeout, httpx.Timeout) else httpx.Timeout(
+            float(timeout or settings.HTTP_TIMEOUT_SECONDS), connect=5.0
+        )
+        self._http = httpx.Client(transport=transport, timeout=eff_timeout)
         self._products: dict[int, ProductInfo] = {}
         self.request_log: list[dict[str, Any]] = []  # method, path, attempt, status (no secrets)
 

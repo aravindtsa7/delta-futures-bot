@@ -30,10 +30,12 @@ from typing import Any, Callable, Literal
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 
+import httpx
+
 import bot_ops
 import data_manager as dm
 import execution_engine as ee
-from config import mask_secret, settings
+from config import ENVIRONMENTS, mask_secret, settings
 from exchange_client import DeltaAPIError, DeltaRestClientAdapter, ExchangeError, ReadOnlyClientError
 
 router = APIRouter(tags=["manual"])
@@ -48,6 +50,12 @@ EXCHANGE_MODES = ("testnet", "live")
 ZERO_BALANCE_MSG = ("Your Delta India {what} wallet balance is ₹0.00 — please add funds on Delta Exchange India "
                     "or switch to PAPER mode to test")
 _cache: dict[str, tuple[float, Any]] = {}
+_cache_lock = threading.Lock()
+_clients_lock = threading.Lock()
+_clients: dict[tuple[str, bool, str, str, str], DeltaRestClientAdapter] = {}
+_snap_locks: dict[str, threading.Lock] = {m: threading.Lock() for m in ("paper", "testnet", "live")}
+_watcher_stop = threading.Event()
+_watcher_thread: threading.Thread | None = None
 _margin_ok: dict[str, bool] = {}
 _watch: dict[str, Any] = {"thread": None, "runs": 0, "last_run": None, "last_actions": [], "last_error": None, "status": "not started"}
 # Tests inject a fake exchange here: fn(mode, read_only) -> DeltaRestClientAdapter
@@ -55,16 +63,18 @@ CLIENT_FACTORY: Callable[[str, bool], DeltaRestClientAdapter] | None = None
 
 
 def _cached(key: str, ttl: float, fn):
-    hit = _cache.get(key)
-    if hit and time.time() - hit[0] < ttl:
-        return hit[1]
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
     val = fn()
-    _cache[key] = (time.time(), val)
+    with _cache_lock:
+        _cache[key] = (time.time(), val)
     return val
 
 
 def _pub() -> DeltaRestClientAdapter:
-    return DeltaRestClientAdapter("paper")
+    return client_for("paper", read_only=True)
 
 
 def check_symbol(symbol: str) -> str:
@@ -86,7 +96,15 @@ def client_for(mode: str, read_only: bool = False) -> DeltaRestClientAdapter:
     if CLIENT_FACTORY is not None:
         return CLIENT_FACTORY(mode, read_only)
     key, secret = keys_for(mode)
-    return DeltaRestClientAdapter(mode, key, secret, read_only=read_only)
+    base_url = ENVIRONMENTS["india_testnet" if mode == "testnet" else "india_prod"].rest_url
+    ck = (mode, bool(read_only), key, secret, base_url)
+    with _clients_lock:
+        c = _clients.get(ck)
+        if c is not None and not getattr(getattr(c, "_http", None), "is_closed", False):
+            return c
+        c = DeltaRestClientAdapter(mode, key, secret, read_only=read_only)
+        _clients[ck] = c
+        return c
 
 
 # --------------------------------------------------------------------------- #
@@ -283,13 +301,27 @@ def wallet_from_balances(bals: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def exchange_snapshot(mode: str, ttl: float = SNAPSHOT_TTL_S) -> dict[str, Any]:
-    def build() -> dict[str, Any]:
+    key = f"snap:{mode}"
+    if ttl > 0:
+        with _cache_lock:
+            hit = _cache.get(key)
+            if hit and time.time() - hit[0] < ttl:
+                return hit[1]
+    lock = _snap_locks.setdefault(mode, threading.Lock())
+    with lock:
+        if ttl > 0:
+            with _cache_lock:
+                hit = _cache.get(key)
+                if hit and time.time() - hit[0] < ttl:
+                    return hit[1]
         c = client_for(mode, read_only=True)
         bals = c.get_wallet_balances()
         poss = [p for p in c.get_margined_positions() if int(p.get("size") or 0) != 0]
         orders = c.get_active_orders()
-        return {"wallet": wallet_from_balances(bals), "positions": poss, "orders": orders, "at": time.time()}
-    return _cached(f"snap:{mode}", ttl, build)
+        val = {"wallet": wallet_from_balances(bals), "positions": poss, "orders": orders, "at": time.time()}
+        with _cache_lock:
+            _cache[key] = (time.time(), val)
+        return val
 
 
 def sync_journal(mode: str) -> dict[str, Any]:
@@ -315,13 +347,18 @@ def sync_exchange() -> dict[str, Any]:
         raise HTTPException(409, "PAPER mode has no exchange account to sync; switch to LIVE or TESTNET")
     mode_gate(mode)
     out: dict[str, Any] = {"mode": mode}
-    with bot_ops._op_lock:
-        if not bot_ops.runner()[0]:
-            out.update(sync_journal(mode))
-        else:
-            out["note"] = "auto-bot running: it reconciles its own journal; read-only snapshot only"
-    _cache.pop(f"snap:{mode}", None)
-    snap = exchange_snapshot(mode)
+    try:
+        with bot_ops._op_lock:
+            if not bot_ops.runner()[0]:
+                out.update(sync_journal(mode))
+            else:
+                out["note"] = "auto-bot running: it reconciles its own journal; read-only snapshot only"
+        with _cache_lock:
+            _cache.pop(f"snap:{mode}", None)
+        snap = exchange_snapshot(mode)
+    except (ExchangeError, ReadOnlyClientError, httpx.HTTPError) as exc:
+        status = 400 if isinstance(exc, DeltaAPIError) and exc.status < 500 else 503
+        raise HTTPException(status, _diagnose(exc)) from exc
     out.update(wallet=snap["wallet"], exchange_positions=snap["positions"],
                open_orders=[o for o in snap["orders"] if not o.get("stop_order_type")],
                protective_orders=[o for o in snap["orders"] if o.get("stop_order_type")])
@@ -407,7 +444,7 @@ def connection_status(verify: bool = False) -> dict[str, Any]:
                     m.update(connected=True, **{k: w[k] for k in ("wallet_equity_inr", "available_margin_inr", "wallet_equity_usd",
                                                                   "available_margin_usd", "inr_source")},
                              open_positions=len(poss), message="Connected ✔ (read-only check: wallet + positions)")
-                except (ExchangeError, ReadOnlyClientError) as exc:
+                except (ExchangeError, ReadOnlyClientError, httpx.HTTPError) as exc:
                     m.update(connected=False, message=_diagnose(exc))
             elif verify:
                 m.update(connected=False, message="no API key/secret in .env")
@@ -452,22 +489,42 @@ def account_view(mode: str) -> dict[str, Any]:
     """Wallet + journal positions for sizing: virtual paper wallet, or Delta's real wallet in exchange modes."""
     st = bot_ops.read_status(with_market=True, with_signals=False, mode=mode)
     if mode in EXCHANGE_MODES:
-        w = exchange_snapshot(mode)["wallet"]
-        st["wallet"] = {**st["wallet"], "realized_equity_inr": w["wallet_equity_inr"], "available_margin_inr": w["available_margin_inr"],
-                        "used_margin_inr": w["used_margin_inr"], "exchange": w}
+        try:
+            w = exchange_snapshot(mode)["wallet"]
+            st["wallet"] = {**st["wallet"], "realized_equity_inr": w["wallet_equity_inr"], "available_margin_inr": w["available_margin_inr"],
+                            "used_margin_inr": w["used_margin_inr"], "exchange": w}
+        except HTTPException as exc:
+            st["exchange_error"] = str(exc.detail)
+            st["exchange_status"] = exc.status_code
+            st["wallet"] = {**st["wallet"], "realized_equity_inr": 0.0, "available_margin_inr": 0.0,
+                            "used_margin_inr": 0.0, "exchange_error": str(exc.detail)}
+        except (ExchangeError, ReadOnlyClientError, httpx.HTTPError) as exc:
+            diag = _diagnose(exc)
+            st["exchange_error"] = diag
+            st["exchange_status"] = 400 if isinstance(exc, DeltaAPIError) and exc.status < 500 else 503
+            st["wallet"] = {**st["wallet"], "realized_equity_inr": 0.0, "available_margin_inr": 0.0,
+                            "used_margin_inr": 0.0, "exchange_error": diag}
     return st
 
 
 def build_preview(req: ManualOrder) -> dict[str, Any]:
     mode, gen = bot_ops.mode_state()
     sym = check_symbol(req.symbol)
-    info = product_info(sym)
+    try:
+        info = product_info(sym)
+    except (ExchangeError, ReadOnlyClientError, httpx.HTTPError) as exc:
+        status = 400 if isinstance(exc, DeltaAPIError) and exc.status < 500 else 503
+        raise HTTPException(status, f"Exchange product lookup failed for {sym}: {_diagnose(exc)}") from exc
     if info["trading_status"] != "operational":
         raise HTTPException(409, f"{sym} trading_status is {info['trading_status']}")
     max_lev = info["max_leverage"] or 1
     if req.leverage > max_lev + 1e-9:
         raise HTTPException(422, f"{sym}: leverage {req.leverage:g}x exceeds the product maximum {max_lev:g}x")
-    tk = ticker(sym)
+    try:
+        tk = ticker(sym)
+    except (ExchangeError, ReadOnlyClientError, httpx.HTTPError) as exc:
+        status = 400 if isinstance(exc, DeltaAPIError) and exc.status < 500 else 503
+        raise HTTPException(status, f"Exchange ticker unavailable for {sym}: {_diagnose(exc)}") from exc
     bid, ask, mark = tk["best_bid"], tk["best_ask"], tk["mark_price"]
     if not (bid and ask):
         raise HTTPException(503, f"{sym}: no live quotes")
@@ -503,6 +560,8 @@ def build_preview(req: ManualOrder) -> dict[str, Any]:
         problems.append("trailing stops are paper-only for manual exchange positions (use SL/TP; edit the SL as price moves)")
     rate, cv = settings.FIXED_USD_INR_RATE, info["contract_value"]
     st = account_view(mode)
+    if mode in EXCHANGE_MODES and st.get("exchange_error"):
+        raise HTTPException(st.get("exchange_status", 503), f"{mode.upper()} wallet unavailable: {st['exchange_error']}")
     w = st["wallet"]
     if req.contracts is not None:
         n = int(req.contracts)
@@ -836,7 +895,7 @@ def state(symbol: str = Query("BTCUSD"), resolution: Literal["1m", "5m", "15m", 
     if mode in EXCHANGE_MODES:
         try:
             mode_gate(mode)
-            if not st["runner"]["running"]:
+            if not st["runner"]["running"] and (st["positions"] or st.get("outcome_unknown_intents") or pending):
                 with bot_ops._op_lock:
                     sync_journal(mode)
                 st = bot_ops.read_status(with_market=True, with_signals=False, mode=mode)
@@ -860,7 +919,7 @@ def state(symbol: str = Query("BTCUSD"), resolution: Literal["1m", "5m", "15m", 
                         "protective_orders": len([o for o in snap["orders"] if o.get("stop_order_type")])}
         except HTTPException as exc:
             exchange = {"connected": False, "error": exc.detail}
-        except (ExchangeError, ReadOnlyClientError) as exc:
+        except (ExchangeError, ReadOnlyClientError, httpx.HTTPError) as exc:
             exchange = {"connected": False, "error": _diagnose(exc)}
         else:
             if not st["runner"]["running"]:
@@ -932,7 +991,7 @@ def watch_once(prices: dict[str, dict[str, float]] | None = None) -> dict[str, A
 
 
 def _watch_loop() -> None:
-    while True:
+    while not _watcher_stop.is_set():
         try:
             r = watch_once()
             _watch.update(status=r["status"], last_run=time.time(), runs=_watch["runs"] + 1, last_error=None)
@@ -940,13 +999,42 @@ def _watch_loop() -> None:
                 _watch["last_actions"] = (r["actions"] + _watch["last_actions"])[:20]
         except Exception as exc:  # noqa: BLE001 - the watcher must survive network / lock hiccups
             _watch.update(last_error=f"{type(exc).__name__}: {exc}", last_run=time.time())
-        time.sleep(WATCH_INTERVAL_S)
+        if _watcher_stop.wait(WATCH_INTERVAL_S):
+            break
+    _watch["status"] = "stopped"
 
 
 def _ensure_watcher() -> None:
+    global _watcher_thread
     t = _watch.get("thread")
     if t is None or not t.is_alive():
+        _watcher_stop.clear()
         t = threading.Thread(target=_watch_loop, name="manual-paper-watcher", daemon=True)
+        _watcher_thread = t
         _watch["thread"] = t
         _watch["status"] = "starting"
         t.start()
+
+
+def _stop_watcher(timeout: float = 1.5) -> None:
+    global _watcher_thread
+    _watcher_stop.set()
+    t = _watcher_thread or _watch.get("thread")
+    if isinstance(t, threading.Thread) and t.is_alive() and t is not threading.current_thread():
+        t.join(timeout=timeout)
+    _watcher_thread = None
+    _watch["thread"] = None
+    _watch["status"] = "stopped"
+
+
+def shutdown_manual_trade() -> None:
+    """Stop the background paper watcher thread and close all cached HTTP clients."""
+    _stop_watcher()
+    with _clients_lock:
+        clients = list(_clients.values())
+        _clients.clear()
+    for c in clients:
+        try:
+            c.close()
+        except Exception:  # noqa: BLE001
+            pass
