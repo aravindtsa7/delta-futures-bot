@@ -273,8 +273,15 @@ class _Session:
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        _cache.pop(f"snap:{self.mode}", None)
+        _invalidate_snapshot(self.mode)
         self.store.close()
+
+
+def _invalidate_snapshot(mode: str, symbol: str | None = None) -> None:
+    with _cache_lock:
+        _cache.pop(f"snap:{mode}", None)
+        if symbol:
+            _cache.pop(f"tk:{symbol}", None)
 
 
 # --------------------------------------------------------------------------- #
@@ -316,8 +323,23 @@ def exchange_snapshot(mode: str, ttl: float = SNAPSHOT_TTL_S) -> dict[str, Any]:
                     return hit[1]
         c = client_for(mode, read_only=True)
         bals = c.get_wallet_balances()
-        poss = [p for p in c.get_margined_positions() if int(p.get("size") or 0) != 0]
+        raw_poss = [p for p in c.get_margined_positions() if int(p.get("size") or 0) != 0]
         orders = c.get_active_orders()
+        poss: list[dict[str, Any]] = []
+        for x in raw_poss:
+            size = int(x.get("size") or 0)
+            pos_side = "LONG" if size > 0 else "SHORT"
+            pid = int(x.get("product_id") or 0)
+            sl_o, tp_o = ee.ExecutionEngine._match_legs(orders or [], pid, pos_side)
+            live_sl = _f(sl_o.get("stop_price")) if sl_o else _f(x.get("bracket_stop_loss_price"))
+            live_tp = _f(tp_o.get("stop_price")) if tp_o else _f(x.get("bracket_take_profit_price"))
+            poss.append({
+                **x,
+                "sl_price": live_sl,
+                "tp_price": live_tp,
+                "sl_order_id": str(sl_o["id"]) if sl_o and sl_o.get("id") is not None else None,
+                "tp_order_id": str(tp_o["id"]) if tp_o and tp_o.get("id") is not None else None,
+            })
         val = {"wallet": wallet_from_balances(bals), "positions": poss, "orders": orders, "at": time.time()}
         with _cache_lock:
             _cache[key] = (time.time(), val)
@@ -490,9 +512,11 @@ def account_view(mode: str) -> dict[str, Any]:
     st = bot_ops.read_status(with_market=True, with_signals=False, mode=mode)
     if mode in EXCHANGE_MODES:
         try:
-            w = exchange_snapshot(mode)["wallet"]
+            snap = exchange_snapshot(mode)
+            w = snap["wallet"]
             st["wallet"] = {**st["wallet"], "realized_equity_inr": w["wallet_equity_inr"], "available_margin_inr": w["available_margin_inr"],
                             "used_margin_inr": w["used_margin_inr"], "exchange": w}
+            st["positions"] = _exchange_positions_view(mode, st["positions"], snap)
         except HTTPException as exc:
             st["exchange_error"] = str(exc.detail)
             st["exchange_status"] = exc.status_code
@@ -723,11 +747,67 @@ def cancel_order(order_id: str, expected_mode: Literal["paper", "testnet", "live
             try:
                 r = s.client.cancel_order(pid, order_id=oid)
             except DeltaAPIError as exc:
-                raise HTTPException(409, f"Delta refused the cancel: {_diagnose(exc)}") from exc
+                code = str(exc.code or "").lower()
+                if exc.status == 404 or code in ee.BENIGN_CANCEL_CODES:
+                    r = {"id": oid, "state": "cancelled"}
+                else:
+                    raise HTTPException(409, f"Delta refused the cancel: {_diagnose(exc)}") from exc
             if it is not None and it["state"] in ("ACKNOWLEDGED", "PARTIALLY_FILLED"):
                 # books any fill quantity not booked yet (a partial fill before the cancel), then CANCELLED / FILLED
                 s.engine._apply_order(it["intent_id"], {**r, "state": r.get("state") or "cancelled"})
-            return {"cancelled": str(oid), "intent_id": it["intent_id"] if it else None, "mode": mode, "exchange_state": r.get("state")}
+        _invalidate_snapshot(mode)
+        return {"cancelled": str(oid), "intent_id": it["intent_id"] if it else None, "mode": mode, "exchange_state": r.get("state")}
+
+
+def _ensure_journal_position(s: _Session, sym: str) -> Any:
+    """Ensure an exchange position on ``sym`` is represented and up-to-date in ``s.store``."""
+    p = s.store.position(s.mode, sym)
+    if s.mode not in EXCHANGE_MODES:
+        return p
+    try:
+        snap = exchange_snapshot(s.mode, ttl=0)
+    except Exception:  # noqa: BLE001
+        return p
+    ext = next((x for x in snap.get("positions") or [] if x.get("product_symbol") == sym and int(x.get("size") or 0) != 0), None)
+    if p is None and ext is not None:
+        size = int(ext["size"])
+        side = "LONG" if size > 0 else "SHORT"
+        contracts = abs(size)
+        prod = s.engine.ensure_product(sym)
+        pid = int(ext.get("product_id") or prod.product_id)
+        cv = float(prod.contract_value)
+        entry = float(ext.get("entry_price") or (ticker(sym)["mark_price"] if sym else 0) or 0.0)
+        margin_usd = float(ext.get("margin") or 0.0)
+        lev = round(contracts * cv * entry / margin_usd, 2) if margin_usd > 0 and entry > 0 else float(ee.LEVERAGE)
+        sl_o, tp_o = ee.ExecutionEngine._match_legs(snap.get("orders") or [], pid, side)
+        sl_px = _f(sl_o.get("stop_price")) if sl_o else _f(ext.get("sl_price"))
+        tp_px = _f(tp_o.get("stop_price")) if tp_o else _f(ext.get("tp_price"))
+        sl_oid = str(sl_o["id"]) if sl_o and sl_o.get("id") is not None else ext.get("sl_order_id")
+        tp_oid = str(tp_o["id"]) if tp_o and tp_o.get("id") is not None else ext.get("tp_order_id")
+        t_us = s.engine.clock()
+        s.store.insert_position(
+            mode=s.mode, symbol=sym, product_id=pid, side=side, contracts=contracts, contract_value=cv,
+            entry_price=entry, raw_entry_price=entry, initial_sl=sl_px, sl_price=sl_px, tp_price=tp_px,
+            trail_amount=0.0, sl_order_id=sl_oid, tp_order_id=tp_oid, highest_fav_price=entry,
+            opened_at_us=t_us, last_bar_us=t_us - t_us % 60_000_000 - 60_000_000,
+            realized_funding_usd=float(_f(ext.get("realized_funding")) or 0.0), entry_fee_usd=0.0,
+            margin_usd=margin_usd or (contracts * cv * entry / lev), atr_at_signal=0.0,
+            intent_id=f"adopt-{ee.secrets.token_hex(6)}", leverage=float(lev), source="manual",
+        )
+        return s.store.position(s.mode, sym)
+    if p is not None and ext is not None:
+        ex_contracts = abs(int(ext["size"]))
+        upd: dict[str, Any] = {}
+        if int(p["contracts"]) != ex_contracts:
+            upd["contracts"] = ex_contracts
+        if ext.get("sl_order_id") and not p["sl_order_id"]:
+            upd["sl_order_id"] = str(ext["sl_order_id"])
+        if ext.get("tp_order_id") and not p["tp_order_id"]:
+            upd["tp_order_id"] = str(ext["tp_order_id"])
+        if upd:
+            s.store.update_position(s.mode, sym, **upd)
+            p = s.store.position(s.mode, sym)
+    return p
 
 
 class ProtectionRequest(ActionBinding):
@@ -749,23 +829,23 @@ def set_protection(symbol: str, req: ProtectionRequest) -> dict[str, Any]:
         if mode in EXCHANGE_MODES and req.trail_amount:
             raise HTTPException(422, "trailing stops are paper-only for manual exchange positions")
         with _Session(mode) as s:
-            p = s.store.position(mode, sym)
+            p = _ensure_journal_position(s, sym)
             if p is None:
                 raise HTTPException(404, f"no open {sym} position in the {mode} journal")
             d = 1 if p["side"] == "LONG" else -1
             e = float(p["entry_price"])
-            mark = ticker(sym)["mark_price"] or e
+            mark = ticker(sym, ttl=0)["mark_price"] or e
             fields: dict[str, Any] = {}
             sl = req.sl_price if req.sl_price is not None else (e * (1 - d * req.sl_pct / 100) if req.sl_pct else None)
             tp = req.tp_price if req.tp_price is not None else (e * (1 + d * req.tp_pct / 100) if req.tp_pct else None)
             tick = s.engine.ensure_product(sym).tick_size
             if sl is not None:
-                sl = round(round(sl / tick) * tick, 10)
+                sl = float(ee.snap_to_tick(sl, tick))
                 if sl >= mark if d == 1 else sl <= mark:
                     raise HTTPException(422, f"stop-loss {sl} would trigger immediately (mark {mark})")
                 fields["sl_price"] = sl
             if tp is not None:
-                tp = round(round(tp / tick) * tick, 10)
+                tp = float(ee.snap_to_tick(tp, tick))
                 if tp <= mark if d == 1 else tp >= mark:
                     raise HTTPException(422, f"take-profit {tp} would trigger immediately (mark {mark})")
                 fields["tp_price"] = tp
@@ -781,7 +861,10 @@ def set_protection(symbol: str, req: ProtectionRequest) -> dict[str, Any]:
                 pos = s.engine.set_protection(sym, **fields)
             except DeltaAPIError as exc:
                 raise HTTPException(409, f"Delta refused the protection change: {_diagnose(exc)} — {exc.error}") from exc
-            return bot_ops._clean({"symbol": sym, "mode": mode, "position": pos, "changed": fields})
+            except ExchangeError as exc:
+                raise HTTPException(409, str(exc)) from exc
+        _invalidate_snapshot(mode, sym)
+        return bot_ops._clean({"symbol": sym, "mode": mode, "position": pos, "changed": fields})
 
 
 class CloseRequest(ActionBinding):
@@ -797,52 +880,70 @@ def close_position(symbol: str, req: CloseRequest | None = None) -> dict[str, An
         mode = guard_writable()
         n = req.contracts if req else None
         with _Session(mode) as s:
-            p = s.store.position(mode, sym)
-            if p is None and mode in EXCHANGE_MODES:
-                # exchange position the journal does not know (opened elsewhere): flatten it reduce-only, not journalled
-                ext = next((x for x in exchange_snapshot(mode, ttl=0)["positions"] if x.get("product_symbol") == sym), None)
-                if ext is None:
-                    raise HTTPException(404, f"no open {sym} position on the {mode} exchange")
-                size = int(ext["size"])
-                if n is not None and n < abs(size):
-                    size = n if size > 0 else -n
-                try:
-                    r = s.client.close_position_reduce_only(int(ext["product_id"]), size) if n is None else \
-                        s.client.place_order(product_id=int(ext["product_id"]), side="sell" if size > 0 else "buy",
-                                             size=abs(size), order_type="market_order", reduce_only=True)
-                except DeltaAPIError as exc:
-                    raise HTTPException(409, f"Delta refused the close: {_diagnose(exc)}") from exc
-                return bot_ops._clean({"symbol": sym, "mode": mode, "result": "external_close", "exchange": r,
-                                       "note": "position was not opened from this terminal; not journalled"})
+            p = _ensure_journal_position(s, sym)
             if p is None:
                 raise HTTPException(404, f"no open {sym} position")
+            if mode in EXCHANGE_MODES:
+                try:
+                    rt_size = int(s.client.get_position(int(p["product_id"])).get("size") or 0)
+                except Exception:  # noqa: BLE001
+                    rt_size = (1 if p["side"] == "LONG" else -1) * int(p["contracts"])
+                if rt_size == 0:
+                    sync_res = None
+                    try:
+                        sync_res = s.engine.sync_exchange_position(sym)
+                    except Exception:  # noqa: BLE001
+                        sync_res = None
+                    p_after = s.store.position(mode, sym)
+                    if p_after is not None:
+                        s.engine._cancel_legs(int(p_after["product_id"]), (p_after["sl_order_id"], p_after["tp_order_id"]))
+                        px = float(ticker(sym, ttl=0)["mark_price"] or p_after["entry_price"])
+                        t_us = s.engine.clock()
+                        row = s.engine._trade_row(p_after, px, px, "EXCHANGE_FLAT", t_us, 0.0, None)
+                        with s.store.tx():
+                            tid = s.store.close_position(mode, sym, row, s.engine._cooldown_until(t_us, p_after))
+                        sync_res = {"action": "exit", "trade_id": tid, **row}
+                    _invalidate_snapshot(mode, sym)
+                    return bot_ops._clean({"symbol": sym, "mode": mode, "result": (sync_res or {}).get("action", "exit"),
+                                           "trade": sync_res or {}, "remaining": 0})
             if n is not None and n > p["contracts"]:
                 raise HTTPException(422, f"position has {p['contracts']} contracts")
             try:
                 if mode in EXCHANGE_MODES:
-                    r = s.engine.exchange_reduce(sym, n, client_request_id=req.client_request_id)
+                    r = s.engine.exchange_reduce(sym, n, client_request_id=req.client_request_id if req else None)
                 else:
                     tk = ticker(sym, ttl=0)
                     raw = tk["best_bid"] if p["side"] == "LONG" else tk["best_ask"]
                     r = s.engine.manual_close(sym, n, raw)
             except (ValueError, ExchangeError) as exc:
                 raise HTTPException(409, str(exc)) from exc
-            return bot_ops._clean({"symbol": sym, "mode": mode, "result": r.get("action"), "trade": r,
-                                   "remaining": (s.store.position(mode, sym) or {"contracts": 0})["contracts"]})
+            rem = (s.store.position(mode, sym) or {"contracts": 0})["contracts"]
+        _invalidate_snapshot(mode, sym)
+        return bot_ops._clean({"symbol": sym, "mode": mode, "result": r.get("action"), "trade": r, "remaining": rem})
 
 
 # --------------------------------------------------------------------------- #
 # State for the terminal
 # --------------------------------------------------------------------------- #
 def _exchange_positions_view(mode: str, journal_positions: list[dict[str, Any]], snap: dict[str, Any]) -> list[dict[str, Any]]:
-    """Delta's positions are the truth; the journal adds SL/TP legs and source."""
+    """Delta's positions are the truth; the journal and active stop orders supply SL/TP legs and source."""
     rate = settings.FIXED_USD_INR_RATE
     by_sym = {p["symbol"]: p for p in journal_positions}
+    orders = snap.get("orders") or []
     rows = []
     for x in snap["positions"]:
         sym = x.get("product_symbol")
         size = int(x["size"])
+        pos_side = "LONG" if size > 0 else "SHORT"
+        pid = int(x.get("product_id") or 0)
         j = by_sym.pop(sym, None)
+        sl_o, tp_o = ee.ExecutionEngine._match_legs(orders, pid, pos_side)
+        live_sl = _f(sl_o.get("stop_price")) if sl_o else _f(x.get("sl_price") if x.get("sl_price") is not None else x.get("bracket_stop_loss_price"))
+        live_tp = _f(tp_o.get("stop_price")) if tp_o else _f(x.get("tp_price") if x.get("tp_price") is not None else x.get("bracket_take_profit_price"))
+        sl_price = live_sl if live_sl is not None else (j or {}).get("sl_price")
+        tp_price = live_tp if live_tp is not None else (j or {}).get("tp_price")
+        sl_order_id = str(sl_o["id"]) if sl_o and sl_o.get("id") is not None else (x.get("sl_order_id") or (j or {}).get("sl_order_id"))
+        tp_order_id = str(tp_o["id"]) if tp_o and tp_o.get("id") is not None else (x.get("tp_order_id") or (j or {}).get("tp_order_id"))
         try:
             cv = float((x.get("product") or {}).get("contract_value") or catalog().get(sym, {}).get("contract_value") or 1)
         except Exception:  # noqa: BLE001
@@ -851,11 +952,12 @@ def _exchange_positions_view(mode: str, journal_positions: list[dict[str, Any]],
         entry = float(x.get("entry_price") or 0)
         u = (1 if size > 0 else -1) * abs(size) * cv * (mark - entry) * rate if mark and entry else None
         margin_inr = float(x.get("margin") or 0) * rate
-        rows.append({**(j or {}), "symbol": sym, "side": "LONG" if size > 0 else "SHORT", "contracts": abs(size),
+        rows.append({**(j or {}), "symbol": sym, "side": pos_side, "contracts": abs(size),
                      "contract_value": cv, "entry_price": entry, "mark_price": mark, "unrealized_pnl_inr": u,
                      "roe_pct": (u / margin_inr * 100) if (u is not None and margin_inr) else None, "margin_inr": margin_inr,
                      "liq_price_est": _f(x.get("liquidation_price")), "liq_source": "delta",
                      "leverage": (j or {}).get("leverage") or (round(abs(size) * cv * entry / float(x["margin"]), 2) if x.get("margin") and float(x["margin"]) else None),
+                     "sl_price": sl_price, "tp_price": tp_price, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id,
                      "source": (j or {}).get("source", "exchange (not journalled)"), "journalled": j is not None,
                      "margin_mode": x.get("margin_mode"), "realized_funding_inr": (_f(x.get("realized_funding")) or 0) * rate})
     for sym, j in by_sym.items():  # journal says open, exchange says flat -> pending sync

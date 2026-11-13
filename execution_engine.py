@@ -38,7 +38,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import numpy as np
 import pandas as pd
@@ -98,6 +98,15 @@ BENIGN_MARGIN_CODES = (
     "no_change",
     "same_margin_mode",
     "cant_switch_with_open_orders_or_positions",
+)
+BENIGN_CANCEL_CODES = (
+    "open_order_not_found",
+    "already_cancelled",
+    "order_not_found",
+    "not_found",
+    "order_already_cancelled",
+    "order_already_closed",
+    "order_not_open",
 )
 
 
@@ -1380,9 +1389,11 @@ class ExecutionEngine:
         d = 1 if pos_side == "LONG" else -1
 
         def ok(o: dict[str, Any], kind: str) -> bool:
-            if o.get("stop_order_type") != kind or o.get("side") != exit_side or not o.get("reduce_only"):
+            if o.get("stop_order_type") != kind or (o.get("side") and o.get("side") != exit_side):
                 return False
-            if int(o.get("product_id") or product_id) != int(product_id) or o.get("state") not in (None, "open", "pending"):
+            if o.get("reduce_only") is False and not o.get("bracket_order"):
+                return False
+            if int(o.get("product_id") or product_id) != int(product_id) or o.get("state") not in (None, "open", "pending", "untriggered"):
                 return False
             if ref_price is not None and o.get("stop_price") not in (None, ""):
                 sp = float(o["stop_price"])
@@ -1866,34 +1877,68 @@ class ExecutionEngine:
         if p is None:
             raise ExchangeError(f"no open {symbol} position")
         upd = {k: v for k, v in fields.items() if k in ("sl_price", "tp_price", "trail_amount")}
-        if self.mode != "paper":
-            self.ensure_product(symbol)
+        prod = self.ensure_product(symbol) if self.mode != "paper" else None
+        if prod is not None:
+            for k in ("sl_price", "tp_price"):
+                if k in upd and upd[k] is not None:
+                    upd[k] = float(snap_to_tick(upd[k], prod.tick_size))
         if "trail_amount" in upd:
             upd["trail_amount"] = float(upd["trail_amount"] or 0)
         if "sl_price" in upd:
             upd["initial_sl"] = upd["sl_price"]  # a manual SL edit is a new initial stop (exit reason SL, not TSL)
         if self.mode != "paper":
-            pid, n = p["product_id"], p["contracts"]
+            pid, n = int(p["product_id"]), int(p["contracts"])
+            exit_side = "sell" if p["side"] == "LONG" else "buy"
+            try:
+                active_orders = self.client.get_active_orders(pid, states="open,pending") or []
+            except Exception:  # noqa: BLE001
+                active_orders = []
             for key, leg, kind in (("sl_price", "sl_order_id", "stop_loss_order"), ("tp_price", "tp_order_id", "take_profit_order")):
                 if key not in upd:
                     continue
+                cancel_ids: list[str] = []
+                if p[leg]:
+                    cancel_ids.append(str(p[leg]))
+                for o in active_orders:
+                    if (
+                        isinstance(o, dict)
+                        and int(o.get("product_id") or pid) == pid
+                        and o.get("stop_order_type") == kind
+                        and o.get("id") is not None
+                        and str(o["id"]) not in cancel_ids
+                    ):
+                        cancel_ids.append(str(o["id"]))
+                for oid in cancel_ids:
+                    try:
+                        self.client.cancel_order(pid, order_id=oid)
+                    except DeltaAPIError as exc:
+                        code = str(exc.code or "").lower()
+                        text = json.dumps(exc.error).lower()
+                        if exc.status == 404 or code in BENIGN_CANCEL_CODES or any(c in text for c in BENIGN_CANCEL_CODES) or "not found" in text or "already" in text:
+                            continue
+                        self._event("WARN", "leg_cancel_failed", symbol, str(exc))
+                    except Exception as exc:  # noqa: BLE001
+                        self._event("WARN", "leg_cancel_failed", symbol, str(exc))
                 if upd[key] is None:  # remove protection: cancel the live leg
-                    if p[leg]:
-                        try:
-                            self.client.cancel_order(pid, order_id=p[leg])
-                        except DeltaAPIError as exc:
-                            self._event("WARN", "leg_cancel_failed", symbol, str(exc))
                     upd[leg] = None
                     continue
-                if p[leg]:
-                    self.client.edit_order(order_id=p[leg], product_id=pid, size=n, stop_price=upd[key])
-                else:
-                    self.client.place_position_bracket(pid, {"order_type": "market_order", "stop_price": upd[key]} if kind == "stop_loss_order" else None,
-                                                       {"order_type": "market_order", "stop_price": upd[key]} if kind == "take_profit_order" else None,
-                                                       TRIGGER_METHOD)
-                    sl_o, tp_o = self._match_legs(self.client.get_active_orders(pid, states="open,pending"), pid, p["side"])
-                    upd["sl_order_id"] = str(sl_o["id"]) if sl_o else p["sl_order_id"]
-                    upd["tp_order_id"] = str(tp_o["id"]) if tp_o else p["tp_order_id"]
+                q_price = snap_to_tick(upd[key], prod.tick_size) if prod is not None else upd[key]
+                order = self.client.place_order(
+                    product_id=pid,
+                    side=exit_side,
+                    size=n,
+                    order_type="market_order",
+                    stop_order_type=kind,
+                    stop_price=str(q_price),
+                    stop_trigger_method="mark_price",
+                    reduce_only=True,
+                    client_order_id=self.new_client_oid(symbol, "S" if kind == "stop_loss_order" else "T"),
+                )
+                upd[leg] = str(order["id"]) if isinstance(order, dict) and order.get("id") is not None else None
+                if isinstance(order, dict) and order.get("stop_price") not in (None, ""):
+                    upd[key] = float(order["stop_price"])
+                    if key == "sl_price":
+                        upd["initial_sl"] = upd[key]
         self.store.update_position(self.mode, symbol, **upd)
         self._event("INFO", "protection_updated", symbol, upd)
         return dict(self.store.position(self.mode, symbol))
@@ -2091,15 +2136,37 @@ class ExecutionEngine:
                     self._event("CRITICAL", "leg_resize_failed", symbol, {"leg": p[leg], "error": str(exc)})
         return done
 
-    def _cancel_legs(self, product_id: int) -> list[str]:
-        out = []
-        for o in self.client.get_active_orders(product_id):
-            if o.get("stop_order_type") in ("stop_loss_order", "take_profit_order"):
-                try:
-                    self.client.cancel_order(product_id, order_id=o["id"])
-                    out.append(str(o["id"]))
-                except ExchangeError as exc:
-                    self._event("WARN", "leg_cancel_failed", None, str(exc))
+    def _cancel_legs(self, product_id: int, extra_order_ids: Iterable[Any] = ()) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        try:
+            active = self.client.get_active_orders(product_id) or []
+        except Exception:  # noqa: BLE001
+            active = []
+        candidates: list[Any] = [
+            o["id"]
+            for o in active
+            if isinstance(o, dict) and o.get("stop_order_type") in ("stop_loss_order", "take_profit_order") and o.get("id") is not None
+        ]
+        for x in extra_order_ids:
+            if x not in (None, ""):
+                candidates.append(x)
+        for oid in candidates:
+            s_oid = str(oid)
+            if s_oid in seen:
+                continue
+            seen.add(s_oid)
+            try:
+                self.client.cancel_order(product_id, order_id=oid)
+                out.append(s_oid)
+            except DeltaAPIError as exc:
+                code = str(exc.code or "").lower()
+                text = json.dumps(exc.error).lower()
+                if exc.status == 404 or code in BENIGN_CANCEL_CODES or any(c in text for c in BENIGN_CANCEL_CODES) or "not found" in text or "already" in text:
+                    continue
+                self._event("WARN", "leg_cancel_failed", None, str(exc))
+            except ExchangeError as exc:
+                self._event("WARN", "leg_cancel_failed", None, str(exc))
         return out
 
     def _unresolved_exit(self, symbol: str) -> str | None:
@@ -2127,6 +2194,8 @@ class ExecutionEngine:
         n = n_all if contracts is None else int(contracts)
         if not 1 <= n <= n_all:
             raise ValueError(f"cannot close {n} of {n_all} contracts")
+        if n == n_all:
+            self._cancel_legs(int(p["product_id"]), (p["sl_order_id"], p["tp_order_id"]))
         d = 1 if p["side"] == "LONG" else -1
         intent = self.store.create_intent(
             intent_id=f"mx-{secrets.token_hex(8)}", client_order_id=self.new_client_oid(symbol, "C"), mode=self.mode,
@@ -2145,6 +2214,17 @@ class ExecutionEngine:
         except (DeltaAPIError, RateLimitedError) as exc:
             self.store.transition(iid, "REJECTED", str(exc), error=str(exc))
             raise
+        if isinstance(order, dict) and order.get("state") in ("open", "pending") and order.get("id") is not None:
+            for _ in range(5):
+                time.sleep(0.15)
+                try:
+                    polled = self.client.get_order_by_id(order["id"])
+                    if isinstance(polled, dict) and polled.get("id") is not None:
+                        order = polled
+                        if order.get("state") not in ("open", "pending"):
+                            break
+                except Exception:  # noqa: BLE001
+                    break
         r = self._apply_order(iid, order)
         if r["action"] == "cancelled":
             raise ExchangeError(f"{symbol}: reduce-only close did not fill (state {order.get('state')})")

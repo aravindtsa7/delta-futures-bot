@@ -1972,19 +1972,43 @@ function mtRender(s, forceChart) {
       ${td(inr(p.margin_inr, false))}${td(`<span class="${cls(p.unrealized_pnl_inr)}">${inr(p.unrealized_pnl_inr)}</span>`)}
       ${td(`<span class="${cls(p.roe_pct)}">${pct(p.roe_pct, true)}</span>`)}${td(isNum(p.sl_price) ? fmtPx(p.sl_price) : "–")}
       ${td(isNum(p.tp_price) ? fmtPx(p.tp_price) : "–")}${td(p.trail_amount ? p.trail_amount : "–")}${td(esc(p.source || "bot"), "l")}
-      <td class="l"><button class="btn btn-xs" data-edit="${esc(p.symbol)}">Edit SL/TP</button>
-      <button class="btn btn-xs btn-danger" data-close="${esc(p.symbol)}">Close</button>
-      <button class="btn btn-xs" data-part="${esc(p.symbol)}">Close part…</button></td></tr>`).join("")
+      <td class="l"><button class="btn btn-xs" data-edit="${esc(p.symbol)}">SL/TP</button>
+      <button class="btn btn-xs" data-half="${esc(p.symbol)}" data-need-multi="${p.contracts < 2 ? "1" : "0"}" title="${p.contracts < 2 ? "Need >= 2 contracts for 50% close" : `Close 50% (${Math.floor(p.contracts / 2)}) of ${p.contracts} contracts at market`}">50%</button>
+      <button class="btn btn-xs" data-part="${esc(p.symbol)}" data-need-multi="${p.contracts < 2 ? "1" : "0"}" title="${p.contracts < 2 ? "Need >= 2 contracts for 50% close" : "Close a custom number of contracts"}">Close part…</button>
+      <button class="btn btn-xs btn-danger" data-close="${esc(p.symbol)}">Close</button></td></tr>`).join("")
       : `<tr><td class="l muted" colspan="15">No open positions</td></tr>`) + "</tbody>";
   $("mtPositions").querySelectorAll("[data-edit]").forEach((b) => { b.onclick = () => mtOpenProtect(b.dataset.edit); });
+  $("mtPositions").querySelectorAll("[data-half]").forEach((b) => { b.onclick = () => {
+    const p = pos.find((x) => x.symbol === b.dataset.half);
+    if (!p) return;
+    if (p.contracts < 2) {
+      mtMsg("Need >= 2 contracts for 50% close (use Close for 1 contract)", true);
+      toast("Need >= 2 contracts for 50% close", true);
+      return;
+    }
+    mtClose(p.symbol, Math.floor(p.contracts / 2));
+  }; });
   $("mtPositions").querySelectorAll("[data-close]").forEach((b) => { b.onclick = () => mtClose(b.dataset.close, null); });
   $("mtPositions").querySelectorAll("[data-part]").forEach((b) => { b.onclick = () => {
     const p = pos.find((x) => x.symbol === b.dataset.part);
-    const n = Number(prompt(`Close how many of ${p.contracts} ${p.symbol} contracts?`, String(Math.max(1, Math.floor(p.contracts / 2)))));
-    if (n >= 1) mtClose(p.symbol, Math.floor(n));
+    if (!p) return;
+    if (p.contracts < 2) {
+      mtMsg("Need >= 2 contracts for 50% close (use Close for 1 contract)", true);
+      toast("Need >= 2 contracts for 50% close", true);
+      return;
+    }
+    const raw = prompt(`Close how many of ${p.contracts} ${p.symbol} contracts?`, String(Math.max(1, Math.floor(p.contracts / 2))));
+    if (raw === null) return;
+    const n = Math.floor(Number(raw));
+    if (!Number.isFinite(n) || n < 1 || n > p.contracts) {
+      mtMsg(`Enter a whole number of contracts between 1 and ${p.contracts}`, true);
+      toast(`Enter 1 to ${p.contracts} contracts`, true);
+      return;
+    }
+    mtClose(p.symbol, n);
   }; });
   const disabled = !s.manual_enabled;
-  $("mtPositions").querySelectorAll("button").forEach((b) => { b.disabled = disabled; });
+  $("mtPositions").querySelectorAll("button").forEach((b) => { b.disabled = disabled || b.dataset.needMulti === "1"; });
 
   const pend = s.pending_orders || [];
   $("mtPending").innerHTML = `<thead><tr><th class="l">Symbol</th><th class="l">Side</th><th>Size</th><th>Limit</th><th>Lev</th><th>SL</th><th>TP</th><th class="l"></th></tr></thead><tbody>` +
@@ -2040,13 +2064,15 @@ async function mtSelect(sym, add = false) {
 }
 
 function mtOpenProtect(sym) {
-  const p = mt.state.positions.find((x) => x.symbol === sym);
+  const p = mt.state && mt.state.positions && mt.state.positions.find((x) => x.symbol === sym);
   if (!p) return;
   mt.protectSym = sym;
+  const exch = mt.state.mode !== "paper";
   $("mtProtectTitle").textContent = `Edit protection — ${sym} ${p.side} ${p.contracts} @ ${fmtPx(p.entry_price)} (mark ${fmtPx(p.mark_price)}, est. liq ${fmtPx(p.liq_price_est)})`;
   $("mtPSl").value = isNum(p.sl_price) ? p.sl_price : "";
   $("mtPTp").value = isNum(p.tp_price) ? p.tp_price : "";
-  $("mtPTrail").value = p.trail_amount || 0;
+  $("mtPTrail").value = exch ? "" : (p.trail_amount || 0);
+  $("mtPTrail").disabled = exch;
   $("mtPClearSl").checked = false;
   $("mtPClearTp").checked = false;
   $("mtProtectMsg").textContent = "";
@@ -2056,24 +2082,43 @@ function mtOpenProtect(sym) {
 async function mtSaveProtect(ev) {
   if (ev.submitter && ev.submitter.value === "cancel") return;
   ev.preventDefault();
+  if (!mt.state || !mt.protectSym) return;
+  const p = (mt.state.positions || []).find((x) => x.symbol === mt.protectSym);
   const body = {};
-  const sl = Number($("mtPSl").value), tp = Number($("mtPTp").value);
-  if ($("mtPClearSl").checked) body.clear_sl = true; else if (sl > 0) body.sl_price = sl;
-  if ($("mtPClearTp").checked) body.clear_tp = true; else if (tp > 0) body.tp_price = tp;
-  if ($("mtPTrail").value !== "") body.trail_amount = Number($("mtPTrail").value);
+  const slRaw = $("mtPSl").value.trim(), tpRaw = $("mtPTp").value.trim();
+  const sl = Number(slRaw), tp = Number(tpRaw);
+  if ($("mtPClearSl").checked || (slRaw === "" && p && isNum(p.sl_price))) body.clear_sl = true;
+  else if (slRaw !== "" && Number.isFinite(sl) && sl > 0) body.sl_price = sl;
+  if ($("mtPClearTp").checked || (tpRaw === "" && p && isNum(p.tp_price))) body.clear_tp = true;
+  else if (tpRaw !== "" && Number.isFinite(tp) && tp > 0) body.tp_price = tp;
+  if (mt.state.mode === "paper" && $("mtPTrail").value !== "") body.trail_amount = Number($("mtPTrail").value);
+  if (!Object.keys(body).length) {
+    $("mtProtectMsg").textContent = "Enter a Stop-Loss or Take-Profit price (or check Clear).";
+    return;
+  }
   let typed = null;
   if (mt.state.real_money && !(typed = mtLiveConfirm(`change SL/TP of the LIVE ${mt.protectSym} position on Delta Exchange India?`))) return;
   Object.assign(body, mtBinding(mt.state, typed));
   try {
-    await api(`/api/manual/position/${mt.protectSym}/protection`, { method: "PUT", body: JSON.stringify(body) });
+    await api(`/api/manual/position/${encodeURIComponent(mt.protectSym)}/protection`, { method: "PUT", body: JSON.stringify(body) });
     $("mtProtectDialog").close();
+    mtMsg(`${mt.protectSym} SL/TP protection updated`);
     toast(`${mt.protectSym} protection updated`);
-    mtLoadState();
-  } catch (e) { $("mtProtectMsg").textContent = e.message; }
+    await mtLoadState(true);
+  } catch (e) {
+    $("mtProtectMsg").textContent = e.message;
+    toast(`SL/TP update failed: ${e.message}`, true);
+  }
 }
 
 async function mtClose(sym, contracts) {
-  const p = mt.state.positions.find((x) => x.symbol === sym);
+  const p = mt.state && mt.state.positions && mt.state.positions.find((x) => x.symbol === sym);
+  if (!p) return;
+  if (contracts !== null && contracts !== undefined && contracts < 1) {
+    mtMsg("Need >= 2 contracts for 50% close", true);
+    toast("Need >= 2 contracts for 50% close", true);
+    return;
+  }
   const q = `Close ${contracts ?? p.contracts} of ${p.contracts} ${sym} ${p.side} at market (reduce-only)?`;
   let typed = null;
   if (mt.state.real_money) {
@@ -2082,12 +2127,16 @@ async function mtClose(sym, contracts) {
   const body = { ...mtBinding(mt.state, typed), client_request_id: mtNewRequestId() };
   if (contracts) body.contracts = contracts;
   try {
-    const r = await api(`/api/manual/position/${sym}/close`, { method: "POST", body: JSON.stringify(body) });
+    const r = await api(`/api/manual/position/${encodeURIComponent(sym)}/close`, { method: "POST", body: JSON.stringify(body) });
     const t = r.trade || {};
-    mtMsg(`${sym}: ${r.result} @ ${fmtPx(t.exit_price)} · net ${inr(t.net_pnl_inr)} · ${r.remaining} left`);
-    toast(`${sym} closed: net ${inr(t.net_pnl_inr)}`);
+    const px = t.exit_price ?? t.price;
+    const net = t.net_pnl_inr;
+    const rem = r.remaining ?? 0;
+    mtMsg(`${sym}: ${r.result}${isNum(px) ? ` @ ${fmtPx(px)}` : ""}${isNum(net) ? ` · net ${inr(net)}` : ""} · ${rem} left`);
+    toast(`${sym} ${rem > 0 ? `reduced (${rem} left)` : "closed"}${isNum(net) ? `: net ${inr(net)}` : ""}`);
   } catch (e) { mtMsg(`Close failed: ${e.message}`, true); toast(e.message, true); }
-  mtLoadState(true);
+  await mtLoadState(true);
+  mtSchedulePreview();
 }
 
 function mtEnter() {
