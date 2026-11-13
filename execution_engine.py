@@ -1889,56 +1889,54 @@ class ExecutionEngine:
         if self.mode != "paper":
             pid, n = int(p["product_id"]), int(p["contracts"])
             exit_side = "sell" if p["side"] == "LONG" else "buy"
-            try:
-                active_orders = self.client.get_active_orders(pid, states="open,pending") or []
-            except Exception:  # noqa: BLE001
-                active_orders = []
+            # A failed read must not turn an edit into duplicate protective orders.
+            active_orders = self.client.get_active_orders(pid, states="open,pending") or []
             for key, leg, kind in (("sl_price", "sl_order_id", "stop_loss_order"), ("tp_price", "tp_order_id", "take_profit_order")):
                 if key not in upd:
                     continue
-                cancel_ids: list[str] = []
-                if p[leg]:
-                    cancel_ids.append(str(p[leg]))
-                for o in active_orders:
-                    if (
-                        isinstance(o, dict)
-                        and int(o.get("product_id") or pid) == pid
-                        and o.get("stop_order_type") == kind
-                        and o.get("id") is not None
-                        and str(o["id"]) not in cancel_ids
-                    ):
-                        cancel_ids.append(str(o["id"]))
-                for oid in cancel_ids:
-                    try:
-                        self.client.cancel_order(pid, order_id=oid)
-                    except DeltaAPIError as exc:
-                        code = str(exc.code or "").lower()
-                        text = json.dumps(exc.error).lower()
-                        if exc.status == 404 or code in BENIGN_CANCEL_CODES or any(c in text for c in BENIGN_CANCEL_CODES) or "not found" in text or "already" in text:
-                            continue
-                        self._event("WARN", "leg_cancel_failed", symbol, str(exc))
-                    except Exception as exc:  # noqa: BLE001
-                        self._event("WARN", "leg_cancel_failed", symbol, str(exc))
-                if upd[key] is None:  # remove protection: cancel the live leg
+                matched = self._match_legs(active_orders, pid, p["side"])
+                existing = matched[0 if kind == "stop_loss_order" else 1]
+                candidates = [o for o in active_orders
+                              if self._match_legs([o], pid, p["side"])[0 if kind == "stop_loss_order" else 1]]
+                if upd[key] is None:
+                    for o in candidates:
+                        self.client.cancel_order(pid, order_id=o["id"])
                     upd[leg] = None
+                else:
+                    q_price = snap_to_tick(upd[key], prod.tick_size)
+                    if existing is not None:
+                        # Keep the existing protection in place if Delta rejects an edit.
+                        order = self.client.edit_order(existing["id"], pid, n, stop_price=str(q_price))
+                    else:
+                        # Delta India supports standalone reduce-only stop-market orders
+                        # on existing positions; no new entry or initial bracket is required.
+                        order = self.client.place_order(
+                            product_id=pid, side=exit_side, size=n, order_type="market_order",
+                            stop_order_type=kind, stop_price=str(q_price),
+                            stop_trigger_method="mark_price", reduce_only=True,
+                            client_order_id=self.new_client_oid(symbol, "S" if kind == "stop_loss_order" else "T"))
+                    upd[leg] = str(order["id"])
+                    for o in candidates:
+                        if str(o["id"]) != upd[leg]:
+                            self.client.cancel_order(pid, order_id=o["id"])
+                # Persist each acknowledged leg: a later TP failure must not hide an SL
+                # that has already been accepted by the exchange.
+                saved = {key: upd[key], leg: upd[leg]}
+                if key == "sl_price":
+                    saved["initial_sl"] = upd[key]
+                self.store.update_position(self.mode, symbol, **saved)
+            readback = self.client.get_active_orders(pid, states="open,pending") or []
+            for key, leg, kind in (("sl_price", "sl_order_id", "stop_loss_order"), ("tp_price", "tp_order_id", "take_profit_order")):
+                if key not in upd:
                     continue
-                q_price = snap_to_tick(upd[key], prod.tick_size) if prod is not None else upd[key]
-                order = self.client.place_order(
-                    product_id=pid,
-                    side=exit_side,
-                    size=n,
-                    order_type="market_order",
-                    stop_order_type=kind,
-                    stop_price=str(q_price),
-                    stop_trigger_method="mark_price",
-                    reduce_only=True,
-                    client_order_id=self.new_client_oid(symbol, "S" if kind == "stop_loss_order" else "T"),
-                )
-                upd[leg] = str(order["id"]) if isinstance(order, dict) and order.get("id") is not None else None
-                if isinstance(order, dict) and order.get("stop_price") not in (None, ""):
-                    upd[key] = float(order["stop_price"])
-                    if key == "sl_price":
-                        upd["initial_sl"] = upd[key]
+                actual = self._match_legs(readback, pid, p["side"])[0 if kind == "stop_loss_order" else 1]
+                if upd[key] is None:
+                    if actual is not None:
+                        raise ExchangeError(f"{symbol}: {kind} removal not confirmed by Delta readback")
+                elif (actual is None or str(actual["id"]) != upd[leg]
+                      or float(actual.get("stop_price") or 0) != upd[key]
+                      or (not actual.get("bracket_order") and int(actual.get("size") or 0) != n)):
+                    raise ExchangeError(f"{symbol}: {kind} update not confirmed by Delta readback; refresh positions")
         self.store.update_position(self.mode, symbol, **upd)
         self._event("INFO", "protection_updated", symbol, upd)
         return dict(self.store.position(self.mode, symbol))
@@ -2248,7 +2246,7 @@ class ExecutionEngine:
                 out.append({"intent_id": it["intent_id"], "error": str(exc)})
         return out
 
-    def sync_exchange_position(self, symbol: str) -> dict[str, Any] | None:
+    def sync_exchange_position(self, symbol: str, position: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """testnet/live: bring the journal position in line with Delta's real-time position (Source #3).
         flat -> book the exit (SL/TP leg or external fills); smaller -> book the external partial close; larger -> adopt
         the external add (size, average entry); side flipped -> close the journal position (the new side shows as an
@@ -2265,7 +2263,7 @@ class ExecutionEngine:
             if self.store.one(f"SELECT 1 FROM order_intents WHERE mode=? AND symbol=? AND state IN "
                               f"({','.join('?' * len(UNRESOLVED_STATES))})", (self.mode, symbol, *UNRESOLVED_STATES)):
                 return {"action": "deferred", "reason": "an unresolved intent may explain the exchange position"}
-        pos = self.client.get_position(p["product_id"])
+        pos = position if position is not None else self.client.get_position(p["product_id"])
         d = 1 if p["side"] == "LONG" else -1
         ex, j = int(pos["size"]), d * int(p["contracts"])
         if ex == j:

@@ -988,10 +988,16 @@
   <dialog id="mtProtectDialog">
     <form method="dialog" id="mtProtectForm">
       <h3 id="mtProtectTitle">Edit protection</h3>
-      <div class="row2">
-        <div class="field"><label for="mtPSl">Stop-loss price</label><input id="mtPSl" type="number" step="any" min="0"></div>
-        <div class="field"><label for="mtPTp">Take-profit price</label><input id="mtPTp" type="number" step="any" min="0"></div>
+      <p id="mtProtectPosition" class="hint"></p>
+      <div class="field"><label for="mtPReference">Percentage reference</label>
+        <select id="mtPReference"><option value="entry">Entry Price</option><option value="mark">Current Mark Price</option></select>
+        <span class="hint">Percentages measure price movement, not leveraged return. Triggers use Mark Price.</span>
       </div>
+      <div class="row2">
+        <div class="field"><label for="mtPSl">Stop-loss <select id="mtPSlMode" class="mt-mini"><option value="pct">%</option><option value="price">Price ($)</option></select></label><input id="mtPSl" type="number" step="any" min="0"><span id="mtPSlPreview" class="hint" aria-live="polite"></span></div>
+        <div class="field"><label for="mtPTp">Take-profit <select id="mtPTpMode" class="mt-mini"><option value="pct">%</option><option value="price">Price ($)</option></select></label><input id="mtPTp" type="number" step="any" min="0"><span id="mtPTpPreview" class="hint" aria-live="polite"></span></div>
+      </div>
+      <p class="hint">Preview PnL is from entry, before fees, funding and slippage. Mark and triggers are rechecked on Save.</p>
       <div class="field"><label for="mtPTrail">Trailing distance (0 = off)</label><input id="mtPTrail" type="number" step="any" min="0"></div>
       <label class="inline"><input type="checkbox" id="mtPClearSl"> remove stop-loss</label>
       <label class="inline"><input type="checkbox" id="mtPClearTp"> remove take-profit</label>

@@ -300,7 +300,10 @@ function fmtTime(x) {
   const d = typeof x === "number" ? new Date(x * 1000) : new Date(x);
   return d.toISOString().slice(0, 16).replace("T", " ");
 }
-function decimals(step) { const s = String(step); return s.includes(".") ? s.split(".")[1].length : 0; }
+function decimals(step) {
+  const [base, exponent] = String(step).toLowerCase().split("e");
+  return Math.max(0, (base.split(".")[1] || "").length - Number(exponent || 0));
+}
 function esc(s) { return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 
 function toast(msg, isError = false) {
@@ -1754,9 +1757,9 @@ function mtLiveConfirm(question) {
 }
 const LEV_CHIPS = [1, 2, 3, 5, 10, 20, 25, 50, 75, 100, 125, 150, 200];
 
-function fmtPx(x) {
+function fmtPx(x, tickSize) {
   if (!isNum(x)) return "–";
-  const t = mt.product ? mt.product.tick_size : 0.01;
+  const t = tickSize || (mt.product ? mt.product.tick_size : 0.01);
   const d = Math.min(8, Math.max(2, decimals(t)));
   return x.toLocaleString("en-IN", { minimumFractionDigits: d, maximumFractionDigits: d });
 }
@@ -1928,6 +1931,7 @@ function mtRenderLines(positions) {
 
 function mtRender(s, forceChart) {
   mt.state = s;
+  if ($("mtProtectDialog").open) mtProtectPreview();
   mt.product = s.product;
   const w = s.wallet;
   const mode = (s.mode || s.journal.mode || "paper").toUpperCase();
@@ -1968,10 +1972,10 @@ function mtRender(s, forceChart) {
   $("mtPositions").innerHTML = `<thead><tr><th class="l">Symbol</th><th class="l">Side</th><th>Lev</th><th>Contracts</th><th>Entry</th><th>Mark</th>
     <th>Est. liq</th><th>Margin ₹</th><th>uPnL ₹</th><th>ROE</th><th>SL</th><th>TP</th><th>Trail</th><th class="l">Source</th><th class="l">Actions</th></tr></thead><tbody>` +
     (pos.length ? pos.map((p) => `<tr>${td(esc(p.symbol), "l")}${td(`<span class="${p.side === "LONG" ? "pos" : "neg"}">${p.side}</span>`, "l")}
-      ${td(p.leverage ? `${p.leverage}x` : "–")}${td(p.contracts)}${td(fmtPx(p.entry_price))}${td(fmtPx(p.mark_price))}${td(`<span class="neg">${fmtPx(p.liq_price_est)}</span>${p.liq_source === "delta" ? ' <span class="muted">Δ</span>' : ""}`)}
+      ${td(p.leverage ? `${p.leverage}x` : "–")}${td(p.contracts)}${td(fmtPx(p.entry_price, p.tick_size))}${td(fmtPx(p.mark_price, p.tick_size))}${td(`<span class="neg">${fmtPx(p.liq_price_est, p.tick_size)}</span>${p.liq_source === "delta" ? ' <span class="muted">Δ</span>' : ""}`)}
       ${td(inr(p.margin_inr, false))}${td(`<span class="${cls(p.unrealized_pnl_inr)}">${inr(p.unrealized_pnl_inr)}</span>`)}
-      ${td(`<span class="${cls(p.roe_pct)}">${pct(p.roe_pct, true)}</span>`)}${td(isNum(p.sl_price) ? fmtPx(p.sl_price) : "–")}
-      ${td(isNum(p.tp_price) ? fmtPx(p.tp_price) : "–")}${td(p.trail_amount ? p.trail_amount : "–")}${td(esc(p.source || "bot"), "l")}
+      ${td(`<span class="${cls(p.roe_pct)}">${pct(p.roe_pct, true)}</span>`)}${td(isNum(p.sl_price) ? fmtPx(p.sl_price, p.tick_size) : "–")}
+      ${td(isNum(p.tp_price) ? fmtPx(p.tp_price, p.tick_size) : "–")}${td(p.trail_amount ? p.trail_amount : "–")}${td(esc(p.source || "bot"), "l")}
       <td class="l"><button class="btn btn-xs" data-edit="${esc(p.symbol)}">SL/TP</button>
       <button class="btn btn-xs" data-half="${esc(p.symbol)}" data-need-multi="${p.contracts < 2 ? "1" : "0"}" title="${p.contracts < 2 ? "Need >= 2 contracts for 50% close" : `Close 50% (${Math.floor(p.contracts / 2)}) of ${p.contracts} contracts at market`}">50%</button>
       <button class="btn btn-xs" data-part="${esc(p.symbol)}" data-need-multi="${p.contracts < 2 ? "1" : "0"}" title="${p.contracts < 2 ? "Need >= 2 contracts for 50% close" : "Close a custom number of contracts"}">Close part…</button>
@@ -2067,8 +2071,14 @@ function mtOpenProtect(sym) {
   const p = mt.state && mt.state.positions && mt.state.positions.find((x) => x.symbol === sym);
   if (!p) return;
   mt.protectSym = sym;
+  mt.protectBinding = mtBinding(mt.state);
+  mt.protectBusy = false;
   const exch = mt.state.mode !== "paper";
-  $("mtProtectTitle").textContent = `Edit protection — ${sym} ${p.side} ${p.contracts} @ ${fmtPx(p.entry_price)} (mark ${fmtPx(p.mark_price)}, est. liq ${fmtPx(p.liq_price_est)})`;
+  $("mtProtectTitle").textContent = `Edit protection — ${sym}`;
+  $("mtPReference").value = "entry";
+  // Existing triggers stay exact prices; empty legs use the order form's units (default %).
+  $("mtPSlMode").value = isNum(p.sl_price) ? "price" : ($("mtSlMode").value || "pct");
+  $("mtPTpMode").value = isNum(p.tp_price) ? "price" : ($("mtTpMode").value || "pct");
   $("mtPSl").value = isNum(p.sl_price) ? p.sl_price : "";
   $("mtPTp").value = isNum(p.tp_price) ? p.tp_price : "";
   $("mtPTrail").value = exch ? "" : (p.trail_amount || 0);
@@ -2076,29 +2086,82 @@ function mtOpenProtect(sym) {
   $("mtPClearSl").checked = false;
   $("mtPClearTp").checked = false;
   $("mtProtectMsg").textContent = "";
+  mtProtectPreview();
   $("mtProtectDialog").showModal();
+}
+
+function mtProtectValues() {
+  if (!mt.state || !mt.protectBinding || mt.state.mode !== mt.protectBinding.expected_mode ||
+      mt.state.mode_generation !== mt.protectBinding.mode_generation) throw new Error("Trading mode changed; reopen SL/TP.");
+  const p = (mt.state.positions || []).find((x) => x.symbol === mt.protectSym);
+  if (!p || p.stale) throw new Error("Position is no longer open; refresh and reopen SL/TP.");
+  const product = (mt.catalog || {})[p.symbol] || (mt.product?.symbol === p.symbol ? mt.product : {});
+  const tick = Number(p.tick_size || product.tick_size);
+  if (!(tick > 0)) throw new Error("Tick size unavailable; refresh the position.");
+  const d = p.side === "LONG" ? 1 : -1, ref = $("mtPReference").value === "mark" ? p.mark_price : p.entry_price;
+  const priceText = v => Number(v).toFixed(Math.min(12, decimals(tick)));
+  const body = { reference: $("mtPReference").value }, previews = {}, errors = [];
+  for (const [leg, id, clearId, sign] of [["sl", "mtPSl", "mtPClearSl", -1], ["tp", "mtPTp", "mtPClearTp", 1]]) {
+    const clear = $(clearId).checked, raw = $(id).value.trim(), mode = $(id + "Mode").value;
+    $(id).disabled = clear;
+    $(id).placeholder = mode === "pct" ? "e.g. 6 (%)" : "Trigger price ($)";
+    if (clear) { body[`clear_${leg}`] = true; previews[leg] = "Remove this trigger"; continue; }
+    if (raw === "") { previews[leg] = "Unchanged"; continue; }
+    const value = Number(raw);
+    const boundedPercent = leg === "sl" || p.side === "SHORT";
+    if (!Number.isFinite(value) || value <= 0 || (mode === "pct" && boundedPercent && value >= 100)) {
+      errors.push(`${leg.toUpperCase()}: enter ${mode === "pct" ? (boundedPercent ? "a percentage between 0 and 100" : "a positive percentage") : "a positive price"}.`);
+      previews[leg] = "Invalid value"; continue;
+    }
+    const rawPrice = mode === "pct" ? ref * (1 + sign * d * value / 100) : value;
+    // Positive prices use the same nearest-tick, half-up rounding as the server.
+    const units = rawPrice / tick;
+    const price = Number((Math.floor(units + 0.5 + Number.EPSILON * units * 2) * tick).toFixed(Math.min(12, decimals(tick))));
+    const pnl = d * p.contracts * p.contract_value * (price - p.entry_price) * (mt.state.usd_inr_rate || 85);
+    previews[leg] = `Trigger $${priceText(price)} · est. PnL ${inr(pnl)}`;
+    if (!(p.mark_price > 0) || price <= 0 || sign * d * (price - p.mark_price) <= 0) {
+      errors.push(`${leg.toUpperCase()} would trigger immediately against Mark Price. Adjust it or choose Current Mark Price as the percentage reference.`);
+    }
+    body[`${leg}_${mode === "pct" ? "pct" : "price"}`] = value;
+  }
+  return { p, body, previews, errors, priceText };
+}
+
+function mtProtectPreview() {
+  try {
+    const { p, previews, errors } = mtProtectValues();
+    const positionPrice = v => Number(v).toLocaleString("en-IN", { maximumFractionDigits: 12 });
+    $("mtProtectPosition").textContent = `${p.symbol} · ${p.side} · ${p.contracts} contracts · Entry $${positionPrice(p.entry_price)} · Mark $${positionPrice(p.mark_price)}`;
+    $("mtPSlPreview").textContent = previews.sl;
+    $("mtPTpPreview").textContent = previews.tp;
+    $("mtProtectMsg").textContent = errors.join(" ");
+    $("mtProtectSave").disabled = mt.protectBusy || errors.length > 0;
+  } catch (e) {
+    $("mtProtectMsg").textContent = e.message;
+    $("mtProtectSave").disabled = true;
+  }
 }
 
 async function mtSaveProtect(ev) {
   if (ev.submitter && ev.submitter.value === "cancel") return;
   ev.preventDefault();
-  if (!mt.state || !mt.protectSym) return;
-  const p = (mt.state.positions || []).find((x) => x.symbol === mt.protectSym);
-  const body = {};
-  const slRaw = $("mtPSl").value.trim(), tpRaw = $("mtPTp").value.trim();
-  const sl = Number(slRaw), tp = Number(tpRaw);
-  if ($("mtPClearSl").checked || (slRaw === "" && p && isNum(p.sl_price))) body.clear_sl = true;
-  else if (slRaw !== "" && Number.isFinite(sl) && sl > 0) body.sl_price = sl;
-  if ($("mtPClearTp").checked || (tpRaw === "" && p && isNum(p.tp_price))) body.clear_tp = true;
-  else if (tpRaw !== "" && Number.isFinite(tp) && tp > 0) body.tp_price = tp;
+  if (!mt.state || !mt.protectSym || mt.protectBusy) return;
+  let body;
+  try {
+    const values = mtProtectValues();
+    if (values.errors.length) throw new Error(values.errors.join(" "));
+    body = values.body;
+  } catch (e) { $("mtProtectMsg").textContent = e.message; return; }
   if (mt.state.mode === "paper" && $("mtPTrail").value !== "") body.trail_amount = Number($("mtPTrail").value);
-  if (!Object.keys(body).length) {
-    $("mtProtectMsg").textContent = "Enter a Stop-Loss or Take-Profit price (or check Clear).";
+  if (Object.keys(body).length === 1) {
+    $("mtProtectMsg").textContent = "Enter a Stop-Loss or Take-Profit (or check Remove).";
     return;
   }
   let typed = null;
   if (mt.state.real_money && !(typed = mtLiveConfirm(`change SL/TP of the LIVE ${mt.protectSym} position on Delta Exchange India?`))) return;
   Object.assign(body, mtBinding(mt.state, typed));
+  mt.protectBusy = true;
+  $("mtProtectSave").disabled = true;
   try {
     await api(`/api/manual/position/${encodeURIComponent(mt.protectSym)}/protection`, { method: "PUT", body: JSON.stringify(body) });
     $("mtProtectDialog").close();
@@ -2108,6 +2171,9 @@ async function mtSaveProtect(ev) {
   } catch (e) {
     $("mtProtectMsg").textContent = e.message;
     toast(`SL/TP update failed: ${e.message}`, true);
+  } finally {
+    mt.protectBusy = false;
+    $("mtProtectSave").disabled = false;
   }
 }
 
@@ -2248,6 +2314,10 @@ function bindManual() {
     mtLoadState();
   };
   $("mtProtectForm").addEventListener("submit", mtSaveProtect);
+  ["mtPSl", "mtPTp", "mtPSlMode", "mtPTpMode", "mtPReference", "mtPClearSl", "mtPClearTp"].forEach(id => {
+    $(id).addEventListener("input", mtProtectPreview);
+    $(id).addEventListener("change", mtProtectPreview);
+  });
   mtSetLevBounds(100);
 }
 
