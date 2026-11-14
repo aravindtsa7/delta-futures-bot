@@ -1,92 +1,11 @@
 {
-  "BTCUSD": {
-    "capital_inr": 50000.0,
-    "cooldown_bars": 1,
-    "custom_name": "BTCUSD 5m EMA Pullback",
-    "daily_loss_limit_pct": 26.0,
-    "daily_loss_stop_pct": 26.0,
-    "deployed_at": "2026-11-03T04:54:12.096572+00:00",
-    "effective_config": {
-      "allow_min_one_lot": true,
-      "atr_sl_max_pct": 2.0,
-      "atr_sl_min_pct": 0.15,
-      "breakeven_at_1r": false,
-      "cooldown_bars": 1,
-      "exit_on_opposite_signal": false,
-      "fee_mode": "taker",
-      "gst_rate": 0.18,
-      "initial_capital_inr": 50000.0,
-      "leverage": 12.0,
-      "maker_fee": 0.0002,
-      "margin_buffer": 0.95,
-      "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 26.0,
-      "min_lot_max_loss_pct": 5.0,
-      "risk_per_trade_pct": 5.0,
-      "sl_atr_mult": 2.0,
-      "sl_mode": "atr",
-      "slippage_bps": 5.0,
-      "stop_loss_pct": 1.0,
-      "take_profit_pct": 2.0,
-      "taker_fee": 0.0005,
-      "tp_atr_mult": 1.0,
-      "tp_mode": "atr",
-      "tp_rr_ratio": 2.0,
-      "trailing_atr_mult": 0.0,
-      "trailing_sl_pct": 0.0,
-      "trigger_source": "trade",
-      "usd_inr_rate": 85.0
-    },
-    "enabled": true,
-    "exit_on_opposite_signal": false,
-    "fee_mode": "taker",
-    "fx": 85.0,
-    "history_start": "2026-05-07T00:00:00+00:00",
-    "leverage": 12.0,
-    "max_daily_loss_pct": 26.0,
-    "params": {
-      "adx_min": 18,
-      "atr_sl_max_pct": 2,
-      "atr_sl_min_pct": 0.15,
-      "breakeven_at_1r": false,
-      "cost_gate_mult": 0,
-      "fast_ema": 9,
-      "pullback_tol": 0.001,
-      "rsi_long_max": 65,
-      "rsi_long_min": 42,
-      "rsi_period": 14,
-      "rsi_short_max": 58,
-      "rsi_short_min": 35,
-      "slow_ema": 21,
-      "use_4h_trend": 0,
-      "vol_mult": 0.8
-    },
-    "risk_pct": 5.0,
-    "rule_type": "ema_pullback_scalp",
-    "run_id": "0161787d398c2c494497a080df0fc7433b6355c9db50e72083f4b05453483342",
-    "saved_result_id": "bt_27525501c7",
-    "sl_type": "atr_mult",
-    "sl_value": 2.0,
-    "slippage_bps": 5.0,
-    "strict_lot_cap": false,
-    "symbol": "BTCUSD",
-    "timeframe": "5m",
-    "tp_type": "atr_mult",
-    "tp_value": 1.0,
-    "trail_mult": 0.0,
-    "trailing_stop": false,
-    "trigger_source": "trade",
-    "usd_inr_rate": 85.0,
-    "use_4h_trend": false,
-    "use_cost_gate": false
-  },
   "DOGEUSD": {
     "capital_inr": 50000.0,
     "cooldown_bars": 1,
     "custom_name": "LiqSweep: DOGEUSD SFP 45m",
-    "daily_loss_limit_pct": 26.0,
-    "daily_loss_stop_pct": 26.0,
-    "deployed_at": "2026-11-02T16:59:56.082599+00:00",
+    "daily_loss_limit_pct": 50.0,
+    "daily_loss_stop_pct": 50.0,
+    "deployed_at": "2026-11-12T19:06:49.521950+00:00",
     "effective_config": {
       "allow_min_one_lot": true,
       "atr_sl_max_pct": 4.0,
@@ -101,7 +20,7 @@
       "maker_fee": 0.0002,
       "margin_buffer": 0.95,
       "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 26.0,
+      "max_daily_loss_pct": 50.0,
       "min_lot_max_loss_pct": 5.0,
       "risk_per_trade_pct": 12.0,
       "sl_atr_mult": 1.5,
@@ -121,10 +40,13 @@
     "enabled": true,
     "exit_on_opposite_signal": false,
     "fee_mode": "taker_maker_tp",
-    "fx": 85.0,
     "history_start": "2026-07-30T16:03:00+00:00",
     "leverage": 12.0,
-    "max_daily_loss_pct": 26.0,
+    "max_daily_loss_pct": 50.0,
+    "paper_account_runtime_override": {
+      "capital_inr": 50000.0,
+      "daily_loss_limit_pct": 26.0
+    },
     "params": {
       "atr_sl_min_pct": 0.8,
       "breakeven_at_1r": 1,
@@ -155,30 +77,16 @@
     "trail_mult": 0.0,
     "trailing_stop": false,
     "trigger_source": "trade",
-    "usd_inr_rate": 85.0,
     "use_4h_trend": false,
-    "use_cost_gate": false,
-    "wallet_normalization": {
-      "previous": {
-        "initial_capital_inr": 100000.0,
-        "max_daily_loss_pct": 5.0,
-        "usd_inr_rate": 85.0
-      },
-      "source_symbol": "BTCUSD",
-      "wallet": {
-        "initial_capital_inr": 50000.0,
-        "max_daily_loss_pct": 25.0,
-        "usd_inr_rate": 85.0
-      }
-    }
+    "use_cost_gate": false
   },
   "ETHUSD": {
     "capital_inr": 50000.0,
     "cooldown_bars": 1,
     "custom_name": "LiqSweep: ETHUSD MSS 30m (\u20b9100k \u00b7 15x)",
-    "daily_loss_limit_pct": 26.0,
-    "daily_loss_stop_pct": 26.0,
-    "deployed_at": "2026-11-02T16:59:56.116597+00:00",
+    "daily_loss_limit_pct": 50.0,
+    "daily_loss_stop_pct": 50.0,
+    "deployed_at": "2026-11-12T19:06:49.557992+00:00",
     "effective_config": {
       "allow_min_one_lot": true,
       "atr_sl_max_pct": 4.0,
@@ -193,7 +101,7 @@
       "maker_fee": 0.0002,
       "margin_buffer": 0.95,
       "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 26.0,
+      "max_daily_loss_pct": 50.0,
       "min_lot_max_loss_pct": 5.0,
       "risk_per_trade_pct": 10.0,
       "sl_atr_mult": 1.5,
@@ -213,10 +121,13 @@
     "enabled": true,
     "exit_on_opposite_signal": false,
     "fee_mode": "taker_maker_tp",
-    "fx": 85.0,
     "history_start": "2025-09-05T04:14:00+00:00",
     "leverage": 12.0,
-    "max_daily_loss_pct": 26.0,
+    "max_daily_loss_pct": 50.0,
+    "paper_account_runtime_override": {
+      "capital_inr": 50000.0,
+      "daily_loss_limit_pct": 26.0
+    },
     "params": {
       "atr_sl_min_pct": 0.8,
       "body_ratio": 0.48,
@@ -244,30 +155,16 @@
     "trail_mult": 0.0,
     "trailing_stop": false,
     "trigger_source": "trade",
-    "usd_inr_rate": 85.0,
     "use_4h_trend": false,
-    "use_cost_gate": false,
-    "wallet_normalization": {
-      "previous": {
-        "initial_capital_inr": 100000.0,
-        "max_daily_loss_pct": 5.0,
-        "usd_inr_rate": 85.0
-      },
-      "source_symbol": "BTCUSD",
-      "wallet": {
-        "initial_capital_inr": 50000.0,
-        "max_daily_loss_pct": 25.0,
-        "usd_inr_rate": 85.0
-      }
-    }
+    "use_cost_gate": false
   },
   "SUIUSD": {
     "capital_inr": 50000.0,
     "cooldown_bars": 1,
     "custom_name": "SUIUSD 15m LiqSweep",
-    "daily_loss_limit_pct": 26.0,
-    "daily_loss_stop_pct": 26.0,
-    "deployed_at": "2026-11-02T16:59:56.045516+00:00",
+    "daily_loss_limit_pct": 50.0,
+    "daily_loss_stop_pct": 50.0,
+    "deployed_at": "2026-11-12T19:06:49.484062+00:00",
     "effective_config": {
       "allow_min_one_lot": true,
       "atr_sl_max_pct": 4.0,
@@ -282,7 +179,7 @@
       "maker_fee": 0.0002,
       "margin_buffer": 0.95,
       "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 26.0,
+      "max_daily_loss_pct": 50.0,
       "min_lot_max_loss_pct": 5.0,
       "risk_per_trade_pct": 12.0,
       "sl_atr_mult": 9.0,
@@ -302,10 +199,13 @@
     "enabled": true,
     "exit_on_opposite_signal": false,
     "fee_mode": "taker_maker_tp",
-    "fx": 85.0,
     "history_start": "2026-07-30T16:03:00+00:00",
     "leverage": 15.0,
-    "max_daily_loss_pct": 26.0,
+    "max_daily_loss_pct": 50.0,
+    "paper_account_runtime_override": {
+      "capital_inr": 50000.0,
+      "daily_loss_limit_pct": 26.0
+    },
     "params": {
       "atr_sl_min_pct": 0.8,
       "body_ratio": 0.48,
@@ -333,29 +233,15 @@
     "trail_mult": 0.0,
     "trailing_stop": false,
     "trigger_source": "trade",
-    "usd_inr_rate": 85.0,
     "use_4h_trend": false,
-    "use_cost_gate": false,
-    "wallet_normalization": {
-      "previous": {
-        "initial_capital_inr": 100000.0,
-        "max_daily_loss_pct": 5.0,
-        "usd_inr_rate": 85.0
-      },
-      "source_symbol": "BTCUSD",
-      "wallet": {
-        "initial_capital_inr": 50000.0,
-        "max_daily_loss_pct": 25.0,
-        "usd_inr_rate": 85.0
-      }
-    }
+    "use_cost_gate": false
   },
   "XRPUSD": {
     "capital_inr": 50000.0,
     "custom_name": "XRP-1",
-    "daily_loss_limit_pct": 26.0,
-    "daily_loss_stop_pct": 26.0,
-    "deployed_at": "2026-11-02T16:59:56.118598+00:00",
+    "daily_loss_limit_pct": 50.0,
+    "daily_loss_stop_pct": 50.0,
+    "deployed_at": "2026-11-12T19:06:49.560992+00:00",
     "effective_config": {
       "allow_min_one_lot": true,
       "atr_sl_max_pct": 4.0,
@@ -370,7 +256,7 @@
       "maker_fee": 0.0002,
       "margin_buffer": 0.95,
       "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 26.0,
+      "max_daily_loss_pct": 50.0,
       "min_lot_max_loss_pct": 5.0,
       "risk_per_trade_pct": 23.0,
       "sl_atr_mult": 1.5,
@@ -389,9 +275,12 @@
     },
     "enabled": true,
     "fee_mode": "maker_maker",
-    "fx": 85.0,
     "leverage": 22.0,
-    "max_daily_loss_pct": 26.0,
+    "max_daily_loss_pct": 50.0,
+    "paper_account_runtime_override": {
+      "capital_inr": 50000.0,
+      "daily_loss_limit_pct": 26.0
+    },
     "params": {
       "adx_max": 48,
       "atr_sl_min_pct": 0.75,
@@ -422,21 +311,7 @@
     "tp_value": 2.2,
     "trail_mult": 0.0,
     "trailing_stop": true,
-    "usd_inr_rate": 85.0,
     "use_4h_trend": false,
-    "use_cost_gate": false,
-    "wallet_normalization": {
-      "previous": {
-        "initial_capital_inr": 100000.0,
-        "max_daily_loss_pct": 5.0,
-        "usd_inr_rate": 85.0
-      },
-      "source_symbol": "BTCUSD",
-      "wallet": {
-        "initial_capital_inr": 50000.0,
-        "max_daily_loss_pct": 25.0,
-        "usd_inr_rate": 85.0
-      }
-    }
+    "use_cost_gate": false
   }
 }

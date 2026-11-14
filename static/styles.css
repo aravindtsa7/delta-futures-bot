@@ -617,3 +617,7 @@ tr.lvl-WARN td { color: var(--warn); }
 .sl-filter-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .sl-filter-bar input, .sl-filter-bar select { width: auto; flex: 0 0 auto; }
 .sl-filter-bar .spacer { flex: 1 1 auto; }
+
+#dailyLossPresets .btn { border-radius: 999px; padding: 4px 10px; }
+#dailyLossPresets .btn.active { border-color: var(--accent); }
+#dailyLossAllowance { flex-basis: 100%; }

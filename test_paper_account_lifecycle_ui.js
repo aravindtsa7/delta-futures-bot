@@ -91,15 +91,16 @@ const deferred=()=>{let resolve,reject;const promise=new Promise((r,j)=>{resolve
   // A process verification failure never hides account evidence or permits a save/start.
   handler=async p=>{if(p.includes('/paper/sessions'))return catalog({...account,revision:3});throw Error('permission denied');};
   await context.loadPaperAccount();assert.equal(state.process.state,'unknown');
-  assert.equal($('paperAccountCard').hidden,false);assert.equal($('paperLimitSave').disabled,true);assert.equal($('botStart').disabled,true);
+  $('paperDailyLossInput').value='7';$('paperDailyLossInput').oninput();
+  assert.equal($('paperAccountCard').hidden,false);assert.equal($('paperLimitSave').disabled,false);assert.equal($('botStart').disabled,true);
   assert.match($('paperAccountBlockers').textContent,/permission denied/);
   // Specific account blockers and stopping progress remain separate from HALTED.
   state.process={state:'stopped'};state.account={...account,revision:3,positions:1,unresolved_intents:2,funding_obligations:3};
   context.renderPaperAccount();
-  for(const text of ['1 open position','2 unresolved order','3 outstanding funding'])assert.ok($('paperAccountBlockers').textContent.includes(text));
+  for(const text of ['close 1 position','resolve 2 order intent','book 3 funding obligation'])assert.ok($('paperAccountBlockers').textContent.includes(text));
   state.account={...account,revision:3};state.stopping=true;context.renderPaperAccount();
-  assert.match($('paperAccountBlockers').textContent,/waiting for confirmed process termination/);
-  assert.equal($('paperLimitSave').disabled,true);assert.match($('paperAccountLifecycle').textContent,/HALTED/);
+  assert.match($('paperAccountBlockers').textContent,/verify termination/);
+  assert.equal($('paperLimitSave').disabled,false);assert.match($('paperAccountApplied').textContent,/HALTED/);
   state.stopping=false;state.process={state:'stopped'};
   // Responses from a session/mode the user has left must be ignored.
   const delayed=[];handler=()=>{const d=deferred();delayed.push(d);return d.promise;};

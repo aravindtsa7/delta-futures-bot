@@ -1323,90 +1323,101 @@ const paperAccountUi = {session: "", offset: 0, draftKey: null, draftBinding: nu
 
 function botSelectedMode() { return $("botMode").value || "paper"; }
 
+function accountForMode(s = bot.status || {}) {
+  const mode = botSelectedMode();
+  const cached = paperAccountUi.account;
+  return cached && (cached.mode || "paper") === mode ? cached : (mode === "paper" ? s.paper_account : null);
+}
+function accountRequestKey(mode = botSelectedMode()) { return mode === "paper" ? "deltaPaperAccountRequest" : `deltaAccountRequest:${mode}`; }
 function paperDraftPreview() {
-  const a = paperAccountUi.account || bot.status?.paper_account;
-  const capital = Number($("paperCapitalInput").value), limit = Number($("paperDailyLossInput").value);
-  if (!a?.initialized) {
-    $("paperAccountDraft").textContent = `Draft new-session allowance: ${Number.isFinite(capital) && capital > 0 && Number.isFinite(limit) && limit > 0 && limit <= 100 ? inr(capital * (limit / 100), false) : "enter valid capital and daily loss percentage"}. No account has been initialized.`;
-    return;
-  }
-  if (!(Number.isFinite(limit) && limit > 0 && limit <= 100)) {
-    $("paperAccountDraft").textContent = "Draft daily loss limit must be greater than 0 and at most 100%.";
-    return;
-  }
-  const limitDiffers = Math.abs(limit - Number(a.daily_loss_limit_pct)) > 1e-9;
-  const capNote = !limitDiffers
-    ? ` Enter a Daily Loss Limit % different from applied ${a.daily_loss_limit_pct}% to enable Update Daily Loss Limit (capital changes use Start New Paper Session).`
-    : " Draft values are not applied.";
-  $("paperAccountDraft").textContent = `Draft: current-session allowance ${inr(a.daily_baseline_inr * limit / 100, false)} on baseline ${inr(a.daily_baseline_inr, false)}. New-session allowance ${Number.isFinite(capital) && capital > 0 ? inr(capital * limit / 100, false) : "invalid capital"}.${capNote}`;
+  const a = accountForMode(), limit = Number($("paperDailyLossInput").value);
+  const valid = Number.isFinite(limit) && limit >= 0.5 && limit <= 95;
+  const baseline = Number(a?.daily_baseline_inr);
+  $("dailyLossAllowance").textContent = a?.initialized && valid && Number.isFinite(baseline)
+    ? `${limit}% of ${inr(baseline, false)} UTC opening balance = ${inr(baseline * limit / 100, false)} max daily loss`
+    : "Enter a daily loss percentage between 0.5% and 95%.";
+  if (!a?.initialized) { $("paperAccountDraft").textContent = "Initialize a paper account or refresh the Delta wallet to load applied values."; return; }
+  $("paperAccountDraft").textContent = valid
+    ? `Draft allowance ${inr(baseline * limit / 100, false)}. Applied daily limit ${a.daily_loss_limit_pct}%. Click Update Daily Loss Limit to save.`
+    : "Daily Loss Limit must be between 0.5% and 95%.";
 }
 
 function renderPaperAccount(s) {
   s = s || bot.status || {};
-  const a = paperAccountUi.account || s.paper_account;
-  const catalog = paperAccountUi.catalog || s.paper_session_catalog || a || {};
-  const archive = !!paperAccountUi.session || !!(paperAccountUi.catalog ? catalog.historical_session : s.historical_session);
-  const loadingSession = paperAccountUi.catalog && paperAccountUi.loadedSession !== paperAccountUi.session;
-  $("paperAccountCard").classList.toggle("hidden", botSelectedMode() !== "paper");
-  if (botSelectedMode() !== "paper") return;
+  const mode = botSelectedMode(), isPaper = mode === "paper";
+  const a = accountForMode(s);
+  const matchingCatalog = !paperAccountUi.catalog?.mode || paperAccountUi.catalog.mode === mode;
+  const catalog = (matchingCatalog ? paperAccountUi.catalog : null) || (isPaper ? s.paper_session_catalog : null) || a || {};
+  const archive = isPaper && (!!paperAccountUi.session || !!(paperAccountUi.catalog ? catalog.historical_session : s.historical_session));
+  const loadingSession = isPaper && paperAccountUi.catalog && paperAccountUi.loadedSession !== paperAccountUi.session;
+  $("paperAccountCard").classList.toggle("hidden", false);
+  $("accountSettingsTitle").textContent = `${mode.toUpperCase()} Account Settings`;
+  $("paperCapitalField").classList.toggle("hidden", !isPaper);
+  $("paperSessionField").classList.toggle("hidden", !isPaper);
+  $("paperSessionNew").classList.toggle("hidden", !isPaper);
   const process = paperAccountUi.stopping ? {state:"stopping",pid:paperAccountUi.process?.pid} :
-    (paperAccountUi.process || {state:"unknown",error:"Process status has not been verified."});
-  $("paperAccountLifecycle").textContent = `Web/API: ${paperAccountUi.accountApi} · Runner: ${process.state.toUpperCase()}${process.pid ? " · PID " + process.pid : ""} · Account: ${a?.initialized ? (a.halted ? "HALTED" : "active") : "uninitialized"} · Session: ${archive ? "archived (read only)" : "active"}.`;
+    (paperAccountUi.process || s.process || {state:"unknown",error:"Process status has not been verified."});
+  $("paperAccountLifecycle").textContent = `Account API: ${paperAccountUi.accountApi} ? Runner: ${process.state.toUpperCase()}${process.pid ? " ? PID " + process.pid : ""}. Daily limits can be changed while running.`;
   const blockers = [];
-  if (loadingSession) blockers.push("Loading selected session; editing is disabled until its account is verified.");
-  if (archive) blockers.push("Archived session: editing is disabled. Select Active paper account.");
-  if (process.state === "running") blockers.push("Stop Bot Process to apply account settings.");
-  if (process.state === "stopping") blockers.push("Stopping runner; waiting for confirmed process termination.");
-  if (process.state === "unknown") blockers.push(process.error || "Process status unknown; settings cannot be applied.");
+  if (loadingSession) blockers.push("Loading selected session.");
+  if (archive) blockers.push("Archived session is read-only.");
   if (paperAccountUi.accountError) blockers.push(`Account verification failed: ${paperAccountUi.accountError}`);
   if (paperAccountUi.statusError) blockers.push(`Status verification failed: ${paperAccountUi.statusError}`);
-  if (a?.positions) blockers.push(`${a.positions} open position(s) must be closed before applying settings.`);
-  if (a?.unresolved_intents) blockers.push(`${a.unresolved_intents} unresolved order intent(s) must be resolved.`);
-  if (a?.funding_obligations) blockers.push(`${a.funding_obligations} outstanding funding obligation(s) must be booked.`);
   const binding = paperAccountUi.draftBinding;
-  if (paperAccountUi.dirty && binding && (binding.session_id !== catalog.session_id || binding.revision !== catalog.revision))
-    blockers.push("Account changed since this draft. Reload Applied Values and review before saving.");
-  $("paperAccountBlockers").textContent = blockers.join(" ");
+  if (paperAccountUi.dirty && binding && (binding.mode || "paper") === mode &&
+      (binding.session_id !== catalog.session_id || binding.revision !== catalog.revision))
+    blockers.push("Account changed since this draft. Reload Applied Values before saving.");
+  const resetBlockers = [];
+  if (process.state !== "stopped") resetBlockers.push(`Stop Bot Process and verify termination${process.error ? ": " + process.error : ""}`);
+  if (a?.positions) resetBlockers.push(`close ${a.positions} position(s)`);
+  if (a?.unresolved_intents) resetBlockers.push(`resolve ${a.unresolved_intents} order intent(s)`);
+  if (a?.funding_obligations) resetBlockers.push(`book ${a.funding_obligations} funding obligation(s)`);
+  $("paperAccountBlockers").textContent = [...blockers, ...(isPaper && resetBlockers.length ? [`New paper session requires: ${resetBlockers.join(", ")}.`] : [])].join(" ");
   const select = $("paperSessionSelect"), wanted = paperAccountUi.session;
   const options = `<option value="">Active paper account</option>` + (catalog.sessions || []).map(x =>
-    `<option value="${esc(x.id)}">Archived ${esc(x.closed_at)} · ${x.trade_count} trades · ${inr(x.equity_inr, false)}${x.halted ? " · HALTED" : ""}</option>`).join("");
+    `<option value="${esc(x.id)}">Archived ${esc(x.closed_at)} ? ${x.trade_count} trades ? ${inr(x.equity_inr, false)}${x.halted ? " ? HALTED" : ""}</option>`).join("");
   if (select.innerHTML !== options) select.innerHTML = options;
   select.value = wanted;
-  if (loadingSession) {
-    $("paperAccountApplied").textContent = "Loading selected paper session… Applied values will appear after account verification.";
-  } else if (!a?.initialized) {
-    $("paperAccountApplied").textContent = "No persisted paper wallet. Enter capital and a daily limit to initialize a stopped account using Start New Paper Session.";
-  } else {
-  $("paperAccountApplied").textContent = `${archive ? "ARCHIVED · read only. " : "Applied: "}Capital ${inr(a.capital_inr, false)} · Daily loss ${a.daily_loss_limit_pct}% · Allowance ${inr(a.allowance_inr, false)}. Basis: ${a.baseline_basis}, ${a.baseline_date_utc || "not initialized"} UTC, ${inr(a.daily_baseline_inr, false)}. Persisted equity ${inr(a.equity_inr, false)}${a.positions ? " (excludes unrealized price P&L)" : ""} · ${a.halted ? "HALTED — " + (a.halt_reason || "") : "not halted"}.`;
-  const key = `${catalog.session_id}:${catalog.revision}`;
-  if (!archive && !paperAccountUi.dirty && paperAccountUi.draftKey !== key) {
-    $("paperCapitalInput").value = a.capital_inr;
-    $("paperDailyLossInput").value = a.daily_loss_limit_pct;
-    paperAccountUi.draftKey = key;
-    paperAccountUi.draftBinding = {session_id:catalog.session_id,revision:catalog.revision};
+  if (loadingSession) $("paperAccountApplied").textContent = "Loading selected session?";
+  else if (!a?.initialized) $("paperAccountApplied").textContent = isPaper ? "No persisted paper wallet. Start New Paper Session to initialize it." : "Loading the real Delta wallet and applied daily limit?";
+  else {
+    $("paperAccountApplied").textContent = `${archive ? "ARCHIVED ? read only. " : "Applied: "}${isPaper ? "Capital" : "Delta wallet"} ${inr(isPaper ? a.capital_inr : a.equity_inr, false)} ? Daily loss ${a.daily_loss_limit_pct}% ? Allowance ${inr(a.allowance_inr, false)}. Basis: ${a.baseline_basis}, ${a.baseline_date_utc || "not initialized"} UTC, ${inr(a.daily_baseline_inr, false)}. ${a.halted ? "HALTED ? " + (a.halt_reason || "") : "not halted"}.`;
+    const key = `${mode}:${catalog.session_id}:${catalog.revision}`;
+    if (!archive && !paperAccountUi.dirty && paperAccountUi.draftKey !== key) {
+      if (isPaper) $("paperCapitalInput").value = a.capital_inr;
+      $("paperDailyLossInput").value = a.daily_loss_limit_pct;
+      paperAccountUi.draftKey = key;
+      paperAccountUi.draftBinding = {mode,session_id:catalog.session_id,revision:catalog.revision};
+    }
   }
-  }
-  const pending = catalog.pending || paperAccountUi.request;
+  const request = paperAccountUi.request;
+  const pending = catalog.pending || (request && (request.body?.mode || "paper") === mode ? request : null);
   const blocked = blockers.length > 0 || paperAccountUi.busy || bot.busy;
   const limit = Number($("paperDailyLossInput").value), capital = Number($("paperCapitalInput").value);
-  const validLimit = Number.isFinite(limit) && limit > 0 && limit <= 100;
+  const validLimit = Number.isFinite(limit) && limit >= 0.5 && limit <= 95;
   const limitDiffers = Boolean(a?.initialized && validLimit && Math.abs(limit - Number(a.daily_loss_limit_pct)) > 1e-9);
-  for (const id of ["paperCapitalInput", "paperDailyLossInput"]) $(id).disabled = archive || paperAccountUi.busy || !!pending;
+  $("paperCapitalInput").disabled = !isPaper || archive || paperAccountUi.busy || !!pending;
+  $("paperDailyLossInput").disabled = archive || paperAccountUi.busy || !!pending;
   $("paperLimitSave").disabled = !!blocked || !!pending || !validLimit || !a?.initialized || !limitDiffers;
-  $("paperSessionNew").disabled = !!blocked || !!pending || !a || !validLimit || !Number.isFinite(capital) || capital <= 0;
+  $("paperSessionNew").disabled = !isPaper || !!blocked || !!pending || resetBlockers.length > 0 || !a || !validLimit || !Number.isFinite(capital) || capital <= 0;
   $("paperAccountRetry").classList.toggle("hidden", !pending || archive);
-  $("paperAccountRetry").disabled = !!blocked;
-  $("botStart").disabled = $("botStep").disabled = process.state !== "stopped" || archive || !!catalog.pending || !!paperAccountUi.statusError || bot.busy || paperAccountUi.busy;
-  $("botStop").disabled = process.state !== "running" || archive || bot.busy;
-  $("botProcessStatus").textContent = `Runner process: ${process.state.toUpperCase()}${process.pid ? " · PID " + process.pid : ""}${process.error ? " · " + process.error : ""}. Account ${a?.halted ? "HALTED" : (a?.initialized ? "active" : "uninitialized")}; process and account state are independent.`;
-  if (pending && !$("paperAccountError").textContent) $("paperAccountError").textContent = "An account operation needs retry/recovery. Runner startup is blocked while server recovery is pending.";
-  if (archive) $("paperAccountDraft").textContent = "Historical journal selected. Select Active paper account to change settings or start a runner.";
+  $("paperAccountRetry").disabled = archive || loadingSession || paperAccountUi.busy || bot.busy || !!paperAccountUi.accountError || !!paperAccountUi.statusError;
+  for (const preset of [4,5,10,25,50]) {
+    $("dailyPreset" + preset).disabled = archive || paperAccountUi.busy || !!pending || !a?.initialized;
+    $("dailyPreset" + preset).classList.toggle("active", limit === preset);
+  }
+  if (isPaper) {
+    $("botStart").disabled = $("botStep").disabled = process.state !== "stopped" || archive || !!catalog.pending || !!paperAccountUi.statusError || bot.busy || paperAccountUi.busy;
+    $("botStop").disabled = process.state !== "running" || archive || bot.busy;
+  }
+  $("botProcessStatus").textContent = `Runner process: ${process.state.toUpperCase()}${process.pid ? " ? PID " + process.pid : ""}${process.error ? " ? " + process.error : ""}. Account ${a?.halted ? "HALTED" : (a?.initialized ? "active" : "uninitialized")}; process and account state are independent.`;
+  if (pending && !$("paperAccountError").textContent) $("paperAccountError").textContent = "Retry the pending account operation to confirm its outcome.";
+  if (archive) $("paperAccountDraft").textContent = "Historical journal selected. Select Active paper account to change settings.";
   else paperDraftPreview();
   for (const id of ["botStart","botStep","botStop","botPause","botResume","botFlatten","botBackup","botTelegram"]) {
     if (archive) $(id).disabled = true;
-    else if (["botFlatten","botBackup","botTelegram"].includes(id)) $(id).disabled = false;
   }
-  $("botMode").disabled = archive;
+  $("botMode").disabled = archive || paperAccountUi.busy;
   if (catalog.pending) $("botStart").disabled = $("botStep").disabled = true;
   if (s && s.journal_mode) {
     const rows = s.evaluation_history || [];
@@ -1422,21 +1433,28 @@ function renderPaperAccount(s) {
 }
 
 async function paperAccountAction(operation, retry = false) {
-  if (paperAccountUi.busy || paperAccountUi.session || paperAccountUi.catalog?.historical_session || bot.status?.historical_session) return;
-  if (paperAccountUi.catalog && paperAccountUi.loadedSession !== paperAccountUi.session) return;
-  const a = paperAccountUi.account || bot.status?.paper_account;
+  const mode = botSelectedMode(), isPaper = mode === "paper", isNew = operation === "new_session";
+  if (paperAccountUi.busy || isPaper && (paperAccountUi.session || paperAccountUi.catalog?.historical_session || bot.status?.historical_session)) return;
+  if (isPaper && paperAccountUi.catalog && paperAccountUi.loadedSession !== paperAccountUi.session) return;
+  if (isNew && !isPaper) return;
+  const a = accountForMode();
   if (!a || (!a.initialized && operation !== "new_session" && !retry)) return;
   const process = paperAccountUi.process;
-  if (paperAccountUi.stopping || process?.state !== "stopped" || paperAccountUi.accountError || paperAccountUi.statusError) {
-    $("paperAccountError").textContent = "Wait for verified stopped process and account state before applying settings.";
+  if (paperAccountUi.accountError || paperAccountUi.statusError || isNew &&
+      (paperAccountUi.stopping || process?.state !== "stopped" || a.positions || a.unresolved_intents || a.funding_obligations)) {
+    $("paperAccountError").textContent = isNew ? "Stop the runner and resolve positions, intents and funding before starting a new paper session." : "Refresh account verification before applying settings.";
     return;
   }
   let request = retry ? ((paperAccountUi.catalog || bot.status?.paper_session_catalog)?.pending || paperAccountUi.request) : null;
+  if (request && (request.body?.mode || "paper") !== mode) {
+    $("paperAccountError").textContent = "The pending operation belongs to another mode. Select that mode to retry it.";
+    return;
+  }
   if (!request) {
     const limit = Number($("paperDailyLossInput").value), capital = Number($("paperCapitalInput").value);
-    if (!Number.isFinite(limit) || limit <= 0 || limit > 100 ||
+    if (!Number.isFinite(limit) || limit < 0.5 || limit > 95 ||
         (operation === "new_session" && (!Number.isFinite(capital) || capital <= 0))) {
-      $("paperAccountError").textContent = "Enter finite capital greater than zero and a daily loss limit greater than 0 and at most 100%.";
+      $("paperAccountError").textContent = "Enter a finite Daily Loss Limit between 0.5% and 95%. New paper capital must be positive.";
       return;
     }
     if (operation === "daily_limit" && Math.abs(limit - Number(a.daily_loss_limit_pct)) <= 1e-9) {
@@ -1445,39 +1463,40 @@ async function paperAccountAction(operation, retry = false) {
     }
     if (operation === "new_session" && !window.confirm(`${a.initialized ? `Archive the current paper session with equity ${inr(a.equity_inr, false)} and ${a.trade_count} trades?` : "Initialize a new paper account?"}\nNew capital: ${inr(capital, false)}; daily loss limit: ${limit}%.\nHistory will remain viewable. The new session starts STOPPED; it will not start trading automatically.`)) return;
     const binding = paperAccountUi.draftBinding || a;
-    request = {operation, body: {request_id: crypto.randomUUID(), expected_session_id:binding.session_id,
+    request = {operation, body: {mode,request_id: crypto.randomUUID(), expected_session_id:binding.session_id,
       expected_revision:binding.revision, daily_loss_limit_pct:limit}};
     if (operation === "new_session") Object.assign(request.body,{capital_inr:capital,confirmed_equity_inr:a.equity_inr ?? 0});
   }
   if (!request) return;
   paperAccountUi.request = request;
-  localStorage.setItem("deltaPaperAccountRequest", JSON.stringify(request));
+  localStorage.setItem(accountRequestKey(mode), JSON.stringify(request));
   paperAccountUi.busy = true;
   ++paperAccountUi.loadSeq;
   ++paperAccountUi.accountSeq; ++paperAccountUi.processSeq;
   renderPaperAccount(bot.status);
   try {
-    const isNew = request.operation === "new_session";
-    const result = await api(isNew ? "/api/bot/paper/sessions" : "/api/bot/paper/account/daily-loss", {
-      method:isNew ? "POST" : "PUT", body:JSON.stringify(request.body)});
+    const newSession = request.operation === "new_session";
+    const result = await api(newSession ? "/api/bot/paper/sessions" : isPaper ? "/api/bot/paper/account/daily-loss" : "/api/bot/settings", {
+      method:newSession ? "POST" : "PUT", body:JSON.stringify(request.body)});
     paperAccountUi.request = null;
-    localStorage.removeItem("deltaPaperAccountRequest");
+    localStorage.removeItem(accountRequestKey(mode));
     paperAccountUi.dirty = false; paperAccountUi.draftKey = null; paperAccountUi.draftBinding = null;
-    if (result.paper_account) {
-      paperAccountUi.minRevision = Number(result.paper_account.revision);
-      paperAccountUi.minRevisionSession = result.paper_account.session_id;
-      paperAccountUi.account = result.paper_account;
+    const applied = result.account_settings || result.paper_account;
+    if (applied && mode === botSelectedMode()) {
+      paperAccountUi.minRevision = Number(applied.revision);
+      paperAccountUi.minRevisionSession = applied.session_id;
+      paperAccountUi.account = applied;
       if (paperAccountUi.catalog) {
-        paperAccountUi.catalog = {...paperAccountUi.catalog, ...result.paper_account, paper_account: result.paper_account};
+        paperAccountUi.catalog = {...paperAccountUi.catalog, ...applied, account_settings:applied, paper_account:isPaper ? applied : null};
       }
     }
-    if (isNew) { paperAccountUi.session = ""; paperAccountUi.offset = 0; }
+    if (newSession) { paperAccountUi.session = ""; paperAccountUi.offset = 0; }
     $("paperAccountError").textContent = result.message;
   } catch (e) {
     $("paperAccountError").textContent = e.message;
     if (e.status && e.status < 500) {
       paperAccountUi.request = null;
-      localStorage.removeItem("deltaPaperAccountRequest");
+      localStorage.removeItem(accountRequestKey(mode));
     }
   } finally {
     paperAccountUi.busy = false;
@@ -1486,11 +1505,16 @@ async function paperAccountAction(operation, retry = false) {
 }
 
 function initPaperAccount() {
-  try { paperAccountUi.request = JSON.parse(localStorage.getItem("deltaPaperAccountRequest") || "null"); } catch (_) { /* no valid pending client request */ }
+  try { paperAccountUi.request = JSON.parse(localStorage.getItem(accountRequestKey()) || "null"); } catch (_) { /* no valid pending client request */ }
   for (const id of ["paperCapitalInput","paperDailyLossInput"]) $(id).oninput = () => { paperAccountUi.dirty = true; renderPaperAccount(); };
   $("paperDraftReload").onclick = () => { paperAccountUi.dirty = false; paperAccountUi.draftKey = null; renderPaperAccount(); };
   $("paperSessionSelect").onchange = () => { paperAccountUi.session = $("paperSessionSelect").value; paperAccountUi.offset = 0; loadBotStatus(); };
   $("paperLimitSave").onclick = () => paperAccountAction("daily_limit");
+  for (const limit of [4,5,10,25,50]) $("dailyPreset" + limit).onclick = () => {
+    $("paperDailyLossInput").value = limit;
+    paperAccountUi.dirty = true;
+    renderPaperAccount();
+  };
   $("paperSessionNew").onclick = () => paperAccountAction("new_session");
   $("paperAccountRetry").onclick = () => paperAccountAction(null,true);
   $("paperEvalPrev").onclick = () => { paperAccountUi.offset = Math.max(0,paperAccountUi.offset-100); loadBotStatus(); };
@@ -1498,16 +1522,16 @@ function initPaperAccount() {
 }
 
 async function loadPaperAccount() {
-  const mode = botSelectedMode(), session = paperAccountUi.session;
+  const mode = botSelectedMode(), session = mode === "paper" ? paperAccountUi.session : "";
   renderPaperAccount();
-  if (mode !== "paper" || paperAccountUi.busy) return;
+  if (paperAccountUi.busy) return;
   const accountSeq = ++paperAccountUi.accountSeq, processSeq = ++paperAccountUi.processSeq;
-  const current = () => botSelectedMode() === mode && paperAccountUi.session === session && !paperAccountUi.busy;
+  const current = () => botSelectedMode() === mode && (mode !== "paper" || paperAccountUi.session === session) && !paperAccountUi.busy;
   const query = session ? "?paper_session_id=" + encodeURIComponent(session) : "";
   await Promise.allSettled([
-    api("/api/bot/paper/sessions" + query, {signal:AbortSignal.timeout(8000)}).then(catalog => {
+    api(mode === "paper" ? "/api/bot/paper/sessions" + query : `/api/bot/settings?mode=${mode}`, {signal:AbortSignal.timeout(8000)}).then(catalog => {
       if (!current() || accountSeq !== paperAccountUi.accountSeq) return;
-      const incoming = catalog.paper_account || catalog;
+      const incoming = catalog.account_settings || catalog.paper_account || catalog;
       if (!session && paperAccountUi.minRevision !== null &&
           incoming?.session_id === paperAccountUi.minRevisionSession &&
           Number(incoming?.revision) < paperAccountUi.minRevision) {
@@ -1537,7 +1561,7 @@ async function loadBotStatus() {
     const seq = ++paperAccountUi.loadSeq;
     const mode = botSelectedMode(), session = paperAccountUi.session;
     const query = new URLSearchParams({mode, evaluation_offset: String(paperAccountUi.offset)});
-    if (session) query.set("paper_session_id", session);
+    if (mode === "paper" && session) query.set("paper_session_id", session);
     const s = await api("/api/bot/status?" + query);
     if (seq !== paperAccountUi.loadSeq || paperAccountUi.busy || mode !== botSelectedMode() || session !== paperAccountUi.session) return;
     const returnedMode = s.journal_mode || s.mode;
@@ -1590,12 +1614,15 @@ function renderBot(s) {
   $("botHaltBadge").classList.toggle("hidden", !s.daily_halted);
   $("botHaltBadge").textContent = s.daily_halted ? `HALTED · ${s.halt_reason || ""}`.slice(0, 80) : "HALTED";
   const running = s.runner.running;
-  $("botStart").disabled = running;
-  $("botStep").disabled = running;
+  const exchangeMode = jmode !== "paper";
+  const exchangeUnavailable = exchangeMode && !s.exchange?.connected;
+  $("botStart").disabled = running || (exchangeMode && (exchangeUnavailable || (jmode === "live" && !s.settings.live_allowed)));
+  $("botStep").disabled = running || exchangeMode;
   $("botStop").disabled = !running;
   $("botPause").disabled = !!s.entries_paused;
   $("botResume").disabled = !s.entries_paused;
   $("botMode").querySelector('option[value="live"]').disabled = !s.settings.live_allowed;
+  $("botMode").querySelector('option[value="live"]').textContent = s.settings.live_allowed ? "Live (real money)" : "Live (disabled)";
   $("botMode").querySelector('option[value="testnet"]').disabled = !s.settings.testnet_keys;
   $("botTelegram").title = s.settings.telegram_configured ? "send a test message" : "no Telegram credentials: dry run";
 
@@ -1604,10 +1631,11 @@ function renderBot(s) {
   const streak = `${s.loss_streak ?? 0} / ${s.max_consecutive_losses ?? 4}`;
   $("botKpis").innerHTML = [
     kpi("Runner", running ? `PID ${s.runner.pid}` : "stopped", running ? `${(s.runner.mode || "").toUpperCase()} · ${rs}` : `last ${s.last_known_state || "–"}`, "primary"),
-    kpi("Total equity", inr(w.total_equity_inr, false), `realized ${inr(w.realized_equity_inr, false)}`),
-    kpi("Today's PnL", `<span class="${cls(w.today_pnl_inr)}">${inr(w.today_pnl_inr)}</span>`, `${pct(w.today_pnl_pct, true)} · limit −${w.daily_loss_limit_pct ?? 5}% (${inr(-(w.daily_loss_limit_inr || 0))})`),
-    kpi("Unrealized", `<span class="${cls(w.unrealized_pnl_inr)}">${inr(w.unrealized_pnl_inr)}</span>`, `available ${inr(w.available_margin_inr, false)}`),
-    kpi("Open positions", String(pos.length), pos.map((p) => `${p.symbol} ${p.side}`).join(", ") || "flat"),
+    kpi("Total equity", inr(w.total_equity_inr, false), `${exchangeMode ? "Delta wallet" : "realized"} ${inr(w.realized_equity_inr, false)}`),
+    kpi("Available margin", inr(w.available_margin_inr, false), `used ${inr(w.used_margin_inr, false)}`),
+    kpi("Today's PnL", `<span class="${cls(w.today_pnl_inr)}">${inr(w.today_pnl_inr)}</span>`, `${pct(w.today_pnl_pct, true)} · limit −${w.daily_loss_limit_pct ?? 5}% (${inr(isNum(w.daily_loss_limit_inr) ? -w.daily_loss_limit_inr : null)})${exchangeMode ? " · wallet change since first UTC observation, including transfers" : ""}`),
+    kpi("Unrealized", `<span class="${cls(w.unrealized_pnl_inr)}">${inr(w.unrealized_pnl_inr)}</span>`, exchangeMode ? "Delta positions · mark price" : "open positions"),
+    kpi("Open positions", exchangeUnavailable ? "unavailable" : String(pos.length), exchangeUnavailable ? s.exchange.error : pos.map((p) => `${p.symbol} ${p.side}`).join(", ") || "flat"),
     kpi("Loss streak", streak, s.daily_halted ? "breaker TRIPPED" : "breaker armed"),
     kpi("Closed trades", String(w.closed_trades ?? 0), `net ${inr(w.closed_net_inr)}`),
     kpi("Unknown intents", String(s.outcome_unknown_intents ?? 0), (s.outcome_unknown_intents ? "entries blocked — reconcile" : "none")),
@@ -1637,10 +1665,10 @@ function renderBot(s) {
   $("botPosCount").textContent = pos.length ? `${pos.length} open` : "flat";
   $("botPositions").innerHTML = `<thead><tr><th class="l">Symbol</th><th class="l">Side</th><th>Lots</th><th>Entry</th><th>Mark</th><th>Unrealized ₹</th>
     <th>SL</th><th>TP</th><th>Trail</th><th class="l">SL / TP order</th><th>Opened</th></tr></thead><tbody>` +
-    (pos.length ? pos.map((p) => `<tr>${td(esc(p.symbol), "l")}${td(esc(p.side), "l")}${td(p.contracts)}${td(nf2.format(p.entry_price))}
-      ${td(isNum(p.mark_price) ? nf2.format(p.mark_price) : "–")}${td(`<span class="${cls(p.unrealized_pnl_inr)}">${inr(p.unrealized_pnl_inr)}</span>`)}
-      ${td(nf2.format(p.sl_price))}${td(nf2.format(p.tp_price))}${td(nf2.format(p.trail_amount))}
-      ${td(`${esc(p.sl_order_id || "paper")} / ${esc(p.tp_order_id || "paper")}`, "l")}${td(shortTime(p.opened_at))}</tr>`).join("")
+    (pos.length ? pos.map((p) => `<tr>${td(esc(p.symbol), "l")}${td(esc(p.side), "l")}${td(p.contracts)}${td(fmtPx(p.entry_price, p.tick_size))}
+      ${td(fmtPx(p.mark_price, p.tick_size))}${td(`<span class="${cls(p.unrealized_pnl_inr)}">${inr(p.unrealized_pnl_inr)}</span>`)}
+      ${td(fmtPx(p.sl_price, p.tick_size))}${td(fmtPx(p.tp_price, p.tick_size))}${td(p.trail_amount ? fmtPx(p.trail_amount, p.tick_size) : "–")}
+      ${td(`${esc(p.sl_order_id || (exchangeMode ? "–" : "paper"))} / ${esc(p.tp_order_id || (exchangeMode ? "–" : "paper"))}`, "l")}${td(shortTime(p.opened_at))}</tr>`).join("")
       : `<tr><td class="l muted" colspan="11">No open positions</td></tr>`) + "</tbody>";
 
   const ints = s.intents || [];
@@ -1688,7 +1716,7 @@ async function botAction(label, path, body = null, confirmText = null) {
   try {
     const payload = {
       mode: botSelectedMode(),
-      ...(paperAccountUi.session ? { paper_session_id: paperAccountUi.session } : {}),
+      ...(botSelectedMode() === "paper" && paperAccountUi.session ? { paper_session_id: paperAccountUi.session } : {}),
       ...(body || {}),
     };
     const r = await api(path, { method: "POST", body: JSON.stringify(payload) });
@@ -1737,7 +1765,12 @@ function bindBot() {
     botAction("Emergency flatten", "/api/bot/flatten");
   };
   initPaperAccount();
-  $("botMode").onchange = () => { ++paperAccountUi.loadSeq; ++paperAccountUi.accountSeq; ++paperAccountUi.processSeq; paperAccountUi.statusError = ""; renderPaperAccount(); loadBotStatus(); };
+  $("botMode").onchange = () => {
+    ++paperAccountUi.loadSeq; ++paperAccountUi.accountSeq; ++paperAccountUi.processSeq;
+    Object.assign(paperAccountUi, {statusError:"",accountError:"",account:null,catalog:null,dirty:false,draftKey:null,draftBinding:null,minRevision:null,minRevisionSession:null});
+    try { paperAccountUi.request = JSON.parse(localStorage.getItem(accountRequestKey()) || "null"); } catch (_) { paperAccountUi.request = null; }
+    renderPaperAccount(); loadBotStatus();
+  };
   $("botBackup").onclick = () => botAction("Backup state DB", "/api/bot/backup");
   $("botTelegram").onclick = () => botAction("Test Telegram alert", "/api/bot/test-telegram");
 }

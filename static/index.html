@@ -532,12 +532,17 @@
     <section class="kpis" id="botKpis" aria-label="Bot telemetry"></section>
 
     <section class="panel bot-card hidden" id="paperAccountCard">
-      <div class="bot-card-head"><h3>Paper Account Settings</h3><label>Session <select id="paperSessionSelect"><option value="">Active paper account</option></select></label></div>
+      <div class="bot-card-head"><h3 id="accountSettingsTitle">Account Settings</h3><label id="paperSessionField">Session <select id="paperSessionSelect"><option value="">Active paper account</option></select></label></div>
       <div id="paperAccountApplied" class="hint"></div>
       <div id="paperAccountLifecycle" class="hint" role="status">Verifying process and persisted account…</div>
       <div class="bot-controls">
-        <label>Paper Capital ₹ <input id="paperCapitalInput" type="number" min="0" step="any" aria-label="Paper Capital in rupees"></label>
-        <label>Daily Loss Limit % <input id="paperDailyLossInput" type="number" min="0" max="100" step="any" aria-label="Paper daily loss percentage"></label>
+        <label id="paperCapitalField">Paper Capital ₹ <input id="paperCapitalInput" type="number" min="0" step="any" aria-label="Paper Capital in rupees"></label>
+        <label>Daily Loss Limit % <input id="paperDailyLossInput" type="number" min="0.5" max="95" step="any" aria-label="Daily loss percentage"></label>
+        <span id="dailyLossPresets" class="bot-controls" aria-label="Daily loss presets">
+          <button type="button" id="dailyPreset4" class="btn btn-xs">4%</button><button type="button" id="dailyPreset5" class="btn btn-xs">5%</button>
+          <button type="button" id="dailyPreset10" class="btn btn-xs">10%</button><button type="button" id="dailyPreset25" class="btn btn-xs">25%</button><button type="button" id="dailyPreset50" class="btn btn-xs">50%</button>
+        </span>
+        <div id="dailyLossAllowance" class="hint" role="status" aria-live="polite"></div>
         <button type="button" id="paperLimitSave" class="btn">Update Daily Loss Limit</button>
         <button type="button" id="paperSessionNew" class="btn btn-primary">Start New Paper Session</button>
         <button type="button" id="paperAccountRetry" class="btn hidden">Retry pending operation</button>
@@ -545,7 +550,7 @@
         <span id="paperAccountBlockers" class="hint" role="status"></span>
       </div>
       <div id="paperAccountDraft" class="hint"></div>
-      <div class="hint">Capital changes require a new session. Saving a daily limit preserves the balance, daily baseline, history and existing halt; it does not resume trading. A new session archives this journal and begins stopped.</div>
+      <div class="hint">Daily limits (0.5–95%) can be updated with open positions and while the runner is active. Raising the limit clears a daily-loss halt when the loss fits the new allowance. Other halts and manual pauses remain. Paper capital changes require a stopped, settled account and a new session.</div>
       <div id="paperAccountError" class="hint" role="alert"></div>
     </section>
 

@@ -165,7 +165,7 @@ class InstanceLock:
 # Control channel: the dashboard drops command files; the running bot (sole DB writer) executes them
 # --------------------------------------------------------------------------- #
 CONTROL_DIR = settings.data_path / "bot_control"
-CONTROL_COMMANDS = ("pause", "resume", "flatten", "stop")
+CONTROL_COMMANDS = ("pause", "resume", "flatten", "stop", "daily_loss_limit")
 
 
 class ControlChannel:
@@ -314,6 +314,7 @@ class LiveBotRunner:
                                        clock=lambda: int(self.clock() * 1_000_000))
             self.engine = ee.ExecutionEngine(self.store, mode, self.client, clock=lambda: int(self.clock() * 1_000_000),
                                              profiles=profiles, notifier=notifier)
+            self.profiles = self.engine.profiles
             self.notifier = self.engine.notifier
             self.control = ControlChannel(control_dir or CONTROL_DIR)
             managed = [p["symbol"] for p in self.store.positions(mode)] + [i["symbol"] for i in self.engine.pending_limits()]
@@ -321,7 +322,9 @@ class LiveBotRunner:
                 if sym not in self.symbols:
                     self.symbols.append(sym)
                     self.engine.ensure_product(sym)
-            self.market = market if market is not None else RestMarketData(self.symbols, profiles)
+            self.market = market if market is not None else RestMarketData(self.symbols, self.profiles)
+            if hasattr(self.market, 'profiles'):
+                self.market.profiles = self.profiles
             if mode != "paper":
                 ws_api_key = ws_api_key or (settings.TESTNET_API_KEY if mode == "testnet" else settings.LIVE_API_KEY)
                 ws_api_secret = ws_api_secret or (settings.TESTNET_API_SECRET if mode == "testnet" else settings.LIVE_API_SECRET)
@@ -483,9 +486,8 @@ class LiveBotRunner:
                 issues.append("private_stream_unavailable: " + ", ".join(p["channel"] for p in degraded["private"]))
             summary["user_id"] = self.engine.bind_account()
             summary["resting_orders"] = self.engine.refresh_resting_orders()
-            bals = self.client.get_wallet_balances()
-            usd = next((b for b in bals if b.get("asset_symbol") == "USD"), {})
-            summary["wallet_usd_available"] = float(usd.get("available_balance") or 0)
+            summary["wallet"] = self.engine.sync_exchange_wallet()
+            summary["wallet_usd_available"] = summary["wallet"]["available_margin_usd"]
             orders = self.client.get_active_orders()
             summary["open_orders"] = len(orders)
             summary["positions"] = {}
@@ -833,12 +835,23 @@ class LiveBotRunner:
         return self.engine.realized_equity_inr() - today
 
     def equity_inr(self) -> float:
+        if self.mode != "paper":
+            return self.engine.sync_exchange_wallet()["wallet_equity_inr"]
         return self.engine.realized_equity_inr() + self.engine.unrealized_inr(self.last_close)
 
     def _roll_day(self, bar_s: int) -> None:
         """UTC day anchor of the 5% breaker, persisted in system_meta (Source #5): a restart later the same day keeps
         the 00:00 baseline, including the mark-to-market of positions held across midnight."""
         day = bar_s // 86_400
+        if self.mode != "paper":
+            # Use the observation clock, never a historical catch-up candle, for UTC rollover.
+            today = int(self.clock()) // 86_400
+            date = to_utc(today * 86_400)[:10]
+            if self.day != today or self.store.meta_get("utc_day_anchor_date") != date:
+                self.engine.sync_exchange_wallet()
+                self.day = today
+            self.day_start_equity = float(self.store.meta_get("daily_start_equity_inr"))
+            return
         if day == self.day:
             return
         date = to_utc(day * 86_400)[:10]
@@ -866,6 +879,10 @@ class LiveBotRunner:
         return n
 
     def _risk_checks(self, bar_s: int) -> None:
+        self.engine.refresh_account_settings()
+        if self.mode != "paper":
+            bar_s = int(self.clock())
+            self._roll_day(bar_s)
         if self.daily_halted:
             return
         if self.store.meta_get('utc_day_anchor_date') == to_utc(bar_s//86400*86400)[:10]:
@@ -873,6 +890,8 @@ class LiveBotRunner:
             if anchor is not None:
                 self.day_start_equity = float(anchor)*self.engine.rate
         eq = self.equity_inr()
+        if self.mode != "paper":
+            self.day_start_equity = float(self.store.meta_get("daily_start_equity_inr"))
         daily_pct = float(self.engine.cfg_row["daily_loss_limit_pct"])
         limit = self.day_start_equity * (1 - daily_pct / 100)
         reason = kind = None
@@ -999,6 +1018,24 @@ class LiveBotRunner:
     @_locked
     def handle_command(self, cmd: str, args: dict[str, Any]) -> dict[str, Any]:
         """Operator commands (dashboard / control files). Protective logic keeps running in every case."""
+        if cmd == 'daily_loss_limit':
+            import paper_accounts
+            import bot_ops
+            try:
+                request = bot_ops.PaperAccountRequest(**args)
+                if request.mode != self.mode:
+                    raise paper_accounts.AccountError(409, 'Settings target does not match this runner mode.')
+                if self.mode!='paper':
+                    self.engine.sync_exchange_wallet()
+                result = paper_accounts.apply(self.store.path, ee.BOT_PROFILES_FILE, bot_ops.PATHS['backups'],
+                                              'daily_limit', request.model_dump(exclude_defaults=True), store=self.store)
+                self.engine.refresh_account_settings()
+                self.profiles = self.engine.profiles
+                if hasattr(self.market, 'profiles'):
+                    self.market.profiles = self.profiles
+                return result
+            except paper_accounts.AccountError as exc:
+                return {'ok':False, 'status':exc.status, 'error':exc.detail}
         if cmd == "pause":
             self.store.set_entries_paused(True)
             self.store.event("INFO", "entries_paused", None, args, self.mode)
@@ -1112,7 +1149,7 @@ class LiveBotRunner:
         return report
 
     def status(self) -> dict[str, Any]:
-        eq, avail = self.engine.account_equity_inr() if self.mode == "paper" else (None, None)
+        eq, avail = self.engine.account_equity_inr()
         return {"state": self.state, "halted": self.engine.halted(), "equity_inr": eq, "available_inr": avail,
                 "positions": [dict(p) for p in self.store.positions(self.mode)], "trades": len(self.store.trades(self.mode)),
                 "loss_streak": self.loss_streak(), "ws": self.ws.snapshot()}
@@ -1144,7 +1181,7 @@ def print_report(bot: LiveBotRunner, console: Console) -> None:
     halted, why = st["halted"]
     console.print(f"[bold]state {st['state']}[/]  halted={halted}{f' ({why})' if why else ''}  mode={bot.mode}")
     if st["equity_inr"] is not None:
-        console.print(f"paper wallet: equity ₹{st['equity_inr']:,.2f}  available ₹{st['available_inr']:,.2f}  "
+        console.print(f"{bot.mode} wallet: equity ₹{st['equity_inr']:,.2f}  available ₹{st['available_inr']:,.2f}  "
                       f"open positions {len(st['positions'])}  closed trades {st['trades']}  loss streak {st['loss_streak']}")
     s = Table(title="Signal evaluation (latest CLOSED 1h bar)")
     for c in ("symbol", "variant", "1h bar (UTC)", "close", "BB upper", "BB lower", "4h EMA50", "4h EMA200", "ATR14",

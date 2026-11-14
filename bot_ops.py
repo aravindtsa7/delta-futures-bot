@@ -24,6 +24,7 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -35,7 +36,7 @@ import run_store
 import execution_engine as ee
 import live_bot as lb
 from config import PROJECT_ROOT, settings
-from exchange_client import DeltaRestClientAdapter
+from exchange_client import DeltaRestClientAdapter, ExchangeError
 from notifier import TelegramNotifier
 
 router = APIRouter(prefix="/api/bot", tags=["bot"])
@@ -374,7 +375,7 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
     }
     con = ro_conn(jmode, jdb)
     if con is None:
-        cap = ee.CAPITAL_INR
+        cap = ee.CAPITAL_INR if jmode == "paper" else 0.0
         sigs = _signals() if with_market and with_signals else {}
         dep = deployed_summary_view(sigs)
         base.update(readiness_state="NO_JOURNAL", mode=jmode, entries_paused=False, daily_halted=False, loss_streak=0,
@@ -387,12 +388,12 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
                     signals=sigs,
                     deployed_strategies=dep["deployed"],
                     deployed_summary=dep)
-        return _clean(base)
+        return _clean(_exchange_status(base, jmode) if jmode in ("live", "testnet") else base)
     try:
         cfg = con.execute("SELECT * FROM bot_config_state WHERE id=1").fetchone()
         mode = cfg["mode"] if cfg else jmode
         rate = float(cfg["usd_inr_rate"]) if cfg else settings.FIXED_USD_INR_RATE
-        capital = float(cfg["capital_inr"]) if cfg else ee.CAPITAL_INR
+        capital = (float(cfg["capital_inr"]) if cfg else ee.CAPITAL_INR) if jmode == "paper" else 0.0
         trades = con.execute("SELECT * FROM trade_history WHERE mode=? ORDER BY trade_id", (mode,)).fetchall()
         positions = con.execute("SELECT * FROM open_positions WHERE mode=? ORDER BY symbol", (mode,)).fetchall()
         intents = con.execute("SELECT * FROM order_intents WHERE mode=? ORDER BY created_at_us DESC LIMIT 30", (mode,)).fetchall()
@@ -503,7 +504,70 @@ def read_status(with_market: bool = True, with_signals: bool = True, mode: str |
         deployed_strategies=(dep := deployed_summary_view(sigs) if not archived else {'deployed':{}})["deployed"],
         deployed_summary=dep,
     )
-    return _clean(base)
+    return _clean(_exchange_status(base, mode) if mode in ("live", "testnet") else base)
+
+
+def _exchange_status(base: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Exchange GETs supply dashboard balances/positions, never reconstructed paper equity."""
+    import manual_trade as manual  # lazy: this router is also used by the manual terminal
+    try:
+        snap = manual.exchange_snapshot(mode)
+        if pd.Timestamp(snap["at"], unit="s", tz="UTC").date() != pd.Timestamp.now(tz="UTC").date():
+            snap = manual.exchange_snapshot(mode, ttl=0)
+        wallet = snap["wallet"]
+        positions = manual._exchange_positions_view(mode, base.get("positions", []), snap)
+        # The stopped dashboard can persist observations. A running engine owns
+        # its StateStore writer fence and updates the same snapshot/anchor itself.
+        with _op_lock:
+            if not runner()[0]:
+                store = ee.StateStore(mode_db(mode))
+                try:
+                    store.init_config(mode, ee.bot_profiles())
+                    store.record_exchange_wallet(mode, wallet, int(snap["at"] * 1_000_000))
+                finally:
+                    store.close()
+        con = ro_conn(mode)
+        try:
+            meta = {r[0]: r[1] for r in con.execute("SELECT key,value FROM system_meta")} if con else {}
+        finally:
+            if con is not None:
+                con.close()
+        date = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
+        anchor = (float(meta["daily_start_equity_inr"]) if meta.get("utc_day_anchor_date") == date
+                  and meta.get("utc_day_anchor_source") == f"delta_wallet:{mode}" else None)
+        equity, available, used = (wallet[k] for k in ("wallet_equity_inr", "available_margin_inr", "used_margin_inr"))
+        unreal = sum(p.get("unrealized_pnl_inr") or 0 for p in positions)
+        old = base["wallet"]
+        daily_pct = old.get("daily_loss_limit_pct", settings.MAX_DAILY_LOSS_PCT)
+        today = equity - anchor if anchor is not None else None
+        base["wallet"] = {**old, **wallet, "initial_capital_inr": None, "realized_equity_inr": equity,
+                          "total_equity_inr": equity + unreal, "unrealized_pnl_inr": unreal,
+                          "available_margin_inr": available, "used_margin_inr": used,
+                          "day_start_equity_inr": anchor, "daily_start_equity_inr": anchor,
+                          "today_pnl_inr": today, "today_pnl_pct": today / anchor * 100 if anchor else None,
+                          "daily_loss_limit_inr": anchor * daily_pct / 100 if anchor is not None else None,
+                          "baseline_basis": "First observed Delta wallet balance of the UTC day; includes wallet transfers",
+                          "baseline_date_utc": meta.get("utc_day_anchor_date"),
+                          "baseline_observed_at": us_iso(int(meta["utc_day_anchor_at_us"])) if meta.get("utc_day_anchor_at_us") else None,
+                          "source": "delta", "observed_at": us_iso(int(snap["at"] * 1_000_000))}
+        base["positions"] = positions
+        base["exchange"] = {"connected": True, "snapshot_age_s": time.time() - snap["at"]}
+        # A live deployment's rupee risk summary uses this wallet, while retaining
+        # the saved backtest capital as explicitly labelled reference metadata.
+        dep = base.get("deployed_summary", {})
+        for profile in dep.get("deployed", []):
+            profile.update(backtest_capital_inr=profile["capital_inr"], capital_inr=equity,
+                           sizing_source="delta_wallet", runtime_fee_mode="taker",
+                           risk_budget_inr=equity * profile["risk_pct"] / 100)
+        dep["combined_risk_inr"] = sum(p["risk_budget_inr"] for p in dep.get("deployed", []) if p["enabled"])
+    except (ExchangeError, httpx.HTTPError, HTTPException) as exc:
+        base["exchange"] = {"connected": False, "error": str(getattr(exc, "detail", exc))}
+        base["wallet"] = {**base["wallet"], **{key: None for key in (
+            "initial_capital_inr", "wallet_equity_inr", "realized_equity_inr", "total_equity_inr", "unrealized_pnl_inr",
+            "available_margin_inr", "used_margin_inr", "today_pnl_inr", "today_pnl_pct", "day_start_equity_inr", "daily_loss_limit_inr")},
+            "source": "delta", "error": base["exchange"]["error"]}
+        base["positions"] = []
+    return base
 
 
 # --------------------------------------------------------------------------- #
@@ -521,7 +585,8 @@ def bot_status(paper_session_id: str | None = None, evaluation_offset: int = 0,
 
 
 class PaperAccountRequest(BaseModel):
-    daily_loss_limit_pct: float
+    daily_loss_limit_pct: float = Field(ge=.5, le=95, allow_inf_nan=False)
+    mode: Literal['paper','live','testnet'] = 'paper'
     expected_session_id: str
     expected_revision: int = Field(ge=0)
     request_id: str = Field(pattern=r'^[A-Za-z0-9_-]{8,100}$')
@@ -548,10 +613,57 @@ def bot_process() -> dict[str, Any]:
     return {**process_state(), 'checked_at':pd.Timestamp.now(tz='UTC').isoformat()}
 
 
+@router.get('/settings')
+@router.get('/paper/settings')
+def account_settings(mode: Literal['paper','live','testnet'] = 'paper') -> dict[str, Any]:
+    try:
+        status = (read_status(mode=mode, with_market=False, with_signals=False)
+                  if mode!='paper' and not paper_accounts.pending_path(mode_db(mode)).exists() else None)
+        if status and not status.get('exchange', {}).get('connected'):
+            raise HTTPException(503, status.get('exchange', {}).get('error', 'Delta wallet unavailable'))
+        account = paper_accounts.describe(mode_db(mode), mode)
+        if status:
+            account.update(equity_inr=status['wallet']['wallet_equity_inr'],
+                           positions=len(status['positions']))
+        return _clean({**account, 'account_settings':account, 'paper_account':account if mode=='paper' else None,
+                       'historical_session':False})
+    except paper_accounts.AccountError as exc:
+        raise HTTPException(exc.status, exc.detail) from exc
+
+
 def _paper_account_operation(operation: str, req: PaperAccountRequest) -> dict[str, Any]:
     with _op_lock:
         lock = None
+        mode = req.mode
+        body = req.model_dump(exclude_defaults=True)
         try:
+            if operation=='daily_limit':
+                try:
+                    running, info = runner()
+                except OSError as exc:
+                    raise HTTPException(409, f'Cannot verify the journal writer; refresh process status: {exc}') from exc
+                if running and (info or {}).get('mode')==mode:
+                    result = _send('daily_loss_limit', 30, body)
+                    if not result.get('ok'):
+                        raise HTTPException(int(result.get('status') or 503), result.get('error', 'Runner could not update the daily limit; retry the same request.'))
+                    _cache.pop('signals',None)
+                    return result
+                if not running:
+                    lock = lb.InstanceLock(PATHS['lock'], 'paper-account-settings')
+                if mode!='paper' and not paper_accounts.pending_path(mode_db(mode)).exists():
+                    import manual_trade as manual
+                    wallet = manual.wallet_from_balances(manual.client_for(mode, read_only=True).get_wallet_balances())
+                    store = ee.StateStore(mode_db(mode))
+                    try:
+                        store.init_config(mode, {})
+                        store.record_exchange_wallet(mode, wallet)
+                    finally:
+                        store.close()
+                result = paper_accounts.apply(mode_db(mode), ee.BOT_PROFILES_FILE, PATHS['backups'], operation, body)
+                _cache.pop('signals',None)
+                return result
+            if mode!='paper':
+                raise HTTPException(422, 'Capital resets are paper-only.')
             process = process_state()
             if process['state'] != 'stopped':
                 raise HTTPException(409, process['error'] or 'Stop Bot Process and wait for confirmed termination before changing Paper Account Settings.')
@@ -561,25 +673,27 @@ def _paper_account_operation(operation: str, req: PaperAccountRequest) -> dict[s
             if prev_pid and int(prev_pid) != os.getpid() and _pid_alive(int(prev_pid)):
                 raise HTTPException(409, 'Runner lock released; waiting for process termination.')
             result = paper_accounts.apply(mode_db('paper'), ee.BOT_PROFILES_FILE, PATHS['backups'],
-                                          operation, req.model_dump())
+                                          operation, body)
             _cache.pop('signals',None)
             return result
         except (lb.BotAlreadyRunningError, ee.StateStoreLockedError) as exc:
-            raise HTTPException(409, 'Stop the runner and other paper journal writers before changing Paper Account Settings.') from exc
+            raise HTTPException(409, 'The account journal writer changed or is busy. Refresh and retry the same settings request.') from exc
         except paper_accounts.AccountError as exc:
             raise HTTPException(exc.status, exc.detail) from exc
         except HTTPException:
             raise
         except Exception as exc:
-            if paper_accounts.pending_path(mode_db('paper')).exists():
-                raise HTTPException(503, 'Paper account operation is pending recovery. Retry the same operation in Paper Account Settings. Startup remains blocked.') from exc
-            raise HTTPException(422, f'Paper account operation failed before applying settings: {exc}') from exc
+            if paper_accounts.pending_path(mode_db(mode)).exists():
+                raise HTTPException(503, 'Account settings operation is pending recovery. Retry the same operation in Account Settings. Startup remains blocked.') from exc
+            raise HTTPException(422, f'Account settings operation failed before applying settings: {exc}') from exc
         finally:
             if lock is not None:
                 lock.release()
 
 
 @router.put('/paper/account/daily-loss')
+@router.put('/settings')
+@router.put('/paper/settings')
 def update_paper_daily_loss(req: PaperAccountRequest) -> dict[str, Any]:
     return _paper_account_operation('daily_limit',req)
 
@@ -810,6 +924,8 @@ def _validate_active_wallet(raw_profiles: dict[str, Any], preferred_symbol: str 
     try:
         active = {sym: ee.profile_config(ee._profile_from_dict(sym, ov))
                   for sym, ov in raw_profiles.items() if ov.get("enabled", True)}
+        if not use_paper_wallet:
+            return  # Live/testnet use Delta equity, runtime FX and the account's daily limit.
         con = ro_conn("paper") if use_paper_wallet else None
         try:
             row = con.execute("SELECT * FROM bot_config_state WHERE id=1").fetchone() if con else None
@@ -1025,6 +1141,7 @@ def _send(cmd: str, timeout: float, args: dict[str, Any] | None = None) -> dict[
 def bot_stop(req: BotActionRequest | None = None) -> dict[str, Any]:
     if req and req.paper_session_id:
         raise HTTPException(409, "Archived paper session is read-only. Select Active paper account.")
+    _action_target(req)
     _stopping.set()
     try:
         return _stop_runner()

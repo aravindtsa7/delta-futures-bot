@@ -324,12 +324,15 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
           and abs(float(live.orders[int(sol["sl_order_id"])]["stop_price"]) - new_sl) < 1e-9
           and abs(float(live.orders[int(sol["tp_order_id"])]["stop_price"]) - new_tp) < 1e-9,
           f"{[(p['body']['id'], p['body'].get('stop_price')) for p in puts]}")
-    n_br = len(calls(live, "POST", "/v2/orders/bracket"))
+    n_stop = len(calls(live, "POST", "/v2/orders"))
     btc_tp = round(btc["entry_price"] * 0.97, 1)
     r = c.put("/api/manual/position/BTCUSD/protection", json={"tp_price": btc_tp, **mb()})
     btc2 = r.json().get("position", {})
-    check("2 protect", "adding a TP to BTCUSD (opened without one) creates the protective leg (POST /v2/orders/bracket) and saves its id",
-          r.status_code == 200 and len(calls(live, "POST", "/v2/orders/bracket")) == n_br + 1 and btc2.get("tp_order_id"),
+    new_stops = calls(live, "POST", "/v2/orders")[n_stop:]
+    check("2 protect", "adding a TP to BTCUSD (opened without one) creates a reduce-only stop-market leg and saves its id",
+          r.status_code == 200 and len(new_stops) == 1 and btc2.get("tp_order_id")
+          and new_stops[0]["body"].get("stop_order_type") == "take_profit_order"
+          and new_stops[0]["body"].get("reduce_only") is True,
           f"new TP leg {btc2.get('tp_order_id')} @ {btc_tp}")
     rt = c.put("/api/manual/position/SOLUSD/protection", json={"trail_amount": 1.0, **mb()})
     check("2 protect", "trailing stop refused for exchange positions (paper-only) — 422", rt.status_code == 422)
@@ -388,8 +391,10 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
     st = c.get("/api/manual/state", params={"symbol": "XRPUSD", "include_candles": False}).json()
     ext = next((p for p in st["positions"] if p["symbol"] == "XRPUSD"), {})
     rx = c.post("/api/manual/position/XRPUSD/close", json=mb())
-    check("2 sync", "position opened outside the terminal shows as 'exchange (not journalled)' and can be closed reduce-only",
-          ext.get("journalled") is False and "not journalled" in ext.get("source", "") and rx.json().get("result") == "external_close"
+    check("2 sync", "position opened outside the terminal is adopted with exact live size/entry and can be closed reduce-only",
+          ext.get("journalled") is True and ext.get("source") == "exchange"
+          and ext.get("contracts") == 50 and ext.get("entry_price") == live.prices[xrp_id]
+          and rx.json().get("result") == "exit"
           and live.positions[xrp_id]["size"] == 0)
 
     # -- ledger audit (live journal)
@@ -403,7 +408,7 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
             fills = [f for f in live.fills if str(f["order_id"]) == t["exit_order_id"]]
             exit_fee = sum(float(f["commission"]) for f in fills)
             if abs(gross - t["gross_pnl_usd"]) > 1e-9 or abs(t["net_pnl_usd"] - (t["gross_pnl_usd"] - t["fees_gst_usd"] + t["funding_usd"])) > 1e-9 \
-                    or abs(t["net_pnl_inr"] - t["net_pnl_usd"] * RATE) > 1e-9 or not fills or exit_fee >= t["fees_gst_usd"]:
+                    or abs(t["net_pnl_inr"] - t["net_pnl_usd"] * RATE) > 1e-9 or not fills or exit_fee > t["fees_gst_usd"] + 1e-9:
                 bad.append(t["trade_id"])
         cfg = store.config()
         intents = store.q("SELECT state, count(*) n FROM order_intents GROUP BY state ORDER BY state")
@@ -418,7 +423,7 @@ def _mocked_body(c: TestClient, live: FakeDeltaExchange, tn: FakeDeltaExchange) 
                     f"{t['fees_gst_inr']:.2f}", f"{t['net_pnl_inr']:.2f}")
     console.print(tab)
     check("2 ledger", "live journal audit: bound to mode 'live'; every exit booked from its own fills (gross/net/INR identities)",
-          cfg["mode"] == "live" and len(trs) == 4 and not bad, f"{len(trs)} trades; intents {[(r['state'], r['n']) for r in intents]}")
+          cfg["mode"] == "live" and len(trs) == 5 and not bad, f"{len(trs)} trades; intents {[(r['state'], r['n']) for r in intents]}")
     check("2 ledger", "every authenticated request to the fake exchange carried a valid HMAC signature + headers",
           live.sig_failures == 0 and live.header_failures == 0, f"{live.sig_checked} signed requests")
 

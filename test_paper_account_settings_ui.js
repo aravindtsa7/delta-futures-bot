@@ -32,7 +32,7 @@ const a = {initialized:true,session_id:'legacy',revision:0,capital_inr:50000,dai
   daily_baseline_inr:50000,baseline_date_utc:'2026-11-03',baseline_basis:'Persisted UTC daily opening equity',
   equity_inr:46987.45,allowance_inr:2500,halted:true,halt_reason:'daily loss',trade_count:5,
   positions:0,unresolved_intents:0,funding_obligations:0};
-context.bot.status = {mode:'paper',paper_account:a,paper_session_catalog:{...a,sessions:[]},runner:{running:false}};
+context.bot.status = {mode:'paper',journal_mode:'paper',paper_account:a,paper_session_catalog:{...a,sessions:[]},runner:{running:false}};
 const $ = context.$, state = context.state;
 state.process = {state:'stopped'};
 (async ()=>{
@@ -61,6 +61,7 @@ state.process = {state:'stopped'};
   assert.equal(calls[1].body.capital_inr,100000);
   // An uncertain network response retains the exact id/body; refresh must not mask its error.
   reply=async ()=>{throw new Error('Connection lost: retry the same request');};
+  $('paperDailyLossInput').value='10';$('paperDailyLossInput').oninput();
   await context.paperAccountAction('daily_limit');
   const uncertain=calls.at(-1).body;
   assert.match($('paperAccountError').textContent,/Connection lost/);assert.ok(storage.size);
@@ -74,7 +75,8 @@ state.process = {state:'stopped'};
   complete({message:'Created stopped'});await pending;
   assert.ok(calls.every(c=>!c.url.includes('/start')));
   state.process={state:'running',pid:123};context.bot.status.runner.running=true;context.renderPaperAccount(context.bot.status);
-  assert.equal($('paperLimitSave').disabled,true);assert.equal($('paperSessionNew').disabled,true);
+  $('paperDailyLossInput').value='10';$('paperDailyLossInput').oninput();
+  assert.equal($('paperLimitSave').disabled,false);assert.equal($('paperSessionNew').disabled,true);
   context.bot.status.runner.running=false;context.bot.status.historical_session=true;
   context.bot.status.evaluation_history=[{symbol:'BTCUSD',bar_close:'closed',evaluated_at:'evaluated',raw_signal:1,
     decision:'skip',skip_reason:'halted',config_id:'saved-hash',config_json:'full configuration',detail:'recorded detail'}];
@@ -85,6 +87,6 @@ state.process = {state:'stopped'};
   assert.equal($('paperEvalNext').disabled,false);
   const archivedCount=calls.length;await context.paperAccountAction('daily_limit');assert.equal(calls.length,archivedCount);
   $('botMode').value='testnet';context.bot.status.mode='testnet';context.renderPaperAccount(context.bot.status);
-  assert.ok($('paperAccountCard').classList.contains('hidden'));
+  assert.ok(!$('paperAccountCard').classList.contains('hidden'));
   console.log('PASS: applied/draft separation, halt visibility, validation, confirmation, exact retry, double-click protection, stopped/archive guards and history rendering');
 })().catch(e=>{console.error(e);process.exitCode=1;});

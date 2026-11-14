@@ -85,7 +85,7 @@ def test_paper_deploy_inherits_wallet_but_rejects_fx_mismatch(runtime,field,valu
 def test_durable_refusal_is_not_an_order_and_dedup_survives_restart(runtime):
     bot,market,clock,path=runtime
     close=int(clock[0])//300*300;market.signals[close]=1
-    bot.profiles['BTCUSD']=replace(bot.profiles['BTCUSD'],max_daily_loss_pct=25)
+    bot.profiles['BTCUSD']=replace(bot.profiles['BTCUSD'],capital_inr=75000)
     bot._queue_close('BTCUSD',close);bot._try_hour_signal('BTCUSD')
     row=bot.store.one('select * from signal_evaluations')
     assert row['raw_signal']==1 and row['decision']=='skip' and row['intent_id'] is None
@@ -133,7 +133,7 @@ def test_raw_signal_survives_entry_filter_refusal(runtime,monkeypatch):
 def test_fixing_profile_cannot_replay_consumed_refused_signal(runtime):
     bot,market,clock,_=runtime;close=int(clock[0])//300*300;market.signals[close]=1
     original=bot.profiles['BTCUSD']
-    bot.profiles['BTCUSD']=replace(original,max_daily_loss_pct=25)
+    bot.profiles['BTCUSD']=replace(original,capital_inr=75000)
     bot._queue_close('BTCUSD',close);bot._try_hour_signal('BTCUSD')
     bot.profiles['BTCUSD']=original
     bot._queue_close('BTCUSD',close);bot._try_hour_signal('BTCUSD')

@@ -35,6 +35,7 @@ import httpx
 import bot_ops
 import data_manager as dm
 import execution_engine as ee
+from exchange_wallet import wallet_from_balances
 from config import ENVIRONMENTS, mask_secret, settings
 from exchange_client import DeltaAPIError, DeltaRestClientAdapter, ExchangeError, ReadOnlyClientError
 
@@ -287,26 +288,6 @@ def _invalidate_snapshot(mode: str, symbol: str | None = None) -> None:
 # --------------------------------------------------------------------------- #
 # Exchange wallet / positions snapshot
 # --------------------------------------------------------------------------- #
-def _usd_row(bals: list[dict[str, Any]]) -> dict[str, Any]:
-    return next((b for b in bals if b.get("asset_symbol") == "USD"), {}) or {}
-
-
-def wallet_from_balances(bals: list[dict[str, Any]]) -> dict[str, Any]:
-    """Delta India wallet in INR: Delta's own *_inr figures when present, else USD x USD_INR_RATE."""
-    rate = settings.FIXED_USD_INR_RATE
-    u = _usd_row(bals)
-    bal_usd, avail_usd = float(u.get("balance") or 0), float(u.get("available_balance") or 0)
-    used_usd = float(u.get("position_margin") or 0) + float(u.get("order_margin") or 0)
-    bal_inr = _f(u.get("balance_inr"))
-    avail_inr = _f(u.get("available_balance_inr"))
-    return {"wallet_equity_usd": bal_usd, "available_margin_usd": avail_usd, "used_margin_usd": used_usd,
-            "wallet_equity_inr": bal_inr if bal_inr is not None else bal_usd * rate,
-            "available_margin_inr": avail_inr if avail_inr is not None else avail_usd * rate,
-            "used_margin_inr": used_usd * rate, "inr_source": "delta *_inr fields" if bal_inr is not None else f"USD x {rate:g}",
-            "assets": [{k: b.get(k) for k in ("asset_symbol", "balance", "available_balance", "balance_inr")}
-                       for b in bals if float(b.get("balance") or 0) or b.get("asset_symbol") in ("USD", "INR")]}
-
-
 def exchange_snapshot(mode: str, ttl: float = SNAPSHOT_TTL_S) -> dict[str, Any]:
     key = f"snap:{mode}"
     if ttl > 0:

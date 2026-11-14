@@ -83,7 +83,7 @@ def test_limit_update_preserves_halt_balance_baseline_history_and_other_settings
 
 
 def test_nonzero_signal_cannot_bypass_preserved_halt_after_limit_update(account):
-    c,db,_,_=account;assert send(c,request(c,daily_loss_limit_pct=100)).status_code==200
+    c,db,_,_=account;assert send(c,request(c,daily_loss_limit_pct=95)).status_code==200
     store=ee.StateStore(db)
     try:
         e=ee.ExecutionEngine(store,'paper',profiles=ee.bot_profiles())
@@ -138,14 +138,20 @@ def test_operations_refuse_outstanding_obligations(account,kind,obligation):
         else:
             store.conn.execute("INSERT INTO funding_settlements(mode,symbol,intent_id,at_us,side,contracts,contract_value) VALUES('paper','BTCUSD','old',1,'LONG',1,.001)")
     finally:store.close()
-    r=send(c,request(c,kind),kind);assert r.status_code==409,r.text
-    assert 'resolve' in r.text and not pa.pending_path(db).exists()
+    r=send(c,request(c,kind),kind)
+    assert r.status_code==(409 if kind=='new_session' else 200),r.text
+    if kind=='new_session': assert 'resolve' in r.text
+    assert not pa.pending_path(db).exists()
 
 
 @pytest.mark.parametrize('kind',['daily_limit','new_session'])
-def test_running_runner_blocks_both_operations(account,kind):
+def test_running_runner_routes_limit_and_blocks_capital_reset(account,kind,monkeypatch):
     c,db,_,_=account;body=request(c,kind);lock=lb.InstanceLock(ops.PATHS['lock'],'paper')
-    try:assert send(c,body,kind).status_code==409
+    received=[]
+    monkeypatch.setattr(ops,'_send',lambda cmd,timeout,args:(received.append((cmd,args)) or {'ok':True}))
+    try:
+        assert send(c,body,kind).status_code==(409 if kind=='new_session' else 200)
+        if kind=='daily_limit': assert received==[('daily_loss_limit',body)]
     finally:lock.release()
 
 
@@ -287,7 +293,8 @@ def test_lock_release_does_not_prove_process_exit(account,monkeypatch):
     monkeypatch.setattr(lb.InstanceLock,'read_info',staticmethod(lambda _:dict(pid=12345678,mode='paper')))
     monkeypatch.setattr(ops,'_pid_alive',lambda _:True)
     assert c.get('/api/bot/process').json()['state']=='stopping'
-    assert send(c,request(c)).status_code==409
+    assert send(c,request(c)).status_code==200  # a limit edit needs only the available journal writer fence
+    assert send(c,request(c,'new_session'),'new_session').status_code==409
     result=c.post('/api/bot/stop').json()
     assert not result['stopped'] and result['process']['state']=='stopping'
     monkeypatch.setattr(ops,'_pid_alive',lambda _:False)
@@ -379,7 +386,7 @@ def test_manual_trade_mode_cannot_redirect_paper_actions_or_status_to_live_journ
         st = c.get(url).json()
         assert st['mode'] == 'paper' and st['journal_mode'] == 'paper'
         assert st['paper_account']['halted'] and len(st['trades']) == 5
-        assert st['wallet']['total_equity_inr'] == pytest.approx(46987.45, abs=0.05)
+        assert st['wallet']['total_equity_inr'] == pytest.approx(pa.describe(db)['equity_inr'])
 
     # Pause & Resume in Paper mode must mutate only the Paper journal, never the Live journal.
     r_pause = c.post('/api/bot/pause', json={'mode': 'paper'})

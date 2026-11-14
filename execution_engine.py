@@ -36,7 +36,7 @@ import sqlite3
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -49,6 +49,7 @@ from trade_rules import stop_config, advance_stop
 from backtester import Backtester, BacktestConfig, ProductSpec
 from config import settings
 from notifier import TelegramNotifier
+from exchange_wallet import wallet_from_balances
 from exchange_client import (
     AmbiguousOutcomeError,
     DeltaAPIError,
@@ -347,6 +348,11 @@ CREATE TABLE IF NOT EXISTS bot_config_state (
     bound_user_id INTEGER,
     updated_at_us INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS exchange_wallet (
+    mode TEXT PRIMARY KEY CHECK (mode IN ('testnet','live')),
+    wallet_equity_inr REAL NOT NULL, available_margin_inr REAL NOT NULL,
+    used_margin_inr REAL NOT NULL, observed_at_us INTEGER NOT NULL, snapshot_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS order_intents (
     intent_id TEXT PRIMARY KEY,
     client_order_id TEXT NOT NULL UNIQUE CHECK (length(client_order_id) BETWEEN 1 AND 32),
@@ -594,17 +600,40 @@ class StateStore:
         capitals = {c.initial_capital_inr for c in configs}
         daily_limits = {c.max_daily_loss_pct for c in configs}
         rates = {c.usd_inr_rate for c in configs}
-        if len(capitals) > 1 or len(daily_limits) > 1 or len(rates) > 1:
+        if mode == "paper" and (len(capitals) > 1 or len(daily_limits) > 1 or len(rates) > 1):
             raise ValueError("shared wallet profiles must agree on capital and daily loss limit")
-        capital = next(iter(capitals), CAPITAL_INR)
-        daily_limit = next(iter(daily_limits), DAILY_LOSS_LIMIT_PCT)
+        capital = next(iter(capitals), CAPITAL_INR) if mode == "paper" else 0.0
+        daily_limit = next(iter(daily_limits), DAILY_LOSS_LIMIT_PCT) if mode == "paper" else settings.MAX_DAILY_LOSS_PCT
+        rate = next(iter(rates), settings.FIXED_USD_INR_RATE) if mode == "paper" else settings.FIXED_USD_INR_RATE
         with self.tx() as c:
             c.execute(
                 "INSERT INTO bot_config_state (id, mode, profiles_json, capital_inr, leverage, risk_pct, daily_loss_limit_pct,"
                 " usd_inr_rate, sizing_slippage_bps, halted, updated_at_us) VALUES (1,?,?,?,?,?,?,?,?,0,?)",
                 (mode, json.dumps({k: asdict(v) for k, v in profiles.items()}, sort_keys=True), capital, LEVERAGE,
-                 RISK_PCT, daily_limit, next(iter(rates), settings.FIXED_USD_INR_RATE), settings.SIZING_SLIPPAGE_BPS, self.clock()))
+                 RISK_PCT, daily_limit, rate, settings.SIZING_SLIPPAGE_BPS, self.clock()))
         return self.config()
+
+    def record_exchange_wallet(self, mode: str, wallet: dict[str, Any], at_us: int | None = None) -> dict[str, Any]:
+        """Persist an observation and the first real wallet equity of each UTC day atomically."""
+        if mode not in ("live", "testnet") or self.config()["mode"] != mode:
+            raise ExchangeError("exchange wallet observation does not match the journal mode")
+        at_us = self.clock() if at_us is None else at_us
+        date = pd.Timestamp(at_us, unit="us", tz="UTC").strftime("%Y-%m-%d")
+        with self.tx() as cx:
+            previous = cx.execute("SELECT observed_at_us FROM exchange_wallet WHERE mode=?", (mode,)).fetchone()
+            if previous and previous[0] > at_us:
+                return wallet  # a cached dashboard response cannot move the anchor/snapshot backwards
+            cx.execute("INSERT INTO exchange_wallet VALUES(?,?,?,?,?,?) ON CONFLICT(mode) DO UPDATE SET "
+                       "wallet_equity_inr=excluded.wallet_equity_inr,available_margin_inr=excluded.available_margin_inr,"
+                       "used_margin_inr=excluded.used_margin_inr,observed_at_us=excluded.observed_at_us,snapshot_json=excluded.snapshot_json",
+                       (mode, wallet["wallet_equity_inr"], wallet["available_margin_inr"], wallet["used_margin_inr"], at_us, json.dumps(wallet)))
+            if (self.meta_get("utc_day_anchor_date") != date
+                    or self.meta_get("utc_day_anchor_source") != f"delta_wallet:{mode}"):
+                equity = wallet["wallet_equity_inr"]
+                self.meta_set(utc_day_anchor_date=date, utc_day_anchor_source=f"delta_wallet:{mode}",
+                              utc_day_start_equity_usd=equity / settings.FIXED_USD_INR_RATE,
+                              daily_start_equity_inr=equity, utc_day_anchor_at_us=at_us)
+        return wallet
 
     def config(self) -> sqlite3.Row | None:
         return self.one("SELECT * FROM bot_config_state WHERE id = 1")
@@ -806,6 +835,19 @@ def profile_config(profile: StrategyProfile) -> BacktestConfig:
         **stop_config(profile.sl_type, profile.sl_value, profile.tp_type, profile.tp_value))
 
 
+def runtime_sizing_config(profile: StrategyProfile | None, mode: str, equity_inr: float) -> BacktestConfig:
+    if mode in ("live", "testnet") and equity_inr <= 0:
+        raise ExchangeError("Delta wallet balance must be positive for entry sizing")
+    cfg = profile_config(profile) if profile else sizing_config(equity_inr)
+    if mode in ("live", "testnet"):
+        # Backtest capital and maker assumptions never set live wallet/risk budgets.
+        cfg = replace(cfg, initial_capital_inr=equity_inr, usd_inr_rate=settings.FIXED_USD_INR_RATE,
+                      fee_mode="taker", taker_fee=settings.TAKER_FEE, gst_rate=settings.GST_ON_FEES,
+                      allow_min_one_lot=False, margin_buffer=min(cfg.margin_buffer, MARGIN_BUFFER),
+                      slippage_bps=max(cfg.slippage_bps, settings.SIZING_SLIPPAGE_BPS))
+    return cfg
+
+
 def validate_deployable(profile: StrategyProfile) -> BacktestConfig:
     cfg = profile_config(profile)
     if profile.timeframe not in dm.TIMEFRAME_MINUTES:
@@ -816,15 +858,20 @@ def validate_deployable(profile: StrategyProfile) -> BacktestConfig:
 
 
 def calculate_order_lots(product: ProductSpec, price: float, atr_value: float, side: str = "LONG",
-                         equity_inr: float = CAPITAL_INR, available_inr: float | None = None,
+                         equity_inr: float | None = None, available_inr: float | None = None,
                          risk_pct: float = RISK_PCT, leverage: float = LEVERAGE,
                          slippage_bps: float | None = None, *, profile: StrategyProfile | None = None,
                          sl_type: str | None = None, sl_value: float | None = None,
                          tp_type: str | None = None, tp_value: float | None = None,
-                         trail_mult: float | None = None) -> LotSizing:
+                         trail_mult: float | None = None, mode: str = "paper") -> LotSizing:
     """Whole contracts for one entry honoring the symbol's deployed risk_pct, leverage, sl_type/value, tp_type/value, and trail_mult."""
     if not (price > 0 and atr_value > 0):
         raise ValueError("price and ATR must be > 0")
+    if mode in ("live", "testnet") and (equity_inr is None or available_inr is None):
+        raise ValueError("exchange sizing requires observed wallet equity and available margin")
+    equity_inr = CAPITAL_INR if equity_inr is None else equity_inr
+    if not math.isfinite(equity_inr) or available_inr is not None and not math.isfinite(available_inr):
+        raise ValueError("wallet equity and available margin must be finite")
     if profile is not None:
         risk_pct = float(profile.risk_pct)
         leverage = float(profile.leverage)
@@ -849,6 +896,11 @@ def calculate_order_lots(product: ProductSpec, price: float, atr_value: float, s
         cfg = profile_config(profile)
         leverage, risk_pct = cfg.leverage, cfg.risk_per_trade_pct
         eff_trail = cfg.trailing_atr_mult
+    if mode in ("live", "testnet"):
+        cfg = runtime_sizing_config(profile, mode, equity_inr) if profile else replace(
+            cfg, initial_capital_inr=equity_inr, usd_inr_rate=settings.FIXED_USD_INR_RATE,
+            taker_fee=settings.TAKER_FEE, gst_rate=settings.GST_ON_FEES, allow_min_one_lot=False)
+        leverage, risk_pct = cfg.leverage, cfg.risk_per_trade_pct
     bt = Backtester(cfg)
     rate = cfg.usd_inr_rate
     sl_pct, tp_pct = cfg.stop_pcts(price, atr_value)
@@ -859,6 +911,11 @@ def calculate_order_lots(product: ProductSpec, price: float, atr_value: float, s
         trail = float(snap_to_tick(trail, product.tick_size))
     available_inr = equity_inr if available_inr is None else available_inr
     n, n_risk, n_cap, _ = bt.size_position(equity_inr / rate, price, sl, product, available_inr / rate)
+    if mode in ("live", "testnet"):
+        # Reserve margin plus BOTH taker fees/GST and adverse execution movement.
+        funds_per_lot = product.contract_value * price * (1 / leverage + 2 * cfg.with_gst(cfg.taker_fee)) * (1 + cfg.slip)
+        n_cap = min(n_cap, max(0, math.floor(available_inr / rate * cfg.margin_buffer / funds_per_lot)))
+        n = max(0, min(n, n_risk, n_cap))
     lpc = bt.loss_per_contract(price, sl, product)
     if n >= 1:
         reason = "ok"
@@ -1003,9 +1060,10 @@ class ExecutionEngine:
         if mode != "paper":
             if client is None or client.mode != mode:
                 raise ExchangeError(f"{mode} engine needs a DeltaRestClientAdapter in {mode} mode")
-        self.store, self.mode, self.client, self.clock, self.profiles, self.sleep = store, mode, client, clock, profiles, sleep
+        self.store, self.mode, self.client, self.clock, self.profiles, self.sleep = store, mode, client, clock, dict(profiles), sleep
         self.notifier = notifier if notifier is not None else TelegramNotifier.from_settings(mode)
         self.cfg_row = store.init_config(mode, profiles)
+        self.refresh_account_settings()
         # A process can die between durable evaluation evidence and its final
         # decision. Do not treat that record as a fresh signal after restart.
         with store.tx() as cx:
@@ -1015,7 +1073,7 @@ class ExecutionEngine:
                        "AND i.symbol=signal_evaluations.symbol AND i.signal_bar_us=signal_evaluations.bar_open_us "
                        "AND i.role='ENTRY' ORDER BY i.created_at_us DESC LIMIT 1) "
                        "WHERE mode=? AND decision='evaluating'", (mode,))
-        self.rate = float(self.cfg_row["usd_inr_rate"])
+        self.rate = float(self.cfg_row["usd_inr_rate"]) if mode == "paper" else settings.FIXED_USD_INR_RATE
         if mode == "paper":
             self.products = products or {s: ProductSpec.from_metadata(s) for s in profiles}
         elif products is not None:
@@ -1034,6 +1092,8 @@ class ExecutionEngine:
         # A DISPATCHING intent left by a crash may or may not have reached the exchange.
         for r in store.q("SELECT intent_id FROM order_intents WHERE mode=? AND state='DISPATCHING'", (mode,)):
             store.transition(r["intent_id"], "OUTCOME_UNKNOWN", "found DISPATCHING at startup")
+        if mode in ("live", "testnet"):
+            self.sync_exchange_wallet()
 
     # -- helpers ---------------------------------------------------------------- #
     def ensure_product(self, symbol: str) -> ProductSpec:
@@ -1092,6 +1152,8 @@ class ExecutionEngine:
 
     def realized_equity_inr(self) -> float:
         """Capital + closed net PnL + open positions' (funding - entry fee); the paper wallet + margins."""
+        if self.mode in ("live", "testnet"):
+            return self.sync_exchange_wallet()["wallet_equity_inr"]
         cap = float(self.cfg_row["capital_inr"])
         closed = sum(float(t["net_pnl_inr"]) for t in self.store.trades(self.mode))
         opened = sum((float(p["realized_funding_usd"]) - float(p["entry_fee_usd"])) * self.rate for p in self.store.positions(self.mode))
@@ -1104,16 +1166,28 @@ class ExecutionEngine:
             used = sum(float(p["margin_usd"]) + float(p["realized_funding_usd"])
                        for p in self.store.positions(self.mode)) * self.rate
             return eq, eq - used
-        bals = self.client.get_wallet_balances()
-        usd = next((b for b in bals if b.get("asset_symbol") == "USD"), None)
-        if usd is None:
-            raise ExchangeError("no USD wallet balance returned")
-        avail = float(usd["available_balance"]) * self.rate
-        return avail, avail
+        wallet = self.sync_exchange_wallet()
+        return wallet["wallet_equity_inr"], max(0.0, wallet["available_margin_inr"])
+
+    def sync_exchange_wallet(self) -> dict[str, Any]:
+        if self.mode not in ("live", "testnet"):
+            raise ExchangeError("paper accounts do not sync exchange wallets")
+        wallet = wallet_from_balances(self.client.get_wallet_balances())
+        return self.store.record_exchange_wallet(self.mode, wallet, self.clock())
 
     # -- entries ---------------------------------------------------------------- #
+    def refresh_account_settings(self) -> None:
+        """The mode journal owns the account-wide daily percentage, including live edits."""
+        self.cfg_row = self.store.config()
+        limit = float(self.cfg_row['daily_loss_limit_pct'])
+        for sym, prof in tuple(self.profiles.items()):
+            if profile_config(prof).max_daily_loss_pct != limit:
+                self.profiles[sym] = replace(prof, max_daily_loss_pct=limit,
+                    effective_config=asdict(replace(profile_config(prof), max_daily_loss_pct=limit)))
+
     def on_signal(self, symbol: str, direction: int, signal_bar_us: int, atr_value: float, ref_price: float) -> dict[str, Any]:
         """Act on a fresh signal from the latest closed bar. Returns what happened (never raises on a skip)."""
+        self.refresh_account_settings()
         side_name = "LONG" if direction == 1 else "SHORT"
         h, why = self.halted()
         if h:
@@ -1136,11 +1210,8 @@ class ExecutionEngine:
         cfg = validate_deployable(prof) if prof else sizing_config(CAPITAL_INR)
         if self.mode == "paper" and prof and (
                 cfg.initial_capital_inr != float(self.cfg_row["capital_inr"])
-                or cfg.max_daily_loss_pct != float(self.cfg_row["daily_loss_limit_pct"])
                 or cfg.usd_inr_rate != self.rate):
             return {"action": "skip", "reason": "profile differs from existing shared wallet; reconcile wallet configuration before entry"}
-        if self.mode != "paper" and prof and cfg.fee_mode != "taker":
-            return {"action": "skip", "reason": "market-order execution requires an all-taker backtest configuration"}
         prof_tf_us = dm.TIMEFRAME_MINUTES.get(prof.timeframe, 60) * 60_000_000 if prof else self.tf_us
         entry_us = signal_bar_us + prof_tf_us
         if st is not None and st["cooldown_until_us"] is not None and entry_us < st["cooldown_until_us"]:
@@ -1150,8 +1221,14 @@ class ExecutionEngine:
             return {"action": "skip", "reason": f"account policy: {why}"}
         product = self.ensure_product(symbol)
         equity, available = self.account_equity_inr()
+        if self.mode != "paper":
+            if equity <= 0:
+                return {"action": "skip", "reason": "Delta wallet balance is zero or negative"}
+            cfg = runtime_sizing_config(prof, self.mode, equity)
+            if self.check_daily_loss(float(self.store.meta_get("daily_start_equity_inr")), equity_inr=equity):
+                return {"action": "skip", "reason": "daily loss limit hit"}
         fill_ref = cfg.entry_price(ref_price, direction) if self.mode == "paper" else ref_price
-        lots = calculate_order_lots(product, fill_ref, atr_value, side_name, equity, available, profile=prof)
+        lots = calculate_order_lots(product, fill_ref, atr_value, side_name, equity, available, profile=prof, mode=self.mode)
         if lots.contracts < 1:
             self._event("INFO", "entry_skipped", symbol, lots.reason)
             return {"action": "skip", "reason": lots.reason, "sizing": lots}
@@ -1200,6 +1277,29 @@ class ExecutionEngine:
 
     def _dispatch_entry(self, intent: sqlite3.Row) -> dict[str, Any]:
         iid = intent["intent_id"]
+        try:
+            wallet = self.sync_exchange_wallet()
+        except ExchangeError as exc:
+            reason = f"wallet unavailable; no entry sent: {exc}"
+            self.store.transition(iid, "REJECTED", reason, error=reason)
+            return {"action": "skip", "intent_id": iid, "reason": reason}
+        if wallet["wallet_equity_inr"] <= 0:
+            reason = "Delta wallet balance is zero or negative; no entry sent"
+            self.store.transition(iid, "REJECTED", reason, error=reason)
+            return {"action": "skip", "intent_id": iid, "reason": reason}
+        prod = self.ensure_product(intent["symbol"])
+        cfg = runtime_sizing_config(self.profiles.get(intent["symbol"]), self.mode, wallet["wallet_equity_inr"])
+        notional = int(intent["size"]) * prod.contract_value * float(intent["entry_price"])
+        required = notional * (1 / float(intent["leverage"] or LEVERAGE) + 2 * cfg.with_gst(cfg.taker_fee)) * (1 + cfg.slip) * self.rate
+        risk = (int(intent["size"]) * Backtester(cfg).loss_per_contract(float(intent["entry_price"]), float(intent["sl_price"]), prod) * self.rate
+                if intent["execution_config"] and intent["sl_price"] else None)
+        limit_hit = (self.check_daily_loss(float(self.store.meta_get("daily_start_equity_inr")), equity_inr=wallet["wallet_equity_inr"])
+                     if intent["execution_config"] else False)
+        if (limit_hit or required > max(0.0, wallet["available_margin_inr"]) * cfg.margin_buffer
+                or risk is not None and risk > wallet["wallet_equity_inr"] * cfg.risk_per_trade_pct / 100):
+            reason = "exchange wallet changed; daily limit, risk budget or margin plus taker fees/GST safety budget would be exceeded"
+            self.store.transition(iid, "REJECTED", reason, error=reason)
+            return {"action": "skip", "intent_id": iid, "reason": reason}
         self.store.transition(iid, "DISPATCHING")  # durable BEFORE anything leaves the process
         try:
             order = self.client.place_order(
@@ -1632,7 +1732,7 @@ class ExecutionEngine:
                        (cash*self.rate, self.mode, row['at_us']))
             anchor_date = self.store.meta_get('utc_day_anchor_date')
             anchor_usd = self.store.meta_get('utc_day_start_equity_usd')
-            if anchor_date and anchor_usd is not None and pd.Timestamp(anchor_date, tz='UTC').value//1000 > row['at_us']:
+            if self.mode == "paper" and anchor_date and anchor_usd is not None and pd.Timestamp(anchor_date, tz='UTC').value//1000 > row['at_us']:
                 # A prior day's delayed charge belongs in today's opening equity,
                 # rather than masquerading as a new loss against today's breaker.
                 self.store.meta_set(utc_day_start_equity_usd=float(anchor_usd)+cash)
@@ -1739,7 +1839,9 @@ class ExecutionEngine:
         funding = float(p["realized_funding_usd"])
         slip = qty * (abs(p["entry_price"] - p["raw_entry_price"]) + abs(raw_exit - exit_price))
         net = gross - fees + funding
-        eq_after = self.realized_equity_inr() + (net - (funding - float(p["entry_fee_usd"]))) * self.rate
+        eq_after = self.realized_equity_inr()
+        if self.mode == "paper":
+            eq_after += (net - (funding - float(p["entry_fee_usd"]))) * self.rate
         return dict(mode=self.mode, symbol=p["symbol"], side=p["side"], contracts=p["contracts"],
                     contract_value=p["contract_value"], entry_price=p["entry_price"], exit_price=exit_price,
                     raw_entry_price=p["raw_entry_price"], raw_exit_price=raw_exit, initial_sl=p["initial_sl"],
@@ -2379,9 +2481,12 @@ class ExecutionEngine:
                 tot += d * p["contracts"] * p["contract_value"] * (px - p["entry_price"])
         return tot * self.rate
 
-    def check_daily_loss(self, day_start_equity_inr: float, unrealized_inr: float = 0.0) -> bool:
-        """Halt until next UTC midnight when realized+unrealized equity fell 5% below the day start."""
-        eq = self.realized_equity_inr() + unrealized_inr
+    def check_daily_loss(self, day_start_equity_inr: float, unrealized_inr: float = 0.0, *, equity_inr: float | None = None) -> bool:
+        """Halt until UTC midnight at the account's daily limit; exchange balance comes from Delta."""
+        self.refresh_account_settings()
+        eq = (self.realized_equity_inr() if equity_inr is None else equity_inr) + (unrealized_inr if self.mode == "paper" else 0.0)
+        if self.mode in ("live", "testnet"):
+            day_start_equity_inr = float(self.store.meta_get("daily_start_equity_inr"))
         daily_pct = float(self.cfg_row["daily_loss_limit_pct"])
         if daily_pct == 0 or eq > day_start_equity_inr * (1 - daily_pct / 100):
             return False
@@ -2412,12 +2517,14 @@ class ExecutionEngine:
         return uid
 
     def prepare_account(self, exchange_sizes: dict[str, int] | None = None) -> dict[str, Any]:
-        """testnet/live (F07): bind the account, isolated margin (strict, F09) and 10x order leverage confirmed by
-        Delta's answer on every flat product. A product holding a position at another leverage is NOT changed: it
+        """Bind the account and verify each profile's leverage on flat products. LIVE preserves an existing
+        cross account; otherwise isolated margin is verified. An open product's leverage is NOT changed: it
         stays blocked for bot entries until flat. ``exchange_sizes`` (signed contracts per symbol) avoids re-reading."""
         self.account_policy = None
         uid = self.bind_account()
-        mm = self.ensure_isolated_margin()
+        existing_mode = self.read_margin_mode() if self.mode == "live" else None
+        mm = ({"margin_mode": "cross", "changed": False, "verified_by": "readback"}
+              if existing_mode == "cross" else self.ensure_isolated_margin())
         lev: dict[str, Any] = {}
         blocked: dict[str, str] = {}
         for s, prod in self.products.items():
@@ -2450,7 +2557,7 @@ class ExecutionEngine:
             try:
                 self.prepare_account()
             except ExchangeError as exc:
-                return f"isolated margin / {LEVERAGE}x leverage could not be verified: {exc}"
+                return f"account margin / configured leverage could not be verified: {exc}"
         return self.account_policy["blocked"].get(symbol)
 
     # -- paper runner ------------------------------------------------------------- #
