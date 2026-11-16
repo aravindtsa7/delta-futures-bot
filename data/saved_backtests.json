@@ -14461,7 +14461,8 @@
       "run_store.py": "334bd7f21a06448520fd3aae0a91c9193c25ddf2a095207e0f8f425c9b045179",
       "strategies.py": "98357e5bb2e20edfd0be5b45971769b68526738e3c0c1928d3cedd747c0aa775",
       "trade_rules.py": "f2a511ba455ee31ffce7d4acc0bc9ec53e645fff720f3d67fb4862e65962f142"
-    }
+    },
+    "daily_loss_limit_pct": 5.0
   },
   {
     "id": "bt_df3d1a081f",
@@ -15458,7 +15459,7 @@
       "maker_fee": 0.0002,
       "margin_buffer": 0.95,
       "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 10.0,
+      "max_daily_loss_pct": 50.0,
       "min_lot_max_loss_pct": 5.0,
       "risk_per_trade_pct": 12.0,
       "sl_atr_mult": 9.0,
@@ -15493,7 +15494,7 @@
       "legs": null,
       "leverage": 15.0,
       "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 10.0,
+      "max_daily_loss_pct": 50.0,
       "params": {
         "atr_sl_min_pct": 0.8,
         "body_ratio": 0.48,
@@ -15542,7 +15543,7 @@
     },
     "history_start": "2026-07-30T16:03:00+00:00",
     "cooldown_bars": 1,
-    "max_daily_loss_pct": 10.0,
+    "max_daily_loss_pct": 50.0,
     "trigger_source": "trade",
     "exit_on_opposite_signal": false,
     "audit": {
@@ -15587,7 +15588,8 @@
       "run_store.py": "334bd7f21a06448520fd3aae0a91c9193c25ddf2a095207e0f8f425c9b045179",
       "strategies.py": "5eb3c305736a1f64251fcb5c56cca3e0ba3fdd258aba1ac485ef9f2cd4e68037",
       "trade_rules.py": "f2a511ba455ee31ffce7d4acc0bc9ec53e645fff720f3d67fb4862e65962f142"
-    }
+    },
+    "daily_loss_limit_pct": 50.0
   },
   {
     "id": "bt_b2c0b6bda7",
@@ -16305,7 +16307,7 @@
       "maker_fee": 0.0002,
       "margin_buffer": 0.95,
       "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 12.0,
+      "max_daily_loss_pct": 50.0,
       "min_lot_max_loss_pct": 5.0,
       "risk_per_trade_pct": 12.0,
       "sl_atr_mult": 1.5,
@@ -16340,7 +16342,7 @@
       "legs": null,
       "leverage": 12.0,
       "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 12.0,
+      "max_daily_loss_pct": 50.0,
       "params": {
         "atr_sl_min_pct": 0.8,
         "breakeven_at_1r": 1,
@@ -16392,7 +16394,7 @@
     },
     "history_start": "2026-07-30T16:03:00+00:00",
     "cooldown_bars": 1,
-    "max_daily_loss_pct": 12.0,
+    "max_daily_loss_pct": 50.0,
     "trigger_source": "trade",
     "exit_on_opposite_signal": false,
     "audit": {
@@ -16437,7 +16439,8 @@
       "run_store.py": "334bd7f21a06448520fd3aae0a91c9193c25ddf2a095207e0f8f425c9b045179",
       "strategies.py": "5eb3c305736a1f64251fcb5c56cca3e0ba3fdd258aba1ac485ef9f2cd4e68037",
       "trade_rules.py": "f2a511ba455ee31ffce7d4acc0bc9ec53e645fff720f3d67fb4862e65962f142"
-    }
+    },
+    "daily_loss_limit_pct": 50.0
   },
   {
     "id": "bt_0a06fe4a3d",
@@ -16928,7 +16931,7 @@
       "maker_fee": 0.0002,
       "margin_buffer": 0.95,
       "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 7.0,
+      "max_daily_loss_pct": 50.0,
       "min_lot_max_loss_pct": 5.0,
       "risk_per_trade_pct": 10.0,
       "sl_atr_mult": 1.5,
@@ -16963,7 +16966,7 @@
       "legs": null,
       "leverage": 12.0,
       "mark_fill_mode": "trigger",
-      "max_daily_loss_pct": 7.0,
+      "max_daily_loss_pct": 50.0,
       "params": {
         "atr_sl_min_pct": 0.8,
         "body_ratio": 0.48,
@@ -17012,7 +17015,7 @@
     },
     "history_start": "2025-09-05T04:14:00+00:00",
     "cooldown_bars": 1,
-    "max_daily_loss_pct": 7.0,
+    "max_daily_loss_pct": 50.0,
     "trigger_source": "trade",
     "exit_on_opposite_signal": false,
     "audit": {
@@ -17057,7 +17060,8 @@
       "run_store.py": "334bd7f21a06448520fd3aae0a91c9193c25ddf2a095207e0f8f425c9b045179",
       "strategies.py": "5eb3c305736a1f64251fcb5c56cca3e0ba3fdd258aba1ac485ef9f2cd4e68037",
       "trade_rules.py": "f2a511ba455ee31ffce7d4acc0bc9ec53e645fff720f3d67fb4862e65962f142"
-    }
+    },
+    "daily_loss_limit_pct": 50.0
   },
   {
     "id": "bt_79c217df8d",
@@ -19105,6 +19109,8 @@
         "entry_time_ts": 1792305900,
         "exit_time_ts": 1792338000
       }
-    ]
+    ],
+    "max_daily_loss_pct": 50.0,
+    "daily_loss_limit_pct": 50.0
   }
 ]

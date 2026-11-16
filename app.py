@@ -1645,6 +1645,10 @@ class SaveResultRequest(BaseModel):
     capital_inr: float | None = None
     leverage: float | None = None
     risk_pct: float | None = None
+    max_daily_loss_pct: float | None = None
+    daily_loss_limit_pct: float | None = None
+    trigger_source: str | None = None
+    cooldown_bars: int | None = None
     sl_type: str | None = None
     sl_value: float | None = None
     tp_type: str | None = None
@@ -1706,6 +1710,11 @@ def save_backtest_result(req: SaveResultRequest) -> JSONResponse:
     use_4h = bool(req.use_4h_trend if req.use_4h_trend is not None else (f.get("trend_filter_4h") or bool(params.get("use_4h_trend", False))))
     use_gate = bool(req.use_cost_gate if req.use_cost_gate is not None else f.get("cost_gate", False))
     strict_lot = bool(req.strict_lot_cap if req.strict_lot_cap is not None else f.get("strict_lot_cap", False))
+    risk_val = float(req.risk_pct if req.risk_pct is not None else (c.get("risk_pct") or c.get("risk_per_trade_pct") or 2.0))
+    raw_dl = req.daily_loss_limit_pct if req.daily_loss_limit_pct is not None else (
+        req.max_daily_loss_pct if req.max_daily_loss_pct is not None else c.get("max_daily_loss_pct")
+    )
+    eff_dl = float(raw_dl) if raw_dl is not None and float(raw_dl) > risk_val else min(100.0, max(float(raw_dl or 0.0), 25.0, math.ceil(risk_val * 2.0)))
 
     entry = {
         "id": rid,
@@ -1721,7 +1730,11 @@ def save_backtest_result(req: SaveResultRequest) -> JSONResponse:
         "params": params,
         "capital_inr": float(req.capital_inr if req.capital_inr is not None else (c.get("capital_inr") or c.get("initial_capital_inr") or 50000.0)),
         "leverage": float(req.leverage if req.leverage is not None else (c.get("leverage") or 10)),
-        "risk_pct": float(req.risk_pct if req.risk_pct is not None else (c.get("risk_pct") or c.get("risk_per_trade_pct") or 2.0)),
+        "risk_pct": risk_val,
+        "max_daily_loss_pct": eff_dl,
+        "daily_loss_limit_pct": eff_dl,
+        "trigger_source": req.trigger_source or c.get("trigger_source") or "trade",
+        "cooldown_bars": int(req.cooldown_bars if req.cooldown_bars is not None else (c.get("cooldown_bars") or 1)),
         "sl_type": req.sl_type or c.get("sl_type") or "atr_mult",
         "sl_value": float(req.sl_value if req.sl_value is not None else (c.get("sl_value") or 2.0)),
         "tp_type": req.tp_type or c.get("tp_type") or "atr_mult",

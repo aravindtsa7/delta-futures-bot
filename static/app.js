@@ -483,6 +483,11 @@ function applySelectedStrategyDefaults() {
   if (st.trailing_stop !== undefined) $("trailEnabled").checked = !!st.trailing_stop;
   if (st.trigger_source !== undefined) $("triggerSource").value = st.trigger_source;
   if (st.max_daily_loss_pct !== undefined) $("dailyLoss").value = st.max_daily_loss_pct;
+  const curRisk = Number($("risk").value || 2);
+  const curDaily = Number($("dailyLoss").value || 5);
+  if (curRisk >= curDaily) {
+    $("dailyLoss").value = Math.min(100, Math.max(25, Math.ceil(curRisk * 2)));
+  }
   if (st.use_4h_trend !== undefined) $("trend4h").checked = !!st.use_4h_trend;
   if (st.use_cost_gate !== undefined) $("costGate").checked = !!st.use_cost_gate;
   if (st.strict_lot_cap !== undefined) $("strictLot").checked = !!st.strict_lot_cap;
@@ -592,7 +597,7 @@ async function saveStrategyFromModal(ev) {
     sl_value: Number($("stratSlValInput").value) || 2.0,
     tp_type: $("stratTpTypeInput").value,
     tp_value: Number($("stratTpValInput").value) || 5.0,
-    trail_mult: Number($("trailAtr").value) || 2.5,
+    trail_mult: $("trailAtr").value !== "" ? Number($("trailAtr").value) : 2.5,
   };
   try {
     let saved;
@@ -772,32 +777,117 @@ function renderSavedResultsTable() {
 
 async function restoreSavedResult(item) {
   showView("lab");
-  $("symbolSelect").value = item.symbol;
-  await loadCustomStrategies(item.symbol, item.strategy_id);
-  const st = state.customStrategies.find((s) => s.id === item.strategy_id);
-  if (st && item.rule_type) {
-    st.rule_type = item.rule_type;
-    if (item.params) st.params = { ...st.params, ...item.params };
+  const req = item.request || {};
+  const cfg = item.effective_config || {};
+  const sym = item.symbol || req.symbol || "ETHUSD";
+  if ($("symbolSelect") && ![...$("symbolSelect").options].some((o) => o.value === sym)) {
+    const opt = document.createElement("option");
+    opt.value = sym;
+    opt.textContent = sym;
+    $("symbolSelect").appendChild(opt);
   }
-  setTimeframePill(item.timeframe || "1h");
-  $("capital").value = item.capital_inr || 50000;
-  $("leverage").value = item.leverage || 10;
-  if (item.risk_pct) setRiskValue(item.risk_pct);
-  $("slType").value = item.sl_type || "atr_mult";
-  $("slValue").value = item.sl_value || 2.0;
-  $("tpType").value = item.tp_type || "atr_mult";
-  $("tpValue").value = item.tp_value || 5.0;
-  if ($("trailEnabled") && item.trailing_stop !== undefined) $("trailEnabled").checked = !!item.trailing_stop;
-  if (item.trail_mult !== undefined) $("trailAtr").value = item.trail_mult;
-  if (item.fee_mode) $("feeMode").value = item.fee_mode;
-  if (item.slippage_bps !== undefined) $("slippage").value = String(Math.round(item.slippage_bps));
-  if ($("trend4h") && item.use_4h_trend !== undefined) $("trend4h").checked = !!item.use_4h_trend;
-  if ($("costGate") && item.use_cost_gate !== undefined) $("costGate").checked = !!item.use_cost_gate;
-  if ($("strictLot") && item.strict_lot_cap !== undefined) $("strictLot").checked = !!item.strict_lot_cap;
-  const d = String(Math.round(item.period_days || 180));
-  if ([...$("daysSelect").options].some((o) => o.value === d)) $("daysSelect").value = d;
+  $("symbolSelect").value = sym;
+  const sid = item.strategy_id || req.strategy_id || req.strategy;
+  await loadCustomStrategies(sym, sid);
+  let st = state.customStrategies.find((s) => s.id === sid);
+  const ruleType = item.rule_type || req.rule_type || (st && st.rule_type);
+  const mergedParams = { ...(st?.params || {}), ...(req.params || {}), ...(item.params || {}) };
+  if (!st && ruleType) {
+    st = {
+      id: sid || `saved_${item.id}`,
+      name: item.custom_name || item.strategy_name || sid || "Saved Strategy",
+      symbol: sym,
+      timeframe: item.timeframe || req.timeframe || "1h",
+      rule_type: ruleType,
+      params: mergedParams,
+    };
+    state.customStrategies.unshift(st);
+    const opt = document.createElement("option");
+    opt.value = st.id;
+    opt.textContent = st.name;
+    $("strategySelect").insertBefore(opt, $("strategySelect").firstChild);
+    $("strategySelect").value = st.id;
+  } else if (st) {
+    if (ruleType) st.rule_type = ruleType;
+    st.params = mergedParams;
+    delete st.history_start;
+    delete st.backtest_window;
+  }
+  if (st) {
+    st.cooldown_bars = item.cooldown_bars ?? req.cooldown_bars ?? cfg.cooldown_bars ?? st.cooldown_bars ?? 1;
+    st.mark_fill_mode = item.mark_fill_mode ?? req.mark_fill_mode ?? cfg.mark_fill_mode ?? st.mark_fill_mode ?? "trigger";
+    const pStr = Object.entries(st.params || {}).map(([k, v]) => `${k}=${v}`).join(", ");
+    $("strategyRuleHint").textContent = `${st.rule_type} · ${pStr}`;
+  }
+
+  setTimeframePill(item.timeframe || req.timeframe || "1h");
+  $("capital").value = item.capital_inr ?? req.capital_inr ?? cfg.initial_capital_inr ?? 50000;
+  $("leverage").value = item.leverage ?? req.leverage ?? cfg.leverage ?? 10;
+  const riskVal = Number(item.risk_pct ?? req.risk_per_trade_pct ?? cfg.risk_per_trade_pct ?? 2.0);
+  setRiskValue(riskVal);
+
+  const rawDailyLoss = Number(
+    item.daily_loss_limit_pct ??
+    item.max_daily_loss_pct ??
+    req.max_daily_loss_pct ??
+    cfg.max_daily_loss_pct ??
+    0
+  );
+  const effDailyLoss = (!rawDailyLoss || riskVal >= rawDailyLoss)
+    ? Math.min(100, Math.max(rawDailyLoss || 0, 25, Math.ceil(riskVal * 2)))
+    : rawDailyLoss;
+  if ($("dailyLoss")) $("dailyLoss").value = effDailyLoss;
+
+  $("slType").value = item.sl_type || req.sl_type || "atr_mult";
+  $("slValue").value = item.sl_value ?? req.sl_value ?? 2.0;
+  $("tpType").value = item.tp_type || req.tp_type || "atr_mult";
+  $("tpValue").value = item.tp_value ?? req.tp_value ?? 5.0;
+
+  const trailMult = Number(item.trail_mult ?? req.trail_atr_mult ?? cfg.trailing_atr_mult ?? 0);
+  const rawTrailOn = item.trailing_stop !== undefined ? item.trailing_stop : req.trailing_stop;
+  const trailOn = rawTrailOn !== undefined ? (!!rawTrailOn && trailMult > 0) : (trailMult > 0);
+  if ($("trailEnabled")) $("trailEnabled").checked = trailOn;
+  if ($("trailAtr")) $("trailAtr").value = trailMult;
+
+  const feeMode = item.fee_mode || req.fee_mode || cfg.fee_mode;
+  if (feeMode && $("feeMode")) $("feeMode").value = feeMode;
+
+  const slipVal = item.slippage_bps ?? req.slippage_bps ?? cfg.slippage_bps;
+  if (slipVal !== undefined && $("slippage")) {
+    const sStr = String(Math.round(Number(slipVal)));
+    if (![...$("slippage").options].some((o) => o.value === sStr)) {
+      const opt = document.createElement("option");
+      opt.value = sStr;
+      opt.textContent = `${sStr} bps`;
+      $("slippage").appendChild(opt);
+    }
+    $("slippage").value = sStr;
+  }
+
+  const trig = item.trigger_source || req.trigger_source || cfg.trigger_source || "trade";
+  if ($("triggerSource") && [...$("triggerSource").options].some((o) => o.value === trig)) {
+    $("triggerSource").value = trig;
+  }
+
+  if ($("trend4h")) $("trend4h").checked = !!(item.use_4h_trend ?? req.trend_filter_4h ?? false);
+  if ($("costGate")) $("costGate").checked = !!(item.use_cost_gate ?? req.cost_gate ?? false);
+  if ($("strictLot")) $("strictLot").checked = !!(item.strict_lot_cap ?? req.strict_lot_cap ?? false);
+
+  const d = String(Math.round(Number(item.period_days || item.window?.days || req.days || 180)));
+  if ($("daysSelect")) {
+    if (![...$("daysSelect").options].some((o) => o.value === d)) {
+      const opt = document.createElement("option");
+      opt.value = d;
+      opt.textContent = `${d} days`;
+      $("daysSelect").insertBefore(opt, $("daysSelect").querySelector('option[value="custom"]'));
+    }
+    $("daysSelect").value = d;
+  }
+  if ($("endSelect")) $("endSelect").value = "latest";
+  toggleCustomRange();
   updateAdvSummary();
-  await runBacktest({ markSaved: true, requestOverride: item.request || undefined });
+  updateOverviewHeaderPreview();
+  await runBacktest({ markSaved: true });
 }
 
 /* ------------------------------------------------------------------ status, presets */
