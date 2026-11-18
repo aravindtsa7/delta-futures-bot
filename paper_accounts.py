@@ -139,11 +139,15 @@ def _profiles(raw, capital, limit, fx, *, update_capital=True, check_fx=True):
         effective.update(max_daily_loss_pct=limit)
         profile.update(max_daily_loss_pct=limit, daily_loss_limit_pct=limit,
                        daily_loss_stop_pct=limit, effective_config=effective)
+        if isinstance(profile.get('paper_account_runtime_override'), dict):
+            profile['paper_account_runtime_override']['daily_loss_limit_pct'] = limit
         if update_capital:
             effective['initial_capital_inr'] = capital
             profile['capital_inr'] = capital
             if 'initial_capital_inr' in profile:
                 profile['initial_capital_inr'] = capital
+            if isinstance(profile.get('paper_account_runtime_override'), dict):
+                profile['paper_account_runtime_override']['capital_inr'] = capital
         ee.profile_config(ee._profile_from_dict(sym, profile))
     return result
 

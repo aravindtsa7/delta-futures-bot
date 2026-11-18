@@ -307,19 +307,21 @@ class LiveBotRunner:
         self.lock = InstanceLock(lock_path, mode)
         self.store = None
         try:
-            self.mode, self.clock, self.profiles = mode, clock, profiles
-            self.symbols = list(profiles)  # extended below with symbols that only need protective management
+            enabled_profiles = {s: p for s, p in dict(profiles).items() if getattr(p, "enabled", True)}
+            self.mode, self.clock, self.profiles = mode, clock, enabled_profiles
+            self.symbols = list(enabled_profiles)
             self.client = client if client is not None else (DeltaRestClientAdapter.from_settings(mode) if mode != "paper" else None)
             self.store = ee.StateStore(store_path or get_mode_db_path(mode),
                                        clock=lambda: int(self.clock() * 1_000_000))
             self.engine = ee.ExecutionEngine(self.store, mode, self.client, clock=lambda: int(self.clock() * 1_000_000),
-                                             profiles=profiles, notifier=notifier)
+                                             profiles=enabled_profiles, notifier=notifier)
             self.profiles = self.engine.profiles
             self.notifier = self.engine.notifier
             self.control = ControlChannel(control_dir or CONTROL_DIR)
-            managed = [p["symbol"] for p in self.store.positions(mode)] + [i["symbol"] for i in self.engine.pending_limits()]
-            for sym in managed:
-                if sym not in self.symbols:
+            for p in self.store.positions(mode):
+                sym = p["symbol"]
+                src = p["source"] if "source" in p.keys() and p["source"] else "bot"
+                if src != "manual" and sym in self.profiles and sym not in self.symbols:
                     self.symbols.append(sym)
                     self.engine.ensure_product(sym)
             self.market = market if market is not None else RestMarketData(self.symbols, self.profiles)
@@ -426,6 +428,15 @@ class LiveBotRunner:
         if c.symbol in self.symbols:
             self.on_minute_close(c.symbol, c.start, c.open, c.high, c.low, c.close, c.source)
 
+    def _is_bot_position(self, p: Any, sym: str | None = None) -> bool:
+        if p is None:
+            return False
+        s = sym or str(p["symbol"])
+        if s not in self.profiles or not getattr(self.profiles[s], "enabled", True):
+            return False
+        src = p["source"] if "source" in p.keys() and p["source"] else "bot"
+        return src != "manual"
+
     def _private_update(self, sym: str, oid: str, closed: bool, source: str) -> None:
         """An order / fill event: book fills of our own resting or partially filled orders now (F04), and the exit
         when one of a position's SL/TP legs is done."""
@@ -434,7 +445,7 @@ class LiveBotRunner:
             for r in self.engine.refresh_resting_orders():
                 self.actions.append({"symbol": sym, "source": source, **r})
         p = self.store.position(self.mode, sym) if sym else None
-        if p is not None and oid in (p["sl_order_id"], p["tp_order_id"]) and closed:
+        if self._is_bot_position(p, sym) and oid in (p["sl_order_id"], p["tp_order_id"]) and closed:
             r = self.engine.sync_exchange_position(sym)
             if r:
                 self.actions.append({"symbol": sym, "source": source, **r})
@@ -461,7 +472,7 @@ class LiveBotRunner:
             return  # snapshots arrive during the handshake; the REST reconciliation covers them
         sym = str(m.get("product_symbol") or "")
         p = self.store.position(self.mode, sym) if sym else None
-        if p is not None and int(m.get("size") or 0) != (1 if p["side"] == "LONG" else -1) * int(p["contracts"]):
+        if self._is_bot_position(p, sym) and int(m.get("size") or 0) != (1 if p["side"] == "LONG" else -1) * int(p["contracts"]):
             r = self.engine.sync_exchange_position(sym)
             if r:
                 self.actions.append({"symbol": sym, "source": "ws_positions", **r})
@@ -492,10 +503,16 @@ class LiveBotRunner:
             summary["open_orders"] = len(orders)
             summary["positions"] = {}
             sizes: dict[str, int] = {}
-            for sym, spec in self.engine.products.items():
+            for sym, prof in self.profiles.items():
+                if not getattr(prof, "enabled", True):
+                    continue
+                spec = self.engine.ensure_product(sym)
                 pos = self.client.get_position(spec.product_id)
                 sizes[sym] = pos["size"]
                 local = self.store.position(self.mode, sym)
+                if local is not None and not self._is_bot_position(local, sym):
+                    summary["positions"][sym] = {"exchange_size": pos["size"], "journal": "manual", "skipped": "manual_position"}
+                    continue
                 info = {"exchange_size": pos["size"], "journal": None if local is None else
                         (1 if local["side"] == "LONG" else -1) * local["contracts"]}
                 if pos["size"] == 0 and local is not None:
@@ -512,7 +529,7 @@ class LiveBotRunner:
                     if local is not None:
                         info.update(self._ensure_protection(sym, spec.product_id, local, orders, issues))
                 summary["positions"][sym] = info
-            try:  # F07: isolated margin + 10x verified before bot entries; open positions keep their leverage
+            try:  # F07: isolated margin + profile leverage verified before bot entries; open positions keep their leverage
                 pol = self.engine.prepare_account(sizes)
                 summary["account_policy"] = {"margin_mode": pol["margin_mode"], "blocked": pol["blocked"]}
             except ExchangeError as exc:
@@ -593,8 +610,10 @@ class LiveBotRunner:
             self.store.event('WARN','readiness_retry_failed',None,str(exc),self.mode)
 
     def _ref_mark(self, sym: str) -> float | None:
-        t = self.ws.last_ticker.get(sym) or {}
-        return t.get("mark_price") or self.last_close.get(sym)
+        ws = getattr(self, "ws", None)
+        t = (ws.last_ticker.get(sym) if ws is not None and hasattr(ws, "last_ticker") else None) or {}
+        last_close = getattr(self, "last_close", None) or {}
+        return t.get("mark_price") or last_close.get(sym)
 
     def _ensure_protection(self, sym: str, pid: int, local: Any, orders: list[dict[str, Any]],
                            issues: list[str]) -> dict[str, Any]:
@@ -604,7 +623,9 @@ class LiveBotRunner:
         'missing_confirmed_protection:{sym}' so the runner stays DEGRADED (no entries)."""
         n = int(local["contracts"])
         ref = self._ref_mark(sym) or float(local["entry_price"])
-        want_sl, want_tp = local["sl_price"] is not None, local["tp_price"] is not None
+        src = local["source"] if "source" in local.keys() and local["source"] else "bot"
+        want_sl = local["sl_price"] is not None or src != "manual"
+        want_tp = local["tp_price"] is not None
 
         def match(rows: list[dict[str, Any]]) -> tuple[dict | None, dict | None]:
             return self.engine._match_legs([o for o in rows if int(o.get("product_id") or 0) == int(pid)], pid, local["side"], ref)
@@ -615,16 +636,20 @@ class LiveBotRunner:
             self.store.event("CRITICAL", "unprotected_position", sym, out, self.mode)
             key = f"{sym}:{local['opened_at_us']}"
             last = self._bracket_attempts.get(key)
-            if last is None or self.clock() - last >= BRACKET_RETRY_S:
+            can_attach_sl = want_sl and sl is None and local["sl_price"] is not None
+            can_attach_tp = want_tp and tp is None and local["tp_price"] is not None
+            if (can_attach_sl or can_attach_tp) and (last is None or self.clock() - last >= BRACKET_RETRY_S):
                 self._bracket_attempts[key] = self.clock()
                 try:
                     self.client.place_position_bracket(
-                        pid, {"order_type": "market_order", "stop_price": local["sl_price"]} if want_sl and sl is None else None,
-                        {"order_type": "market_order", "stop_price": local["tp_price"]} if want_tp and tp is None else None,
+                        pid, {"order_type": "market_order", "stop_price": local["sl_price"]} if can_attach_sl else None,
+                        {"order_type": "market_order", "stop_price": local["tp_price"]} if can_attach_tp else None,
                         ee.TRIGGER_METHOD)
                     out["bracket_attached"] = True
                 except ExchangeError as exc:
                     out["bracket_error"] = str(exc)
+            elif not (can_attach_sl or can_attach_tp):
+                out["bracket_error"] = "missing stop_price for mandatory protection"
             else:
                 out["bracket_attach"] = "awaiting readback (not resent)"
             reread = True
@@ -641,7 +666,9 @@ class LiveBotRunner:
             found = {k: v for k, v in (("sl_order_id", sl), ("tp_order_id", tp)) if v is not None}
             if found:
                 self.store.update_position(self.mode, sym, **{k: str(v["id"]) for k, v in found.items()})
-        ok = all(o is not None and int(o.get("size") or 0) == n for want, o in ((want_sl, sl), (want_tp, tp)) if want)
+        ok = bool(want_sl) and sl is not None and int(sl.get("size") or 0) == n and (
+            not want_tp or (tp is not None and int(tp.get("size") or 0) == n)
+        )
         out["protection_confirmed"] = ok
         if not ok:
             issues.append(f"missing_confirmed_protection:{sym}")
@@ -663,8 +690,12 @@ class LiveBotRunner:
     def _catch_up(self, cov: dict[str, dict[str, Any]]) -> None:
         """Replay closed minutes missed while away over open positions; queue a missed timeframe close."""
         for sym, c in cov.items():
+            if sym not in self.profiles or not getattr(self.profiles[sym], "enabled", True):
+                continue
             last = self.last_minute.get(sym)
             p = self.store.position(self.mode, sym)
+            if p is not None and not self._is_bot_position(p, sym):
+                p = None
             start = None
             if p is not None:
                 start = int(p["last_bar_us"] // 1_000_000)
@@ -672,7 +703,8 @@ class LiveBotRunner:
                 start = max(start or last, last)
             if start is not None and c["last_1m"] > start:
                 for bar_s, o, h, l, cl, fr, mk in self.market.minutes_after(sym, start):
-                    if self.store.position(self.mode, sym) is not None:
+                    cur_p = self.store.position(self.mode, sym)
+                    if self._is_bot_position(cur_p, sym):
                         a = self.engine.on_bar(sym, bar_s * 1_000_000, o, h, l, cl, fr, mk)
                         if a:
                             self.actions.append({"symbol": sym, "catch_up": True, **a})
@@ -697,7 +729,7 @@ class LiveBotRunner:
     # -- minute / timeframe processing --------------------------------------------------------- #
     @_locked
     def on_minute_close(self, symbol: str, bar_s: int, o: float, h: float, l: float, c: float, source: str = "ws") -> None:
-        if symbol not in self.symbols:
+        if symbol not in self.symbols or symbol not in self.profiles or not getattr(self.profiles[symbol], "enabled", True):
             return
         last = self.last_minute.get(symbol)
         if last is not None and bar_s <= last:
@@ -708,11 +740,13 @@ class LiveBotRunner:
         self.last_minute[symbol] = bar_s
         self.last_close[symbol] = c
         self._roll_day(bar_s)
-        if self.mode != "paper" and self.store.position(self.mode, symbol) is not None:
+        cur_p = self.store.position(self.mode, symbol)
+        if self.mode != "paper" and self._is_bot_position(cur_p, symbol):
             x = self.engine.sync_exchange_position(symbol)  # exits first: never trail a leg that already filled
             if x:
                 self.actions.append({"symbol": symbol, "bar": bar_s, "source": source, **x})
-        if self.store.position(self.mode, symbol) is not None:
+        cur_p = self.store.position(self.mode, symbol)
+        if self._is_bot_position(cur_p, symbol):
             fr = mk = None
             if bar_s % dm.FUNDING_INTERVAL_SECONDS == 0:
                 fr, mk = self.market.funding_inputs(symbol, bar_s)
@@ -836,8 +870,13 @@ class LiveBotRunner:
 
     def equity_inr(self) -> float:
         if self.mode != "paper":
-            return self.engine.sync_exchange_wallet()["wallet_equity_inr"]
-        return self.engine.realized_equity_inr() + self.engine.unrealized_inr(self.last_close)
+            w_eq = self.engine.sync_exchange_wallet()["wallet_equity_inr"]
+            prices = {sym: px for sym in getattr(self, "symbols", ()) if (px := self._ref_mark(sym)) is not None}
+            u_inr, ok = self.engine.exchange_unrealized_inr(prices)
+            if not ok:
+                raise ExchangeError("open exchange position mark price / unrealized PnL could not be verified")
+            return w_eq + u_inr
+        return self.engine.realized_equity_inr() + self.engine.unrealized_inr(getattr(self, "last_close", {}) or {})
 
     def _roll_day(self, bar_s: int) -> None:
         """UTC day anchor of the 5% breaker, persisted in system_meta (Source #5): a restart later the same day keeps
@@ -889,7 +928,11 @@ class LiveBotRunner:
             anchor = self.store.meta_get('utc_day_start_equity_usd')
             if anchor is not None:
                 self.day_start_equity = float(anchor)*self.engine.rate
-        eq = self.equity_inr()
+        try:
+            eq = self.equity_inr()
+        except ExchangeError as exc:
+            self.transition("DEGRADED", f"unrealized PnL verification failed: {exc}")
+            return
         if self.mode != "paper":
             self.day_start_equity = float(self.store.meta_get("daily_start_equity_inr"))
         daily_pct = float(self.engine.cfg_row["daily_loss_limit_pct"])
@@ -927,14 +970,16 @@ class LiveBotRunner:
         if (why := auto_bot_live_refusal(self.mode)) is not None:
             raise LiveTradingDisabledError(why)
         summary = self.run_reconciliation("cli --once")
-        for sym in self.profiles:
+        for sym, prof in self.profiles.items():
+            if not getattr(prof, "enabled", True):
+                continue
             try:
                 s = self.market.evaluate(sym)
             except Exception as exc:  # noqa: BLE001 - e.g. an added coin whose history is still downloading
                 self.store.event("WARN", "evaluate_failed", sym, f"{type(exc).__name__}: {exc}", self.mode)
                 continue
             self.last_eval[sym] = s
-            close_s = int(pd.Timestamp(s["bar_close"]).value // 10**9)
+            close_s = _epoch_s(s["bar_close"])
             if s["fresh_signal"] and self.clock() - close_s <= ENTRY_MAX_DELAY_S:
                 self._queue_close(sym, close_s)
                 self._try_hour_signal(sym)

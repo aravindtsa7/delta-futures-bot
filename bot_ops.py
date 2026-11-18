@@ -791,7 +791,7 @@ def _build_deploy_entry(saved: dict[str, Any] | None, req: DeployStrategyRequest
     tp_type = str(req.tp_type or src.get("tp_type") or "atr_mult")
     tp_val = float(req.tp_value if req.tp_value is not None else (src.get("tp_value") or 5.0))
     trail_m = float(req.trail_mult if req.trail_mult is not None else (src.get("trail_mult") if src.get("trail_mult") is not None else 2.5))
-    trail_on = bool(req.trailing_stop if req.trailing_stop is not None else (src.get("trailing_stop", trail_m > 0)))
+    trail_on = bool(req.trailing_stop if req.trailing_stop is not None else (src.get("trailing_stop", trail_m > 0))) and (trail_m > 0)
     fee_mode = str(req.fee_mode or src.get("fee_mode") or "taker_maker_tp")
     slippage_bps = float(req.slippage_bps if req.slippage_bps is not None else (src.get("slippage_bps") or 0.0))
     use_4h = bool(req.use_4h_trend if req.use_4h_trend is not None else src.get("use_4h_trend", bool(params.get("use_4h_trend", False))))

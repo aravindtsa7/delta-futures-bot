@@ -91,6 +91,7 @@ class Settings(BaseSettings):
     # .env: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (or the DELTA_-prefixed names)
     TELEGRAM_BOT_TOKEN: str = Field("", validation_alias=AliasChoices("DELTA_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"))
     TELEGRAM_CHAT_ID: str = Field("", validation_alias=AliasChoices("DELTA_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"))
+    DASHBOARD_AUTH_TOKEN: str = Field("", validation_alias=AliasChoices("DELTA_DASHBOARD_AUTH_TOKEN", "DASHBOARD_AUTH_TOKEN"))
     SIZING_SLIPPAGE_BPS: float = Field(2.0, ge=0, le=100)  # per-fill buffer in the lot sizer / paper fills
 
     # --- Symbols (plug-and-play: add a perpetual symbol string here) ----- #

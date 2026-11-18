@@ -64,7 +64,7 @@ TriggerSource = Literal["trade", "mark"]
 StopMode = Literal["pct", "atr"]
 MarkFillMode = Literal["trigger", "traded"]
 
-MARKET_EXITS = {"SL", "BE", "TSL", "OPP", "XSIG", "DAILY", "END"}
+MARKET_EXITS = {"SL", "BE", "TSL", "OPP", "XSIG", "DAILY", "END", "LIQUIDATION"}
 WALLET_FIELDS = ("initial_capital_inr", "usd_inr_rate", "gst_rate", "max_daily_loss_pct")
 
 # Canonical trade-ledger schema (the keys _Sim._close writes), so a zero-trade run still has every column (F11).
@@ -159,9 +159,8 @@ class BacktestConfig:
         if self.leverage < 1:
             raise ValueError("leverage must be >= 1")
         max_stop = self.stop_loss_pct if self.sl_mode == "pct" else self.atr_sl_max_pct
-        if not 0 < max_stop < 100 / self.leverage:
-            # Liquidation is not simulated, so the widest stop must sit inside the liquidation distance.
-            raise ValueError(f"stop distance must be in (0, {100 / self.leverage:g})% at {self.leverage:g}x")
+        if not 0 < max_stop < 100:
+            raise ValueError("stop distance must be in (0, 100)%")
         if self.sl_mode == "atr" and not (0 < self.atr_sl_min_pct <= self.atr_sl_max_pct and self.sl_atr_mult > 0 < self.tp_atr_mult):
             raise ValueError("invalid ATR stop settings")
         if self.take_profit_pct <= 0 or self.risk_per_trade_pct <= 0 or self.cooldown_bars < 0:
@@ -221,6 +220,8 @@ class BacktestConfig:
         return raw if self.fee_mode == "maker_maker" else self.exec_price(raw, direction)
 
     def exit_price(self, raw: float, direction: int, reason: str) -> float:
+        if reason == "LIQUIDATION":
+            return raw
         return raw if self.fee_mode == "maker_maker" and reason == "TP" else self.exec_price(raw, -direction)
 
 
@@ -668,6 +669,14 @@ class _Sim:
     def _intrabar(self, s: _LegState, i: int) -> None:
         p, cfg = s.pos, s.cfg
         d = p.direction
+        liq_px = p.entry_price * (1.0 - d * (1.0 / cfg.leverage - 0.005))
+        bk_px = p.entry_price * (1.0 - d / cfg.leverage)
+        gap_liq = (s.to[i] <= liq_px if d == 1 else s.to[i] >= liq_px) and i != p.entry_index
+        liq_hit = s.tl[i] <= liq_px if d == 1 else s.th[i] >= liq_px
+        sl_first = p.sl > liq_px if d == 1 else p.sl < liq_px
+        if gap_liq or (liq_hit and not sl_first):
+            self._close(s, i, bk_px, "LIQUIDATION")
+            return
         if d == 1:
             sl_hit, tp_hit, gapped = s.tl[i] <= p.sl, s.th[i] >= p.tp, s.to[i] <= p.sl
         else:

@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -26,7 +27,7 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -71,12 +72,34 @@ from contextlib import asynccontextmanager  # noqa: E402
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
     try:
+        manual_trade.start_watcher_if_needed()
         yield
     finally:
         manual_trade.shutdown_manual_trade()
 
 
 app = FastAPI(title="Delta Futures Lab", version="1.0", lifespan=_app_lifespan)
+
+
+@app.middleware("http")
+async def _dashboard_auth_middleware(request: Request, call_next):
+    expected = (settings.DASHBOARD_AUTH_TOKEN or "").strip()
+    if not expected:
+        return await call_next(request)
+    hdr_x = (request.headers.get("X-Auth-Token") or "").strip()
+    auth = (request.headers.get("Authorization") or "").strip()
+    hdr_bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    q_tok = (request.query_params.get("token") or "").strip()
+    c_tok = (request.cookies.get("delta_auth_token") or "").strip()
+    matched = any(cand and secrets.compare_digest(cand, expected) for cand in (hdr_x, hdr_bearer, q_tok, c_tok))
+    if not matched:
+        return JSONResponse({"detail": "Unauthorized: valid DASHBOARD_AUTH_TOKEN required"}, status_code=401)
+    response = await call_next(request)
+    if not (c_tok and secrets.compare_digest(c_tok, expected)):
+        response.set_cookie("delta_auth_token", expected, httponly=True, samesite="lax")
+    return response
+
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 import bot_ops  # noqa: E402  (Step 7: /api/bot/* operations router)

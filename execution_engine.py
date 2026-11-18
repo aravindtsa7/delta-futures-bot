@@ -863,7 +863,8 @@ def calculate_order_lots(product: ProductSpec, price: float, atr_value: float, s
                          slippage_bps: float | None = None, *, profile: StrategyProfile | None = None,
                          sl_type: str | None = None, sl_value: float | None = None,
                          tp_type: str | None = None, tp_value: float | None = None,
-                         trail_mult: float | None = None, mode: str = "paper") -> LotSizing:
+                         trail_mult: float | None = None, mode: str = "paper",
+                         total_equity_inr: float | None = None) -> LotSizing:
     """Whole contracts for one entry honoring the symbol's deployed risk_pct, leverage, sl_type/value, tp_type/value, and trail_mult."""
     if not (price > 0 and atr_value > 0):
         raise ValueError("price and ATR must be > 0")
@@ -872,6 +873,12 @@ def calculate_order_lots(product: ProductSpec, price: float, atr_value: float, s
     equity_inr = CAPITAL_INR if equity_inr is None else equity_inr
     if not math.isfinite(equity_inr) or available_inr is not None and not math.isfinite(available_inr):
         raise ValueError("wallet equity and available margin must be finite")
+    if mode in ("live", "testnet") and equity_inr <= 0:
+        raise ExchangeError("Delta wallet balance must be positive for entry sizing")
+    if total_equity_inr is not None:
+        if not math.isfinite(total_equity_inr):
+            raise ValueError("total equity must be finite")
+        equity_inr = max(0.0, min(float(equity_inr), float(total_equity_inr)))
     if profile is not None:
         risk_pct = float(profile.risk_pct)
         leverage = float(profile.leverage)
@@ -889,16 +896,17 @@ def calculate_order_lots(product: ProductSpec, price: float, atr_value: float, s
 
     d = 1 if side.upper() in ("LONG", "BUY") else -1
     atr_pct = atr_value / price * 100.0
+    cfg_eq = max(1e-9, equity_inr)
     cfg = profile_config(profile) if profile is not None else sizing_config(
-        equity_inr, risk_pct, leverage, slippage_bps, sl_type=eff_sl_type, sl_value=eff_sl_val,
+        cfg_eq, risk_pct, leverage, slippage_bps, sl_type=eff_sl_type, sl_value=eff_sl_val,
         tp_type=eff_tp_type, tp_value=eff_tp_val, trail_mult=eff_trail, atr_pct=atr_pct)
     if profile is not None:
         cfg = profile_config(profile)
         leverage, risk_pct = cfg.leverage, cfg.risk_per_trade_pct
         eff_trail = cfg.trailing_atr_mult
     if mode in ("live", "testnet"):
-        cfg = runtime_sizing_config(profile, mode, equity_inr) if profile else replace(
-            cfg, initial_capital_inr=equity_inr, usd_inr_rate=settings.FIXED_USD_INR_RATE,
+        cfg = runtime_sizing_config(profile, mode, cfg_eq) if profile else replace(
+            cfg, initial_capital_inr=cfg_eq, usd_inr_rate=settings.FIXED_USD_INR_RATE,
             taker_fee=settings.TAKER_FEE, gst_rate=settings.GST_ON_FEES, allow_min_one_lot=False)
         leverage, risk_pct = cfg.leverage, cfg.risk_per_trade_pct
     bt = Backtester(cfg)
@@ -1221,14 +1229,25 @@ class ExecutionEngine:
             return {"action": "skip", "reason": f"account policy: {why}"}
         product = self.ensure_product(symbol)
         equity, available = self.account_equity_inr()
+        total_equity = equity
         if self.mode != "paper":
             if equity <= 0:
                 return {"action": "skip", "reason": "Delta wallet balance is zero or negative"}
-            cfg = runtime_sizing_config(prof, self.mode, equity)
-            if self.check_daily_loss(float(self.store.meta_get("daily_start_equity_inr")), equity_inr=equity):
+            u_inr, u_ok = self.exchange_unrealized_inr()
+            if not u_ok:
+                self._event("WARN", "entry_blocked_unverified_pnl", symbol,
+                            "open exchange position mark price / unrealized PnL could not be verified")
+                return {"action": "skip", "reason": "open exchange position mark price / unrealized PnL could not be verified"}
+            total_equity = equity + u_inr
+            if self.check_daily_loss(float(self.store.meta_get("daily_start_equity_inr")), unrealized_inr=u_inr, equity_inr=equity):
                 return {"action": "skip", "reason": "daily loss limit hit"}
+            conservative_eq = min(equity, total_equity)
+            if conservative_eq <= 0:
+                return {"action": "skip", "reason": "total equity including unrealized loss is zero or negative"}
+            cfg = runtime_sizing_config(prof, self.mode, conservative_eq)
         fill_ref = cfg.entry_price(ref_price, direction) if self.mode == "paper" else ref_price
-        lots = calculate_order_lots(product, fill_ref, atr_value, side_name, equity, available, profile=prof, mode=self.mode)
+        lots = calculate_order_lots(product, fill_ref, atr_value, side_name, equity, available, profile=prof, mode=self.mode,
+                                    total_equity_inr=total_equity if self.mode != "paper" else None)
         if lots.contracts < 1:
             self._event("INFO", "entry_skipped", symbol, lots.reason)
             return {"action": "skip", "reason": lots.reason, "sizing": lots}
@@ -1287,16 +1306,27 @@ class ExecutionEngine:
             reason = "Delta wallet balance is zero or negative; no entry sent"
             self.store.transition(iid, "REJECTED", reason, error=reason)
             return {"action": "skip", "intent_id": iid, "reason": reason}
+        u_inr, u_ok = self.exchange_unrealized_inr()
+        if not u_ok:
+            reason = "open exchange position mark price / unrealized PnL could not be verified; no entry sent"
+            self.store.transition(iid, "REJECTED", reason, error=reason)
+            return {"action": "skip", "intent_id": iid, "reason": reason}
+        conservative_eq = min(wallet["wallet_equity_inr"], wallet["wallet_equity_inr"] + u_inr)
+        if conservative_eq <= 0:
+            reason = "total equity including unrealized loss is zero or negative; no entry sent"
+            self.store.transition(iid, "REJECTED", reason, error=reason)
+            return {"action": "skip", "intent_id": iid, "reason": reason}
         prod = self.ensure_product(intent["symbol"])
-        cfg = runtime_sizing_config(self.profiles.get(intent["symbol"]), self.mode, wallet["wallet_equity_inr"])
+        cfg = runtime_sizing_config(self.profiles.get(intent["symbol"]), self.mode, conservative_eq)
         notional = int(intent["size"]) * prod.contract_value * float(intent["entry_price"])
         required = notional * (1 / float(intent["leverage"] or LEVERAGE) + 2 * cfg.with_gst(cfg.taker_fee)) * (1 + cfg.slip) * self.rate
         risk = (int(intent["size"]) * Backtester(cfg).loss_per_contract(float(intent["entry_price"]), float(intent["sl_price"]), prod) * self.rate
                 if intent["execution_config"] and intent["sl_price"] else None)
-        limit_hit = (self.check_daily_loss(float(self.store.meta_get("daily_start_equity_inr")), equity_inr=wallet["wallet_equity_inr"])
+        limit_hit = (self.check_daily_loss(float(self.store.meta_get("daily_start_equity_inr")),
+                                           unrealized_inr=u_inr, equity_inr=wallet["wallet_equity_inr"])
                      if intent["execution_config"] else False)
         if (limit_hit or required > max(0.0, wallet["available_margin_inr"]) * cfg.margin_buffer
-                or risk is not None and risk > wallet["wallet_equity_inr"] * cfg.risk_per_trade_pct / 100):
+                or risk is not None and risk > conservative_eq * cfg.risk_per_trade_pct / 100):
             reason = "exchange wallet changed; daily limit, risk budget or margin plus taker fees/GST safety budget would be exceeded"
             self.store.transition(iid, "REJECTED", reason, error=reason)
             return {"action": "skip", "intent_id": iid, "reason": reason}
@@ -1341,10 +1371,37 @@ class ExecutionEngine:
         it = self.store.intent(intent_id)
         size = int(order.get("size") or it["size"])
         booked = int(it["filled_size_booked"] or 0)
-        filled = size - int(order.get("unfilled_size") or 0)
-        st = order.get("state")
-        if fills is None and self.mode != "paper" and filled > booked:
-            fills = self._order_fills(it, order.get("id"))
+        unfilled_raw = order.get("unfilled_size")
+        st_raw = order.get("state")
+        st = str(st_raw).lower() if st_raw is not None else None
+        if unfilled_raw is None and self.mode != "paper" and order.get("id") is not None:
+            try:
+                polled = self.client.get_order_by_id(order["id"])
+                if isinstance(polled, dict):
+                    if polled.get("unfilled_size") is not None:
+                        unfilled_raw = polled.get("unfilled_size")
+                        order = {**order, "unfilled_size": unfilled_raw}
+                    if order.get("average_fill_price") in (None, "") and polled.get("average_fill_price") not in (None, ""):
+                        order = {**order, "average_fill_price": polled.get("average_fill_price")}
+                    if st is None and polled.get("state") is not None:
+                        st_raw = polled.get("state")
+                        st = str(st_raw).lower()
+                        order = {**order, "state": st_raw}
+            except ExchangeError:
+                pass
+        if unfilled_raw is not None:
+            filled = max(0, size - int(unfilled_raw))
+            if fills is None and self.mode != "paper" and filled > booked:
+                fills = self._order_fills(it, order.get("id"))
+        else:
+            if fills is None and self.mode != "paper":
+                try:
+                    fills = self._order_fills(it, order.get("id"))
+                except ExchangeError:
+                    fills = []
+            filled = sum(int(f["size"]) for f in (fills or []))
+            if st in ("closed", "filled") and filled == 0 and self.mode == "paper":
+                filled = size
         fills = fills or []
         qty = sum(int(f["size"]) for f in fills)
         filled = max(filled, qty, booked)  # a lagging order view never un-books contracts
@@ -1355,18 +1412,18 @@ class ExecutionEngine:
                       avg_fill_price=float(avg) if avg not in (None, "") else None)
         if st in ("open", "pending"):
             new = "PARTIALLY_FILLED" if filled > 0 else "ACKNOWLEDGED"
-        elif st in ("closed", "cancelled"):
+        elif st in ("closed", "filled", "cancelled"):
             if filled == 0:
-                self.store.transition(intent_id, "CANCELLED", order.get("cancellation_reason") or f"exchange state {st}", **common)
+                self.store.transition(intent_id, "CANCELLED", order.get("cancellation_reason") or f"exchange state {st_raw}", **common)
                 return {"action": "cancelled", "intent_id": intent_id}
             new = "FILLED"
         else:
-            raise ExchangeError(f"unexpected order state {st!r} for {intent_id}")
+            raise ExchangeError(f"unexpected order state {st_raw!r} for {intent_id}")
         if filled > booked:
             if common["avg_fill_price"] is None:
                 raise ExchangeError(f"order {order.get('id')} filled without a fill price")
             return self._book_fill_delta(it, order, fills, new, common)
-        self.store.transition(intent_id, new, f"exchange state {st}", **common)
+        self.store.transition(intent_id, new, f"exchange state {st_raw}", **common)
         return {"action": new.lower(), "intent_id": intent_id, "contracts": 0}
 
     def _book_fill_delta(self, it: Any, order: dict[str, Any], fills: list[dict[str, Any]], new_state: str,
@@ -1491,7 +1548,7 @@ class ExecutionEngine:
         def ok(o: dict[str, Any], kind: str) -> bool:
             if o.get("stop_order_type") != kind or (o.get("side") and o.get("side") != exit_side):
                 return False
-            if o.get("reduce_only") is False and not o.get("bracket_order"):
+            if bool(o.get("reduce_only")) is not True:
                 return False
             if int(o.get("product_id") or product_id) != int(product_id) or o.get("state") not in (None, "open", "pending", "untriggered"):
                 return False
@@ -1510,7 +1567,8 @@ class ExecutionEngine:
         p = self.store.position(self.mode, symbol)
         if p is None or self.mode == "paper":
             return {}
-        want_sl, want_tp = p["sl_price"] is not None, p["tp_price"] is not None
+        src = p["source"] if "source" in p.keys() and p["source"] else "bot"
+        want_sl, want_tp = (p["sl_price"] is not None or src != "manual"), p["tp_price"] is not None
         if not (want_sl or want_tp):
             return {"sl_leg_order_id": None, "tp_leg_order_id": None, "legs_resized": []}
         pid, n = int(p["product_id"]), int(p["contracts"])
@@ -1521,17 +1579,28 @@ class ExecutionEngine:
         sl_o, tp_o = legs()
         if (want_sl and sl_o is None) or (want_tp and tp_o is None):
             self._event("WARN", "bracket_legs_missing", symbol, {"sl": bool(sl_o), "tp": bool(tp_o)})
-            try:
-                self.client.place_position_bracket(
-                    pid, {"order_type": "market_order", "stop_price": p["sl_price"]} if want_sl and sl_o is None else None,
-                    {"order_type": "market_order", "stop_price": p["tp_price"]} if want_tp and tp_o is None else None,
-                    TRIGGER_METHOD)
-            except ExchangeError as exc:
-                self._event("CRITICAL", "bracket_attach_failed", symbol, str(exc))
-            sl_o, tp_o = legs()
+            if (want_sl and sl_o is None and p["sl_price"] is not None) or (want_tp and tp_o is None and p["tp_price"] is not None):
+                try:
+                    self.client.place_position_bracket(
+                        pid, {"order_type": "market_order", "stop_price": p["sl_price"]} if want_sl and sl_o is None and p["sl_price"] is not None else None,
+                        {"order_type": "market_order", "stop_price": p["tp_price"]} if want_tp and tp_o is None and p["tp_price"] is not None else None,
+                        TRIGGER_METHOD)
+                except ExchangeError as exc:
+                    self._event("CRITICAL", "bracket_attach_failed", symbol, str(exc))
+                sl_o, tp_o = legs()
         if (want_sl and sl_o is None) or (want_tp and tp_o is None):
             self.store.set_halt(True, f"{symbol}: filled position without protective legs")
             self._event("CRITICAL", "unprotected_position", symbol, intent_id)
+            if want_sl and sl_o is None and src != "manual":
+                try:
+                    close_res = self.close_position(symbol, "UNPROTECTED_EMERGENCY_CLOSE")
+                    self._event("CRITICAL", "unprotected_position_emergency_closed", symbol,
+                                {"intent_id": intent_id, "close": close_res})
+                except ExchangeError as exc:
+                    self._event("CRITICAL", "unprotected_emergency_close_failed", symbol,
+                                {"intent_id": intent_id, "error": str(exc)})
+                return {"sl_leg_order_id": None, "tp_leg_order_id": str(tp_o["id"]) if tp_o else None,
+                        "legs_resized": [], "emergency_closed": True}
         upd: dict[str, Any] = {"sl_order_id": str(sl_o["id"]) if sl_o else p["sl_order_id"],
                                "tp_order_id": str(tp_o["id"]) if tp_o else p["tp_order_id"]}
         if sl_o is not None and sl_o.get("stop_price") not in (None, ""):
@@ -1765,7 +1834,7 @@ class ExecutionEngine:
 
     def on_bar(self, symbol: str, bar_us: int, o: float, h: float, l: float, c: float,
                funding_rate: float | None = None, mark_close: float | None = None,
-               mark: float | None = None) -> dict[str, Any] | None:
+               mark: float | None = None, *, allow_manual: bool = False) -> dict[str, Any] | None:
         """Process one CLOSED 1m trade candle for an open position (backtester semantics):
         funding at 8h boundaries, SL-first exits (paper only), then trail from the NEXT candle on.
         ``funding_rate`` / ``mark_close`` are the settlement inputs: the values of the minute BEFORE bar_us."""
@@ -1775,6 +1844,12 @@ class ExecutionEngine:
         p = self.store.position(self.mode, symbol)
         if p is None or bar_us <= p["last_bar_us"]:
             return None
+        src = p["source"] if "source" in p.keys() and p["source"] else "bot"
+        if not allow_manual:
+            if src == "manual":
+                return None
+            if self.mode != "paper" and (symbol not in self.profiles or not getattr(self.profiles[symbol], "enabled", True)):
+                return None
         d = 1 if p["side"] == "LONG" else -1
         product = self.ensure_product(symbol)
         t_s = bar_us // 1_000_000
@@ -1913,7 +1988,7 @@ class ExecutionEngine:
                               b_us+1,dm.FUNDING_INTERVAL_SECONDS*1_000_000):
             # A present-day tick is not the historical prior-minute settlement mark.
             self._funding_due(p,boundary,None,None)
-        return self.on_bar(symbol, t_us, last, last, last, last, None, None, mark=mark)
+        return self.on_bar(symbol, t_us, last, last, last, last, None, None, mark=mark, allow_manual=True)
 
     # -- manual trading (Step 8) ----------------------------------------------------------- #
     def manual_fill(self, symbol: str, direction: int, contracts: int, raw_price: float, leverage: float, *,
@@ -2115,38 +2190,29 @@ class ExecutionEngine:
         return None
 
     def ensure_isolated_margin(self) -> dict[str, Any]:
-        """PUT /v2/users/margin_mode isolated. Only an 'already isolated' rejection that a readback confirms is benign;
+        """PUT /v2/users/margin_mode isolated. Only a rejection that a readback confirms is 'isolated' is benign;
         every other rejection propagates (F09), so callers never cache a failed switch as success."""
-        if self.read_margin_mode() == "isolated":
-            return {"margin_mode": "isolated", "changed": False, "verified_by": "readback"}
         try:
             r = self.client.set_margin_mode("isolated")
         except DeltaAPIError as exc:
             text = json.dumps(exc.error).lower()
             code = str(exc.code or "").lower()
-            if code == "cant_switch_with_open_orders_or_positions" or "cant_switch_with_open_orders_or_positions" in text:
-                log.warning(
-                    "set_margin_mode(isolated) returned cant_switch_with_open_orders_or_positions (%s); proceeding with isolated margin",
-                    exc.error,
-                )
-                return {"margin_mode": "isolated", "changed": False, "verified_by": "open_orders_or_positions", "note": str(exc.error)}
+            try:
+                mode = self.read_margin_mode()
+            except ExchangeError:
+                mode = None
             is_benign = (
                 code in BENIGN_MARGIN_CODES
                 or "already in isolated" in text
                 or "already isolated" in text
                 or "already in selected margin mode" in text
                 or "same margin mode" in text
+                or "cant_switch_with_open_orders_or_positions" in text
+                or "subaccount_user_id" in text
                 or any(c in text for c in BENIGN_MARGIN_CODES)
             )
             if not is_benign:
-                try:
-                    mode_check = self.read_margin_mode()
-                except ExchangeError:
-                    mode_check = None
-                if "subaccount_user_id" in text and mode_check == "isolated":
-                    return {"margin_mode": "isolated", "changed": False, "verified_by": "readback", "note": str(exc.error)}
                 raise
-            mode = self.read_margin_mode()
             if mode != "isolated":
                 raise ExchangeError(f"margin mode switch refused ({exc.error}) and the readback shows {mode!r}, not isolated") from exc
             return {"margin_mode": "isolated", "changed": False, "verified_by": "readback", "note": str(exc.error)}
@@ -2339,7 +2405,9 @@ class ExecutionEngine:
         for it in self.store.q("SELECT * FROM order_intents WHERE mode=? AND state IN ('ACKNOWLEDGED','PARTIALLY_FILLED') "
                                "AND exchange_order_id IS NOT NULL ORDER BY created_at_us", (self.mode,)):
             o = self.client.get_order_by_id(it["exchange_order_id"])
-            filled = int(o.get("size") or it["size"]) - int(o.get("unfilled_size") or 0)
+            sz = int(o.get("size") or it["size"])
+            uf = o.get("unfilled_size")
+            filled = (sz - int(uf)) if uf is not None else int(it["filled_size_booked"] or 0)
             if o.get("state") in ("open", "pending") and filled <= int(it["filled_size_booked"] or 0):
                 continue
             try:
@@ -2398,32 +2466,34 @@ class ExecutionEngine:
                         detail={"journal": n_all, "closed_outside": q})
             self.store.set_halt(True, f"{sym}: exchange position changed by {q} contracts but no exit fill was found")
             return {"action": "halted"}
+        book_q = min(qty, n_all)
         if qty != q:
-            self._event("WARN", "exit_fills_mismatch", sym, {"exit_fill_contracts": qty, "booked_contracts": q, "flipped": flipped})
+            self._event("WARN", "exit_fills_mismatch", sym, {"exit_fill_contracts": qty, "expected_contracts": q,
+                                                             "booked_contracts": book_q, "flipped": flipped})
         rows = self._fill_rows(xf, sym, "EXT_EXIT", float(p["contract_value"]))
         px = sum(r["price"] * r["size"] for r in rows) / qty
-        fee = sum(r["fee_usd"] for r in rows) * min(1.0, q / qty)
+        fee = sum(r["fee_usd"] for r in rows) * min(1.0, book_q / qty)
         oid = str(xf[-1].get("order_id"))
         reason = {p["sl_order_id"]: "TSL" if p["sl_price"] != p["initial_sl"] else "SL", p["tp_order_id"]: "TP"}.get(oid, "EXT")
         with self.store.tx():
-            if q < n_all:
-                f = q / n_all
-                part = {**dict(p), "contracts": q, "entry_fee_usd": p["entry_fee_usd"] * f,
+            if book_q < n_all:
+                f = book_q / n_all
+                part = {**dict(p), "contracts": book_q, "entry_fee_usd": p["entry_fee_usd"] * f,
                         "realized_funding_usd": p["realized_funding_usd"] * f}
                 row = self._trade_row(_Row(part), px, px, reason, end, fee, oid)
                 tid = self.store.reduce_position(self.mode, sym, row, {
-                    "contracts": n_all - q, "entry_fee_usd": p["entry_fee_usd"] * (1 - f),
+                    "contracts": n_all - book_q, "entry_fee_usd": p["entry_fee_usd"] * (1 - f),
                     "realized_funding_usd": p["realized_funding_usd"] * (1 - f), "margin_usd": p["margin_usd"] * (1 - f)})
             else:
                 row = self._trade_row(p, px, px, reason, end, fee, oid)
                 tid = self.store.close_position(self.mode, sym, row, self._cooldown_until(end, p))
             self.store.record_fills(rows)
-        legs = self._resize_legs(sym) if q < n_all else self._cancel_legs(int(p["product_id"]))  # surviving legs
-        action = "partial_exit" if q < n_all else "exit"
+        legs = self._resize_legs(sym) if book_q < n_all else self._cancel_legs(int(p["product_id"]))  # surviving legs
+        action = "partial_exit" if book_q < n_all else "exit"
         self._event("INFO" if reason != "EXT" else "WARN", f"exchange_{action}", sym,
-                    {"reason": reason, "contracts": q, "price": px, "net_inr": row["net_pnl_inr"], "flipped": flipped, "legs": legs})
+                    {"reason": reason, "contracts": book_q, "price": px, "net_inr": row["net_pnl_inr"], "flipped": flipped, "legs": legs})
         self.notifier.notify_trade_exit({**row, "trade_id": tid})
-        return {"action": action, "trade_id": tid, "reason": reason, "contracts": q, "remaining": n_all - q,
+        return {"action": action, "trade_id": tid, "reason": reason, "contracts": book_q, "remaining": n_all - book_q,
                 "flipped": flipped, **row}
 
     def _book_external_add(self, p: Any, ef: list[dict[str, Any]], q: int, pos: dict[str, Any]) -> dict[str, Any]:
@@ -2481,10 +2551,100 @@ class ExecutionEngine:
                 tot += d * p["contracts"] * p["contract_value"] * (px - p["entry_price"])
         return tot * self.rate
 
-    def check_daily_loss(self, day_start_equity_inr: float, unrealized_inr: float = 0.0, *, equity_inr: float | None = None) -> bool:
-        """Halt until UTC midnight at the account's daily limit; exchange balance comes from Delta."""
+    def exchange_unrealized_inr(self, prices: dict[str, float] | None = None) -> tuple[float, bool]:
+        """Verified mark-to-market unrealized PnL (INR) across open positions in live/testnet mode.
+        Returns (unrealized_inr, verified). If open positions exist and their mark/entry prices cannot be verified,
+        returns (0.0, False) so callers block new entries instead of assuming unrealized_pnl = 0."""
+        if self.mode == "paper":
+            return self.unrealized_inr(prices or {}), True
+        try:
+            raw_ex = self.client.get_margined_positions() if hasattr(self.client, "get_margined_positions") else []
+        except ExchangeError:
+            return 0.0, False
+        open_ex = [x for x in (raw_ex or []) if isinstance(x, dict) and int(x.get("size") or 0) != 0]
+        local_pos = list(self.store.positions(self.mode))
+        if not open_ex and not local_pos:
+            return 0.0, True
+        pid_to_sym = {int(prod.product_id): s for s, prod in self.products.items()}
+        for lp in local_pos:
+            pid_to_sym.setdefault(int(lp["product_id"]), str(lp["symbol"]))
+        tot_usd = 0.0
+        if open_ex:
+            for x in open_ex:
+                sz = int(x.get("size") or 0)
+                if sz > 0 and str(x.get("side") or "").upper() in ("SHORT", "SELL"):
+                    sz = -abs(sz)
+                sym = str(x.get("product_symbol") or x.get("symbol") or "")
+                pid = x.get("product_id")
+                if not sym and pid not in (None, ""):
+                    sym = pid_to_sym.get(int(pid), "")
+                lp = self.store.position(self.mode, sym) if sym else None
+                entry_raw = x.get("entry_price")
+                if entry_raw in (None, "") and lp is not None:
+                    entry_raw = lp["entry_price"]
+                cv_raw = x.get("contract_value")
+                if cv_raw in (None, "") and sym in self.products:
+                    cv_raw = self.products[sym].contract_value
+                if cv_raw in (None, "") and lp is not None:
+                    cv_raw = lp["contract_value"]
+                if cv_raw in (None, "") and sym:
+                    try:
+                        cv_raw = self.ensure_product(sym).contract_value
+                    except Exception:  # noqa: BLE001
+                        cv_raw = None
+                mark_raw = (prices or {}).get(sym) if sym and prices else None
+                if mark_raw in (None, ""):
+                    mark_raw = x.get("mark_price")
+                if mark_raw in (None, "") and sym:
+                    try:
+                        tk = self.client.get_ticker(sym) or {}
+                        mark_raw = tk.get("mark_price")
+                    except Exception:  # noqa: BLE001
+                        mark_raw = None
+                try:
+                    entry = float(entry_raw)
+                    mark = float(mark_raw)
+                    cv = float(cv_raw)
+                except (TypeError, ValueError):
+                    return 0.0, False
+                if not (math.isfinite(entry) and entry > 0 and math.isfinite(mark) and mark > 0 and math.isfinite(cv) and cv > 0):
+                    return 0.0, False
+                tot_usd += sz * cv * (mark - entry)
+        else:
+            for lp in local_pos:
+                sym = str(lp["symbol"])
+                d = 1 if lp["side"] == "LONG" else -1
+                sz = d * int(lp["contracts"])
+                cv = float(lp["contract_value"])
+                entry = float(lp["entry_price"])
+                mark_raw = (prices or {}).get(sym) if prices else None
+                if mark_raw in (None, ""):
+                    try:
+                        tk = self.client.get_ticker(sym) or {}
+                        mark_raw = tk.get("mark_price")
+                    except Exception:  # noqa: BLE001
+                        mark_raw = None
+                try:
+                    mark = float(mark_raw)
+                except (TypeError, ValueError):
+                    return 0.0, False
+                if not (math.isfinite(entry) and entry > 0 and math.isfinite(mark) and mark > 0 and math.isfinite(cv) and cv > 0):
+                    return 0.0, False
+                tot_usd += sz * cv * (mark - entry)
+        return tot_usd * self.rate, True
+
+    def check_daily_loss(self, day_start_equity_inr: float, unrealized_inr: float | None = None, *, equity_inr: float | None = None) -> bool:
+        """Halt until UTC midnight at the account's daily limit; exchange balance + verified unrealized PnL comes from Delta."""
         self.refresh_account_settings()
-        eq = (self.realized_equity_inr() if equity_inr is None else equity_inr) + (unrealized_inr if self.mode == "paper" else 0.0)
+        if self.mode == "paper":
+            u_inr = float(unrealized_inr or 0.0)
+        elif unrealized_inr is not None:
+            u_inr = float(unrealized_inr)
+        else:
+            u_inr, ok = self.exchange_unrealized_inr()
+            if not ok:
+                raise ExchangeError("open exchange position unrealized P&L / mark price could not be verified")
+        eq = (self.realized_equity_inr() if equity_inr is None else equity_inr) + u_inr
         if self.mode in ("live", "testnet"):
             day_start_equity_inr = float(self.store.meta_get("daily_start_equity_inr"))
         daily_pct = float(self.cfg_row["daily_loss_limit_pct"])
@@ -2492,7 +2652,7 @@ class ExecutionEngine:
             return False
         t = self.clock()
         self.store.set_halt(True, f"daily loss limit {daily_pct}% hit", t - t % 86_400_000_000 + 86_400_000_000)
-        self._event("CRITICAL", "daily_loss_halt", detail={"equity_inr": eq, "day_start_inr": day_start_equity_inr})
+        self._event("CRITICAL", "daily_loss_halt", detail={"equity_inr": eq, "unrealized_inr": u_inr, "day_start_inr": day_start_equity_inr})
         return True
 
     def emergency_flatten(self) -> dict[str, Any]:
@@ -2527,10 +2687,11 @@ class ExecutionEngine:
               if existing_mode == "cross" else self.ensure_isolated_margin())
         lev: dict[str, Any] = {}
         blocked: dict[str, str] = {}
-        for s, prod in self.products.items():
+        profile_syms = [s for s, p in self.profiles.items() if getattr(p, "enabled", True)] or list(self.products)
+        for s in profile_syms:
+            prod = self.ensure_product(s)
             target_leverage = profile_config(self.profiles[s]).leverage if s in self.profiles else LEVERAGE
-            if float(target_leverage).is_integer():
-                target_leverage = int(target_leverage)
+            target_leverage = int(round(float(target_leverage)))
             size = (exchange_sizes or {}).get(s)
             try:
                 if size is None:
@@ -2542,7 +2703,7 @@ class ExecutionEngine:
                         blocked[s] = (f"open exchange position ({size}) at {have}x, policy {target_leverage:g}x: left unchanged; "
                                       "bot entries blocked until it is flat")
                 else:
-                    lev[s] = self.client.set_order_leverage(prod.product_id, target_leverage)  # raises unless Delta echoes 10x
+                    lev[s] = self.client.set_order_leverage(prod.product_id, target_leverage)
             except ExchangeError as exc:
                 blocked[s] = f"leverage policy failed: {exc}"
         self.account_policy = {"user_id": uid, "margin_mode": mm, "leverage": lev, "blocked": blocked,
@@ -2571,7 +2732,7 @@ class ExecutionEngine:
             acts = []
             hist = s.pop("history")
             p = self.store.position(self.mode, sym)
-            if p is not None:
+            if p is not None and (p["source"] if "source" in p.keys() and p["source"] else "bot") != "manual":
                 prev = hist[["funding_rate", "mark_close"]].shift(1)
                 new = hist[hist.index > pd.Timestamp(int(p["last_bar_us"]), unit="us", tz="UTC")]
                 for ts, r in new.iterrows():

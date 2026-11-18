@@ -729,6 +729,7 @@ def cancel_order(order_id: str, expected_mode: Literal["paper", "testnet", "live
                     raise HTTPException(404, f"no resting manual order {order_id}")
                 s.store.transition(it["intent_id"], "CANCELLED", "cancelled from the manual terminal")
                 return {"cancelled": it["intent_id"], "mode": mode}
+            o = None
             if it is not None and it["state"] in ("ACKNOWLEDGED", "PARTIALLY_FILLED"):
                 pid, oid = it["product_id"], it["exchange_order_id"]
             else:
@@ -741,7 +742,17 @@ def cancel_order(order_id: str, expected_mode: Literal["paper", "testnet", "live
             except DeltaAPIError as exc:
                 code = str(exc.code or "").lower()
                 if exc.status == 404 or code in ee.BENIGN_CANCEL_CODES:
-                    r = {"id": oid, "state": "cancelled"}
+                    polled = None
+                    try:
+                        polled = s.client.get_order_by_id(oid)
+                    except ExchangeError:
+                        polled = None
+                    if isinstance(polled, dict) and polled.get("id") is not None:
+                        r = polled
+                    else:
+                        sz = int(it["size"]) if it is not None else int((o or {}).get("size") or 0)
+                        booked = int(it["filled_size_booked"] or 0) if it is not None else 0
+                        r = {"id": oid, "size": sz, "unfilled_size": max(0, sz - booked), "state": "cancelled"}
                 else:
                     raise HTTPException(409, f"Delta refused the cancel: {_diagnose(exc)}") from exc
             if it is not None and it["state"] in ("ACKNOWLEDGED", "PARTIALLY_FILLED"):
@@ -1144,6 +1155,31 @@ def _ensure_watcher() -> None:
         _watch["thread"] = t
         _watch["status"] = "starting"
         t.start()
+
+
+def start_watcher_if_needed() -> bool:
+    """Start the paper tick watcher automatically on boot if open paper positions or resting paper limit orders exist."""
+    if bot_ops.runner()[0]:
+        return False
+    con = bot_ops.ro_conn("paper")
+    if con is None:
+        return False
+    try:
+        has_pos = con.execute("SELECT 1 FROM open_positions WHERE mode='paper' LIMIT 1").fetchone() is not None
+        has_lim = False
+        cols = {r[1] for r in con.execute("PRAGMA table_info(order_intents)")}
+        if "source" in cols:
+            has_lim = con.execute(
+                "SELECT 1 FROM order_intents WHERE mode='paper' AND state='ACKNOWLEDGED' AND source='manual' LIMIT 1"
+            ).fetchone() is not None
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        con.close()
+    if has_pos or has_lim:
+        _ensure_watcher()
+        return True
+    return False
 
 
 def _stop_watcher(timeout: float = 1.5) -> None:

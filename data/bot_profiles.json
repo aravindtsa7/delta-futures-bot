@@ -45,7 +45,7 @@
     "max_daily_loss_pct": 50.0,
     "paper_account_runtime_override": {
       "capital_inr": 50000.0,
-      "daily_loss_limit_pct": 26.0
+      "daily_loss_limit_pct": 50.0
     },
     "params": {
       "atr_sl_min_pct": 0.8,
@@ -126,7 +126,7 @@
     "max_daily_loss_pct": 50.0,
     "paper_account_runtime_override": {
       "capital_inr": 50000.0,
-      "daily_loss_limit_pct": 26.0
+      "daily_loss_limit_pct": 50.0
     },
     "params": {
       "atr_sl_min_pct": 0.8,
@@ -204,7 +204,7 @@
     "max_daily_loss_pct": 50.0,
     "paper_account_runtime_override": {
       "capital_inr": 50000.0,
-      "daily_loss_limit_pct": 26.0
+      "daily_loss_limit_pct": 50.0
     },
     "params": {
       "atr_sl_min_pct": 0.8,
@@ -279,7 +279,7 @@
     "max_daily_loss_pct": 50.0,
     "paper_account_runtime_override": {
       "capital_inr": 50000.0,
-      "daily_loss_limit_pct": 26.0
+      "daily_loss_limit_pct": 50.0
     },
     "params": {
       "adx_max": 48,
@@ -310,7 +310,7 @@
     "tp_type": "fixed_pct",
     "tp_value": 2.2,
     "trail_mult": 0.0,
-    "trailing_stop": true,
+    "trailing_stop": false,
     "use_4h_trend": false,
     "use_cost_gate": false
   }
