@@ -91,11 +91,12 @@ async def _dashboard_auth_middleware(request: Request, call_next):
     hdr_bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     q_tok = (request.query_params.get("token") or "").strip()
     c_tok = (request.cookies.get("delta_auth_token") or "").strip()
-    matched = any(cand and secrets.compare_digest(cand, expected) for cand in (hdr_x, hdr_bearer, q_tok, c_tok))
+    matched = any(cand and secrets.compare_digest(cand.encode("utf-8"), expected.encode("utf-8"))
+                  for cand in (hdr_x, hdr_bearer, q_tok, c_tok))
     if not matched:
         return JSONResponse({"detail": "Unauthorized: valid DASHBOARD_AUTH_TOKEN required"}, status_code=401)
     response = await call_next(request)
-    if not (c_tok and secrets.compare_digest(c_tok, expected)):
+    if not (c_tok and secrets.compare_digest(c_tok.encode("utf-8"), expected.encode("utf-8"))):
         response.set_cookie("delta_auth_token", expected, httponly=True, samesite="lax")
     return response
 
@@ -178,17 +179,17 @@ def mtime_key(symbol: str) -> tuple:
 
 
 def get_data(symbol: str) -> pd.DataFrame:
-    key = mtime_key(symbol)
-    with _cache_lock:
-        hit = _data_cache.get(symbol)
-        if hit and hit[0] == key:
-            return hit[1]
-    if not all(key):
-        raise HTTPException(404, f"no local 1m data for {symbol}; sync it first")
     with _file_lock:
+        key = mtime_key(symbol)
+        with _cache_lock:
+            hit = _data_cache.get(symbol)
+            if hit and hit[0] == key:
+                return hit[1]
+        if not all(key):
+            raise HTTPException(404, f"no local 1m data for {symbol}; sync it first")
         df = dm.load_unified_1m_dataset(symbol)  # full history
-    with _cache_lock:
-        _data_cache[symbol] = (key, df)
+        with _cache_lock:
+            _data_cache[symbol] = (key, df)
     return df
 
 
@@ -1866,10 +1867,11 @@ def list_backtest_results(
 
 @app.delete("/api/backtest/results/{result_id}")
 def delete_backtest_result(result_id: str) -> JSONResponse:
-    items = _load_saved_backtests()
-    before = len(items)
-    items = [r for r in items if r.get("id") != result_id]
-    if len(items) == before:
-        raise HTTPException(404, f"saved result {result_id!r} not found")
-    _save_saved_backtests(items)
+    with _file_lock:
+        items = _load_saved_backtests()
+        before = len(items)
+        items = [r for r in items if r.get("id") != result_id]
+        if len(items) == before:
+            raise HTTPException(404, f"saved result {result_id!r} not found")
+        _save_saved_backtests(items)
     return JSONResponse({"deleted": result_id, "ok": True})

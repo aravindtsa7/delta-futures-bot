@@ -133,6 +133,8 @@ class Settings(BaseSettings):
     def _check_live_guard(self) -> "Settings":
         if self.LIVE_TRADING_ENABLED and self.MODE != "live":
             raise ValueError("LIVE_TRADING_ENABLED=True requires MODE='live'")
+        if self.AUTO_BOT_LIVE_ENABLED and not (self.MODE == "live" and self.LIVE_TRADING_ENABLED):
+            raise ValueError("AUTO_BOT_LIVE_ENABLED=True requires MODE='live' and LIVE_TRADING_ENABLED=True")
         return self
 
     # --- Derived values -------------------------------------------------- #

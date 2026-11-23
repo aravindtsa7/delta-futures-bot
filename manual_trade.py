@@ -201,6 +201,8 @@ def _f(x: Any) -> float | None:
 
 
 def candles(symbol: str, resolution: str) -> list[dict[str, Any]]:
+    if resolution not in RESOLUTIONS:
+        raise HTTPException(400, f"unsupported resolution {resolution!r}")
     step = RESOLUTIONS[resolution]
 
     def build() -> list[dict[str, Any]]:
@@ -987,15 +989,16 @@ def _exchange_positions_view(mode: str, journal_positions: list[dict[str, Any]],
         except Exception:  # noqa: BLE001
             cv = 1.0
         mark = _f(x.get("mark_price")) or (ticker(sym)["mark_price"] if sym else None)
-        entry = float(x.get("entry_price") or 0)
+        entry = _f(x.get("entry_price")) or 0.0
         u = (1 if size > 0 else -1) * abs(size) * cv * (mark - entry) * rate if mark and entry else None
-        margin_inr = float(x.get("margin") or 0) * rate
+        margin = _f(x.get("margin")) or 0.0
+        margin_inr = margin * rate
         rows.append({**(j or {}), "symbol": sym, "side": pos_side, "contracts": abs(size),
-                     "product_id": pid, "tick_size": float((x.get("product") or {}).get("tick_size") or catalog().get(sym, {}).get("tick_size") or 0.01),
+                     "product_id": pid, "tick_size": _f((x.get("product") or {}).get("tick_size")) or _f(catalog().get(sym, {}).get("tick_size")) or 0.01,
                      "contract_value": cv, "entry_price": entry, "mark_price": mark, "unrealized_pnl_inr": u,
                      "roe_pct": (u / margin_inr * 100) if (u is not None and margin_inr) else None, "margin_inr": margin_inr,
                      "liq_price_est": _f(x.get("liquidation_price")), "liq_source": "delta",
-                     "leverage": (j or {}).get("leverage") or (round(abs(size) * cv * entry / float(x["margin"]), 2) if x.get("margin") and float(x["margin"]) else None),
+                     "leverage": (j or {}).get("leverage") or (round(abs(size) * cv * entry / margin, 2) if margin else None),
                      "sl_price": sl_price, "tp_price": tp_price, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id,
                      "source": (j or {}).get("source", "exchange (not journalled)"), "journalled": j is not None,
                      "margin_mode": x.get("margin_mode"), "realized_funding_inr": (_f(x.get("realized_funding")) or 0) * rate})

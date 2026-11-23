@@ -511,6 +511,10 @@ class LiveBotRunner:
                 sizes[sym] = pos["size"]
                 local = self.store.position(self.mode, sym)
                 if local is not None and not self._is_bot_position(local, sym):
+                    if pos["size"] == 0:
+                        with self.store.tx() as cx:
+                            cx.execute("DELETE FROM open_positions WHERE mode=? AND symbol=? AND source='manual'",
+                                       (self.mode, sym))
                     summary["positions"][sym] = {"exchange_size": pos["size"], "journal": "manual", "skipped": "manual_position"}
                     continue
                 info = {"exchange_size": pos["size"], "journal": None if local is None else
@@ -697,7 +701,7 @@ class LiveBotRunner:
             if p is not None and not self._is_bot_position(p, sym):
                 p = None
             start = None
-            if p is not None:
+            if p is not None and p["last_bar_us"] is not None:
                 start = int(p["last_bar_us"] // 1_000_000)
             if last is not None:
                 start = max(start or last, last)
@@ -709,7 +713,7 @@ class LiveBotRunner:
                         if a:
                             self.actions.append({"symbol": sym, "catch_up": True, **a})
                     self.last_close[sym] = cl
-                    if self._is_tf_boundary(sym, bar_s + 60):
+                    if self._is_tf_boundary(sym, bar_s + 60) and bar_s + 60 not in self.pending_hour.get(sym, ()):
                         self._queue_close(sym, bar_s + 60, recovery=True)
             # Recover evaluation identities across restarts, including when flat.
             cursor = self.store.one('SELECT max(bar_close_us) AS t FROM signal_evaluations WHERE mode=? AND symbol=?',
@@ -723,7 +727,8 @@ class LiveBotRunner:
             else:
                 first = latest
             for close in range(first, latest + 1, tf):
-                self._queue_close(sym, close, recovery=True)
+                if close not in self.pending_hour.get(sym, ()):
+                    self._queue_close(sym, close, recovery=True)
             self.last_minute[sym] = max(self.last_minute.get(sym, 0), c["last_1m"])
 
     # -- minute / timeframe processing --------------------------------------------------------- #
@@ -956,11 +961,16 @@ class LiveBotRunner:
         self._cancel_entry_orders(cancels)  # F05: nothing resting may reopen exposure after the halt
         flattened = []
         for p in self.store.positions(self.mode):
+            if not self._is_bot_position(p, p["symbol"]):
+                continue
             sym = p["symbol"]
             r = self.engine.close_position(sym, kind, price=self.last_close.get(sym), bar_us=bar_s * 1_000_000)
             flattened.append({"symbol": sym, "result": (r or {}).get("action")})
-        if self.mode != "paper" and self.store.positions(self.mode):
-            self.engine.emergency_flatten()
+        if self.mode != "paper":
+            # The account-wide emergency fallback would also close independent manual trades.
+            for p in self.store.positions(self.mode):
+                if self._is_bot_position(p, p["symbol"]):
+                    self.engine.close_position(p["symbol"], kind, bar_us=bar_s * 1_000_000)
         self.actions.append({"action": "halt", "kind": kind, "reason": reason, "flattened": flattened, **cancels})
         self.transition("HALTED", reason)
 
@@ -971,6 +981,8 @@ class LiveBotRunner:
             raise LiveTradingDisabledError(why)
         summary = self.run_reconciliation("cli --once")
         for sym, prof in self.profiles.items():
+            if self.state in ("DEGRADED", "HALTED") or self.daily_halted:
+                break
             if not getattr(prof, "enabled", True):
                 continue
             try:
