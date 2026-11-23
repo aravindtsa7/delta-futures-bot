@@ -22,7 +22,7 @@ const state = {
   lb: { source: "step3c", sort: "net", desc: true, columns: [], rows: [], days: 180 },
 };
 
-const COLORS = { up: "#10b981", down: "#f43f5e", accent: "#3b82f6", muted: "#94a3b8", grid: "#161f30", border: "#1e293b", panel: "#111827" };
+const COLORS = { up: "#10b981", down: "#ef4444", accent: "#2f6df6", muted: "#94a3b8", grid: "rgba(148, 163, 184, 0.06)", border: "rgba(148, 163, 184, 0.14)", panel: "#111829" };
 const OVERLAY_STYLE = {
   ema9: { color: "#f5d76e" }, ema21: { color: "#f59e0b" }, ema50: { color: "#a78bfa" }, ema55: { color: "#c084fc" },
   ema100: { color: "#60a5fa" }, ema200: { color: "#e879f9", width: 2 },
@@ -330,7 +330,7 @@ let priceChart, equityChart, candleSeries, volumeSeries, equitySeries, ddSeries;
 function baseChartOptions() {
   return {
     autoSize: true,
-    layout: { background: { type: "solid", color: COLORS.panel }, textColor: "#94a3b8", fontFamily: "ui-monospace, Consolas, monospace", fontSize: 11, attributionLogo: true },
+    layout: { background: { type: "solid", color: COLORS.panel }, textColor: COLORS.muted, fontFamily: "ui-monospace, Consolas, monospace", fontSize: 11, attributionLogo: true },
     grid: { vertLines: { color: COLORS.grid }, horzLines: { color: COLORS.grid } },
     rightPriceScale: { borderColor: COLORS.border },
     leftPriceScale: { borderColor: COLORS.border },
@@ -1033,6 +1033,7 @@ function renderResult() {
   renderEquity();
   renderChart(syms.includes(state.chartSymbol) ? state.chartSymbol : syms[0]);
   renderLedger();
+  renderResearchRejects();
   renderWalkForward();
 }
 
@@ -1249,11 +1250,42 @@ function pollSync() {
 }
 
 /* ------------------------------------------------------------------ wiring */
+function renderResearchRejects() {
+  const summary = state.result?.summary;
+  const reasons = [
+    ["skipped_in_position", "Position already open", "A position was already open for the symbol."],
+    ["skipped_cooldown", "Cooldown", "The strategy was waiting for its entry cooldown to finish."],
+    ["skipped_daily_halt", "Daily loss halt", "The daily loss limit blocked new entries."],
+    ["skipped_insufficient_capital", "Insufficient capital", "Available capital could not cover the required position."],
+    ["skipped_lot_budget", "Lot / risk budget", "The minimum lot exceeded the trade risk budget."],
+    ["skipped_no_atr", "ATR unavailable", "The required ATR value was not available."],
+  ];
+  const rows = summary ? reasons.filter(([key]) => key in summary) : [];
+  const total = rows.reduce((sum, [key]) => sum + Number(summary[key] || 0), 0);
+  $("researchRejectsNote").textContent = summary
+    ? `${nf0.format(total)} skipped signals · Aggregate counts for the current backtest`
+    : "Run a backtest to inspect blocked entries and skipped signals.";
+  $("researchRejectsTable").querySelector("tbody").innerHTML = rows.length
+    ? rows.map(([key, label, description]) => `<tr><td class="l">${label}</td><td><span class="tag ${summary[key] ? "tag-warn" : "tag-reason"}">${nf0.format(summary[key] || 0)}</span></td><td class="l reject-description">${description}</td></tr>`).join("")
+    : `<tr><td class="l muted" colspan="3">${summary ? "This result does not include skipped-entry counters." : "No active backtest preview."}</td></tr>`;
+}
+
 function showTab(name) {
-  document.querySelectorAll(".bottom .tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
-  ["ledger", "results", "wf"].forEach((t) => {
+  document.querySelectorAll(".bottom .tab").forEach((b) => {
+    const active = b.dataset.tab === name;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", String(active));
+    b.tabIndex = active ? 0 : -1;
+  });
+  ["ledger", "equity", "rejects", "results", "wf"].forEach((t) => {
     const el = $(`tab-${t}`);
     if (el) el.classList.toggle("hidden", t !== name);
+  });
+  if (name === "equity") requestAnimationFrame(() => {
+    const container = $("equityChart");
+    if (equityChart && container.clientWidth && container.clientHeight) {
+      equityChart.resize(container.clientWidth, container.clientHeight);
+    }
   });
 }
 
@@ -1313,11 +1345,23 @@ function bind() {
     if (priceChart) priceChart.timeScale().fitContent();
   };
 
-  document.querySelectorAll(".bottom .tab").forEach((b) => {
+  const researchTabs = [...document.querySelectorAll(".bottom .tab")];
+  researchTabs.forEach((b, index) => {
     b.onclick = () => {
       showTab(b.dataset.tab);
       if (b.dataset.tab === "results") loadSavedResults();
     };
+    b.addEventListener("keydown", event => {
+      let next;
+      if (event.key === "ArrowRight") next = (index + 1) % researchTabs.length;
+      else if (event.key === "ArrowLeft") next = (index - 1 + researchTabs.length) % researchTabs.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = researchTabs.length - 1;
+      else return;
+      event.preventDefault();
+      researchTabs[next].click();
+      researchTabs[next].focus();
+    });
   });
   $("exportCsv").onclick = exportCsv;
 
@@ -1363,13 +1407,21 @@ function bind() {
 const bot = { timer: null, status: null, busy: false };
 
 function showView(name) {
+  if (name === "research") name = "lab";
   document.querySelectorAll(".vbtn").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
+  const activeNav = document.querySelector(".vbtn.active");
+  if (activeNav) {
+    const nav = activeNav.closest(".view-switch");
+    const bounds = nav.getBoundingClientRect(), active = activeNav.getBoundingClientRect();
+    if (active.left < bounds.left) nav.scrollLeft += active.left - bounds.left - 4;
+    else if (active.right > bounds.right) nav.scrollLeft += active.right - bounds.right + 4;
+  }
   $("labView").classList.toggle("hidden", name !== "lab");
   $("botView").classList.toggle("hidden", name !== "bot");
   $("manualView").classList.toggle("hidden", name !== "manual");
   if ($("dataView")) $("dataView").classList.toggle("hidden", name !== "data");
   if ($("strategiesView")) $("strategiesView").classList.toggle("hidden", name !== "strategies");
-  if (history.replaceState) history.replaceState(null, "", name === "lab" ? "#" : `#${name}`);
+  if (history.replaceState) history.replaceState(null, "", name === "lab" ? "#research" : `#${name}`);
   clearInterval(bot.timer);
   clearInterval(mt.timer);
   if (name === "bot") {
@@ -1422,6 +1474,10 @@ function accountRequestKey(mode = botSelectedMode()) { return mode === "paper" ?
 function paperDraftPreview() {
   const a = accountForMode(), limit = Number($("paperDailyLossInput").value);
   const valid = Number.isFinite(limit) && limit >= 0.5 && limit <= 95;
+  $("dailyLossMeterValue").textContent = valid ? `${limit}%` : "–";
+  $("dailyLossMeterFill").style.width = `${valid ? limit : 0}%`;
+  $("dailyLossMeter").setAttribute("aria-valuenow", String(valid ? limit : 0));
+  $("dailyLossMeter").setAttribute("aria-valuetext", valid ? `${limit}% of daily opening balance` : "Enter a valid daily loss limit");
   const baseline = Number(a?.daily_baseline_inr);
   $("dailyLossAllowance").textContent = a?.initialized && valid && Number.isFinite(baseline)
     ? `${limit}% of ${inr(baseline, false)} UTC opening balance = ${inr(baseline * limit / 100, false)} max daily loss`
@@ -1447,7 +1503,7 @@ function renderPaperAccount(s) {
   $("paperSessionNew").classList.toggle("hidden", !isPaper);
   const process = paperAccountUi.stopping ? {state:"stopping",pid:paperAccountUi.process?.pid} :
     (paperAccountUi.process || s.process || {state:"unknown",error:"Process status has not been verified."});
-  $("paperAccountLifecycle").textContent = `Account API: ${paperAccountUi.accountApi} ? Runner: ${process.state.toUpperCase()}${process.pid ? " ? PID " + process.pid : ""}. Daily limits can be changed while running.`;
+  $("paperAccountLifecycle").textContent = `Account API: ${paperAccountUi.accountApi} · Runner: ${process.state.toUpperCase()}${process.pid ? " · PID " + process.pid : ""}. Daily limits can be changed while running.`;
   const blockers = [];
   if (loadingSession) blockers.push("Loading selected session.");
   if (archive) blockers.push("Archived session is read-only.");
@@ -1465,13 +1521,13 @@ function renderPaperAccount(s) {
   $("paperAccountBlockers").textContent = [...blockers, ...(isPaper && resetBlockers.length ? [`New paper session requires: ${resetBlockers.join(", ")}.`] : [])].join(" ");
   const select = $("paperSessionSelect"), wanted = paperAccountUi.session;
   const options = `<option value="">Active paper account</option>` + (catalog.sessions || []).map(x =>
-    `<option value="${esc(x.id)}">Archived ${esc(x.closed_at)} ? ${x.trade_count} trades ? ${inr(x.equity_inr, false)}${x.halted ? " ? HALTED" : ""}</option>`).join("");
+    `<option value="${esc(x.id)}">Archived ${esc(x.closed_at)} · ${x.trade_count} trades · ${inr(x.equity_inr, false)}${x.halted ? " · HALTED" : ""}</option>`).join("");
   if (select.innerHTML !== options) select.innerHTML = options;
   select.value = wanted;
-  if (loadingSession) $("paperAccountApplied").textContent = "Loading selected session?";
-  else if (!a?.initialized) $("paperAccountApplied").textContent = isPaper ? "No persisted paper wallet. Start New Paper Session to initialize it." : "Loading the real Delta wallet and applied daily limit?";
+  if (loadingSession) $("paperAccountApplied").textContent = "Loading selected session…";
+  else if (!a?.initialized) $("paperAccountApplied").textContent = isPaper ? "No persisted paper wallet. Start New Paper Session to initialize it." : "Loading the real Delta wallet and applied daily limit…";
   else {
-    $("paperAccountApplied").textContent = `${archive ? "ARCHIVED ? read only. " : "Applied: "}${isPaper ? "Capital" : "Delta wallet"} ${inr(isPaper ? a.capital_inr : a.equity_inr, false)} ? Daily loss ${a.daily_loss_limit_pct}% ? Allowance ${inr(a.allowance_inr, false)}. Basis: ${a.baseline_basis}, ${a.baseline_date_utc || "not initialized"} UTC, ${inr(a.daily_baseline_inr, false)}. ${a.halted ? "HALTED ? " + (a.halt_reason || "") : "not halted"}.`;
+    $("paperAccountApplied").textContent = `${archive ? "ARCHIVED · read only. " : "Applied: "}${isPaper ? "Capital" : "Delta wallet"} ${inr(isPaper ? a.capital_inr : a.equity_inr, false)} · Daily loss ${a.daily_loss_limit_pct}% · Allowance ${inr(a.allowance_inr, false)}. Basis: ${a.baseline_basis}, ${a.baseline_date_utc || "not initialized"} UTC, ${inr(a.daily_baseline_inr, false)}. ${a.halted ? "HALTED · " + (a.halt_reason || "") : "not halted"}.`;
     const key = `${mode}:${catalog.session_id}:${catalog.revision}`;
     if (!archive && !paperAccountUi.dirty && paperAccountUi.draftKey !== key) {
       if (isPaper) $("paperCapitalInput").value = a.capital_inr;
@@ -1681,6 +1737,16 @@ async function loadBotStatus() {
 
 function chip(ok, yes = "PASS", no = "block") { return `<span class="chip ${ok ? "ok" : "no"}">${ok ? yes : no}</span>`; }
 function td(v, k = "") { return `<td class="${k}">${v}</td>`; }
+function coinTag(symbol) { return `<span class="coin-tag">${esc(symbol)}</span>`; }
+function sideTag(side) { return `<span class="tag ${/^(LONG|BUY)$/i.test(side) ? "tag-long" : /^(SHORT|SELL)$/i.test(side) ? "tag-short" : "tag-reason"}">${esc(side)}</span>`; }
+function statusTag(status) {
+  const value = String(status || "");
+  const tone = /^(TP|TAKE_PROFIT|FILLED|ACTIVE|OBSERVED_READY)$/i.test(value) ? "tag-ok" :
+    /^(SL|STOP_LOSS|HALTED|REJECTED|OUTCOME_UNKNOWN)$/i.test(value) ? "tag-bad" :
+    /^(PENDING|PAUSED|NEW|SUBMITTED)$/i.test(value) ? "tag-warn" : "tag-reason";
+  return `<span class="tag ${tone}">${esc(value)}</span>`;
+}
+
 function shortTime(x) { return x ? String(x).slice(5, 16).replace("T", " ") : "–"; }
 
 function renderRunnerEvidence(s) {
@@ -1720,19 +1786,22 @@ function renderBot(s) {
   const pos = s.positions || [];
   const streak = `${s.loss_streak ?? 0} / ${s.max_consecutive_losses ?? 4}`;
   $("botKpis").innerHTML = [
-    kpi("Runner", running ? `PID ${s.runner.pid}` : "stopped", running ? `${(s.runner.mode || "").toUpperCase()} · ${rs}` : `last ${s.last_known_state || "–"}`, "primary"),
     kpi("Total equity", inr(w.total_equity_inr, false), `${exchangeMode ? "Delta wallet" : "realized"} ${inr(w.realized_equity_inr, false)}`),
     kpi("Available margin", inr(w.available_margin_inr, false), `used ${inr(w.used_margin_inr, false)}`),
     kpi("Today's PnL", `<span class="${cls(w.today_pnl_inr)}">${inr(w.today_pnl_inr)}</span>`, `${pct(w.today_pnl_pct, true)} · limit −${w.daily_loss_limit_pct ?? 5}% (${inr(isNum(w.daily_loss_limit_inr) ? -w.daily_loss_limit_inr : null)})${exchangeMode ? " · wallet change since first UTC observation, including transfers" : ""}`),
-    kpi("Unrealized", `<span class="${cls(w.unrealized_pnl_inr)}">${inr(w.unrealized_pnl_inr)}</span>`, exchangeMode ? "Delta positions · mark price" : "open positions"),
     kpi("Open positions", exchangeUnavailable ? "unavailable" : String(pos.length), exchangeUnavailable ? s.exchange.error : pos.map((p) => `${p.symbol} ${p.side}`).join(", ") || "flat"),
     kpi("Loss streak", streak, s.daily_halted ? "breaker TRIPPED" : "breaker armed"),
+  ].join("");
+  $("botExtraKpis").innerHTML = [
+    kpi("Runner", `<span class="badge ${running ? "badge-ok" : "badge-bot-off"}">${running ? "RUNNING" : "STOPPED"}</span>`, running ? `PID ${s.runner.pid} · ${(s.runner.mode || "").toUpperCase()} · ${rs}` : `last ${s.last_known_state || "–"}`, "primary"),
+    kpi("Unrealized", `<span class="${cls(w.unrealized_pnl_inr)}">${inr(w.unrealized_pnl_inr)}</span>`, exchangeMode ? "Delta positions · mark price" : "open positions"),
     kpi("Closed trades", String(w.closed_trades ?? 0), `net ${inr(w.closed_net_inr)}`),
     kpi("Unknown intents", String(s.outcome_unknown_intents ?? 0), (s.outcome_unknown_intents ? "entries blocked — reconcile" : "none")),
   ].join("");
 
   renderPaperAccount(s);
   renderRunnerEvidence(s);
+  renderBotLayoutStatus(s);
 
   const sig = s.signals || {};
   const dep = s.deployed_strategies || {};
@@ -1746,16 +1815,16 @@ function renderBot(s) {
       const slTp = `${x.sl_value || d.sl_value || 2}x / ${x.tp_value || d.tp_value || 3}x`;
       const enChip = (x.enabled !== false && d.enabled !== false) ? `<span class="chip ok">ACTIVE</span>` : `<span class="chip no">PAUSED</span>`;
       return x.error ? `<tr>${td(esc(sym), "l")}${td(esc(cName), "l")}${td(`<span class="sl-tf-badge">${esc(tf)}</span>`)}${td(esc(levRisk))}${td(esc(slTp), "l")}<td class="l" colspan="7">${esc(x.error)}</td></tr>` : `<tr>
-      ${td(`<strong>${esc(sym)}</strong>`, "l")}${td(`<strong>${esc(cName)}</strong>`, "l")}${td(`<span class="sl-tf-badge">${esc(tf)}</span>`)}${td(esc(levRisk))}${td(esc(slTp), "l")}
+      ${td(coinTag(sym), "l")}${td(`<strong>${esc(cName)}</strong>`, "l")}${td(`<span class="sl-tf-badge">${esc(tf)}</span>`)}${td(esc(levRisk))}${td(esc(slTp), "l")}
       ${td(shortTime(x.bar_open))}${td(nf2.format(x.close))}${td(nf2.format(x.atr14))}
       ${td(x.cost_gate_used ? chip(x.cost_gate_pass) : "off")}${td(`${x.cond_long ? 1 : 0}/${x.cond_short ? 1 : 0}`)}
-      ${td(enChip)}${td(x.signal_side ? `<span class="chip sig">${esc(x.signal_side)}</span>` : "none")}</tr>`;
+      ${td(enChip)}${td(x.signal_side ? sideTag(x.signal_side) : "none")}</tr>`;
     }).join("") : `<tr><td class="l muted" colspan="12">No strategies deployed to Paper Bot yet — open <a href="#strategies" onclick="showView('strategies');return false;" style="color:#60a5fa;text-decoration:underline">Strategy Lab</a> to deploy saved strategies.</td></tr>`) + "</tbody>";
 
   $("botPosCount").textContent = pos.length ? `${pos.length} open` : "flat";
   $("botPositions").innerHTML = `<thead><tr><th class="l">Symbol</th><th class="l">Side</th><th>Lots</th><th>Entry</th><th>Mark</th><th>Unrealized ₹</th>
     <th>SL</th><th>TP</th><th>Trail</th><th class="l">SL / TP order</th><th>Opened</th></tr></thead><tbody>` +
-    (pos.length ? pos.map((p) => `<tr>${td(esc(p.symbol), "l")}${td(esc(p.side), "l")}${td(p.contracts)}${td(fmtPx(p.entry_price, p.tick_size))}
+    (pos.length ? pos.map((p) => `<tr>${td(coinTag(p.symbol), "l")}${td(sideTag(p.side), "l")}${td(p.contracts)}${td(fmtPx(p.entry_price, p.tick_size))}
       ${td(fmtPx(p.mark_price, p.tick_size))}${td(`<span class="${cls(p.unrealized_pnl_inr)}">${inr(p.unrealized_pnl_inr)}</span>`)}
       ${td(fmtPx(p.sl_price, p.tick_size))}${td(fmtPx(p.tp_price, p.tick_size))}${td(p.trail_amount ? fmtPx(p.trail_amount, p.tick_size) : "–")}
       ${td(`${esc(p.sl_order_id || (exchangeMode ? "–" : "paper"))} / ${esc(p.tp_order_id || (exchangeMode ? "–" : "paper"))}`, "l")}${td(shortTime(p.opened_at))}</tr>`).join("")
@@ -1766,8 +1835,8 @@ function renderBot(s) {
   $("botIntentNote").textContent = unknown ? `${unknown} OUTCOME_UNKNOWN — new entries on that symbol are blocked until reconciled` : `${ints.length} most recent`;
   $("botIntents").innerHTML = `<thead><tr><th>Created</th><th class="l">Symbol</th><th class="l">Role</th><th class="l">Side</th><th>Size</th><th class="l">State</th>
     <th>Fill</th><th>SL</th><th>TP</th><th class="l">Client order id</th><th class="l">Exch. id</th></tr></thead><tbody>` +
-    (ints.length ? ints.map((i) => `<tr class="${i.alert ? "alert-row" : ""}">${td(shortTime(i.created_at))}${td(esc(i.symbol), "l")}${td(esc(i.role), "l")}
-      ${td(esc(i.side), "l")}${td(i.size)}${td(esc(i.state), "l")}${td(isNum(i.avg_fill_price) ? nf2.format(i.avg_fill_price) : "–")}
+    (ints.length ? ints.map((i) => `<tr class="${i.alert ? "alert-row" : ""}">${td(shortTime(i.created_at))}${td(coinTag(i.symbol), "l")}${td(esc(i.role), "l")}
+      ${td(sideTag(i.side), "l")}${td(i.size)}${td(statusTag(i.state), "l")}${td(isNum(i.avg_fill_price) ? nf2.format(i.avg_fill_price) : "–")}
       ${td(isNum(i.sl_price) ? nf2.format(i.sl_price) : "–")}${td(isNum(i.tp_price) ? nf2.format(i.tp_price) : "–")}
       ${td(esc(i.client_order_id), "l")}${td(esc(i.exchange_order_id || "–"), "l")}</tr>`).join("")
       : `<tr><td class="l muted" colspan="11">No order intents yet</td></tr>`) + "</tbody>";
@@ -1776,8 +1845,8 @@ function renderBot(s) {
   $("botTradeCount").textContent = `${w.closed_trades ?? 0} closed`;
   $("botTrades").innerHTML = `<thead><tr><th>Closed</th><th class="l">Symbol</th><th class="l">Side</th><th>Lots</th><th>Entry</th><th>Exit</th><th class="l">Reason</th>
     <th>Gross ₹</th><th>Fees+GST ₹</th><th>Funding ₹</th><th>Net ₹</th><th>Equity ₹</th></tr></thead><tbody>` +
-    (trs.length ? trs.map((t) => `<tr>${td(shortTime(t.closed_at))}${td(esc(t.symbol), "l")}${td(esc(t.side), "l")}${td(t.contracts)}
-      ${td(nf2.format(t.entry_price))}${td(nf2.format(t.exit_price))}${td(esc(t.exit_reason), "l")}${td(inr(t.gross_pnl_inr))}${td(inr(-t.fees_gst_inr))}
+    (trs.length ? trs.map((t) => `<tr>${td(shortTime(t.closed_at))}${td(coinTag(t.symbol), "l")}${td(sideTag(t.side), "l")}${td(t.contracts)}
+      ${td(nf2.format(t.entry_price))}${td(nf2.format(t.exit_price))}${td(statusTag(t.exit_reason), "l")}${td(inr(t.gross_pnl_inr))}${td(inr(-t.fees_gst_inr))}
       ${td(inr(t.funding_inr))}${td(`<span class="${cls(t.net_pnl_inr)}">${inr(t.net_pnl_inr)}</span>`)}${td(inr(t.equity_after_inr, false))}</tr>`).join("")
       : `<tr><td class="l muted" colspan="12">No closed bot trades yet</td></tr>`) + "</tbody>";
 
@@ -1843,7 +1912,7 @@ function bindBot() {
   $("botStart").onclick = () => {
     const mode = $("botMode").value;
     botAction(`Start ${mode} loop`, "/api/bot/start", { mode },
-      `Start the 24/7 ${mode.toUpperCase()} bot loop as a background process?\n\nIt keeps running after you close this page; stop it with "Stop Bot Process".`);
+      `Start the 24/7 ${mode.toUpperCase()} bot loop as a background process?\n\nIt keeps running after you close this page; stop it with "Stop Bot".`);
   };
   $("botPause").onclick = () => botAction("Pause new entries", "/api/bot/pause", null, "Pause NEW entries? Trailing stops and exits stay active.");
   $("botResume").onclick = () => botAction("Resume entries", "/api/bot/resume");
@@ -2484,7 +2553,7 @@ function renderDataLab(r) {
 
   const bf = r.backfill_status || {};
   const running = !!bf.is_running;
-  $("dlKpiStatus").textContent = running ? "Syncing / Backfilling…" : (bf.error ? "Warning" : "Up to date ✔");
+  $("dlKpiStatus").textContent = running ? "Syncing…" : (bf.error ? "Warning" : "Up to date ✔");
   $("dlKpiStatus").className = `k-value ${running ? "" : bf.error ? "neg" : "pos"}`;
   $("dlKpiStatusSub").textContent = r.latest_sync_utc ? `Latest: ${r.latest_sync_utc}` : "No local history";
   $("dlInventorySubtitle").textContent = `${items.length} tracked perpetual futures · 1-minute resolution (TRADE + MARK + FUNDING)`;
@@ -2513,7 +2582,7 @@ function renderDataLab(r) {
     const endShort = x.end_date ? x.end_date.slice(0, 16) : "—";
     const gaps = Number(x.gaps_count || 0);
     const healthBadge = gaps === 0 && x.trade_rows > 0
-      ? `<span class="dl-health-ok">0 Gaps ✔</span>`
+      ? `<span class="dl-health-ok">&#9679; 0 gaps</span>`
       : x.trade_rows === 0
       ? `<span class="dl-health-warn">No Data</span>`
       : `<span class="dl-health-warn">${gaps} Gap(s) (${x.missing_minutes || 0}m)</span>`;
@@ -2531,7 +2600,7 @@ function renderDataLab(r) {
           </div>
         </div>
       </td>
-      <td><span class="dl-cov-badge ${covClass}">${days.toFixed(1)}d</span></td>
+      <td><span class="dl-cov-badge ${covClass}">${nf0.format(days)} days</span></td>
       <td class="l">
         <div><b>${esc(startShort)}</b> → <b>${esc(endShort)}</b></div>
         <div class="muted" style="font-size:11px">UTC 1m continuous</div>
@@ -2544,15 +2613,16 @@ function renderDataLab(r) {
       <td><b>${nf2.format(x.file_size_mb || 0)} MB</b></td>
       <td class="l">
         <div class="dl-row-actions">
-          <button type="button" class="btn btn-xs btn-sync" data-dl-sync="${esc(x.symbol)}" title="Incremental sync up to latest closed minute">⚡ Sync</button>
-          <button type="button" class="btn btn-xs btn-primary" data-dl-backfill="${esc(x.symbol)}" title="Extend past history or backfill custom date range">📅 Backfill</button>
-          <button type="button" class="btn btn-xs btn-ghost" data-dl-repair="${esc(x.symbol)}" title="Scan and repair any missing 1m candles">🔧 Repair</button>
+          <button type="button" class="btn btn-xs btn-sync" data-dl-sync="${esc(x.symbol)}" title="Incremental sync up to latest closed minute">Sync</button>
+          <button type="button" class="btn btn-xs btn-primary" data-dl-backfill="${esc(x.symbol)}" title="Extend past history or backfill custom date range">Backfill</button>
+          <button type="button" class="btn btn-xs btn-ghost" data-dl-repair="${esc(x.symbol)}" title="Scan and repair any missing 1m candles">Repair</button>
         </div>
       </td>
     </tr>`;
   }).join("");
 
   $("dlInventoryTable").innerHTML = head + `<tbody>${body}</tbody>`;
+  filterDataInventory();
 
   $("dlInventoryTable").querySelectorAll("[data-dl-sync]").forEach((btn) => {
     btn.onclick = () => triggerBackfill({ symbol: btn.dataset.dlSync, mode: "latest", days_to_add: 7 });
@@ -2813,25 +2883,22 @@ function renderStrategyLab() {
 function renderStrategyLabRoster() {
   const rows = sl.deployed || [];
   const sum = sl.summary || {};
-  if ($("slActiveCoinsCount")) $("slActiveCoinsCount").textContent = `${sum.active_count ?? 0} / ${rows.length}`;
+  if ($("slActiveCoinsCount")) $("slActiveCoinsCount").textContent = `${sum.active_count ?? 0} enabled`;
   if ($("slCombinedRisk")) $("slCombinedRisk").textContent = `${nf2.format(sum.combined_risk_pct ?? 0)}% (${inr(sum.combined_risk_inr ?? 0, false)})`;
   if ($("slClearDeployedBtn")) $("slClearDeployedBtn").disabled = !rows.length;
   $("slDeployedEmpty")?.classList.toggle("hidden", rows.length > 0);
   $("slDeployedTableWrap")?.classList.toggle("hidden", rows.length === 0);
   const tbl = $("slDeployedTable");
   if (!tbl) return;
-  const head = `<thead><tr><th>On</th><th class="l">Coin</th><th class="l">Custom Name</th><th>TF</th><th>Capital ₹</th><th>Lev</th><th>Risk</th><th>SL / TP</th><th>Last signal</th><th class="l">Actions</th></tr></thead>`;
+  const head = `<thead class="sr-only"><tr><th>Coin / Strategy / Timeframe</th><th>On / Off</th><th>Capital ₹</th><th>Lev / Risk</th><th>SL / TP</th><th>Last signal</th><th>Actions</th></tr></thead>`;
   const body = rows.map((d) => `<tr class="${d.enabled === false ? "sl-row-paused" : ""}">
-    <td><input type="checkbox" class="sl-roster-toggle" data-symbol="${esc(d.symbol)}" ${d.enabled !== false ? "checked" : ""}></td>
-    <td class="l"><b>${esc(d.symbol)}</b></td>
-    <td class="l"><b>${esc(d.custom_name || "")}</b></td>
-    <td><span class="sl-tf-badge">${esc(d.timeframe || "1h")}</span></td>
-    <td>₹${nf0.format(d.capital_inr || 0)}</td>
-    <td>${d.leverage}x</td>
-    <td>${d.risk_pct}%</td>
-    <td>${esc(d.sl_tp || slTpLabel(d))}</td>
-    <td>${d.last_signal && d.last_signal !== "none" ? `<span class="chip sig">${esc(d.last_signal)}</span>` : "none"}</td>
-    <td class="l"><button type="button" class="btn btn-xs btn-danger sl-roster-remove" data-symbol="${esc(d.symbol)}">Remove</button></td>
+    <td class="sl-card-identity"><div class="sl-card-symbol"><b>${esc(d.symbol)}</b><span class="sl-tf-badge">${esc(d.timeframe || "1h")}</span></div><div class="sl-card-name" title="${esc(d.custom_name || d.strategy || "Strategy")}">${esc(d.custom_name || d.strategy || "Strategy")}</div></td>
+    <td class="sl-card-switch"><label class="sl-switch-label"><input type="checkbox" class="sl-roster-toggle" data-symbol="${esc(d.symbol)}" aria-label="Enable ${esc(d.symbol)} strategy" ${d.enabled !== false ? "checked" : ""}><span class="sl-switch-state" aria-hidden="true"></span></label></td>
+    <td class="sl-card-stat"><span>Capital</span><b>₹${nf0.format(d.capital_inr || 0)}</b></td>
+    <td class="sl-card-stat"><span>Lev / Risk</span><b>${esc(d.leverage)}x <span class="muted">/</span> ${esc(d.risk_pct)}%</b></td>
+    <td class="sl-card-stat"><span>SL / TP</span><b>${esc(d.sl_tp || slTpLabel(d))}</b></td>
+    <td class="sl-card-signal"><span class="sl-stat-label">Last signal</span>${d.last_signal && d.last_signal !== "none" ? `<span class="chip sig">${esc(d.last_signal)}</span>` : `<span class="sl-signal-none">No signal</span>`}</td>
+    <td class="sl-card-actions"><button type="button" class="btn btn-xs btn-danger sl-roster-remove" data-symbol="${esc(d.symbol)}">Remove</button></td>
   </tr>`).join("");
   tbl.innerHTML = head + `<tbody>${body}</tbody>`;
   tbl.querySelectorAll(".sl-roster-toggle").forEach((chk) => {
@@ -2862,7 +2929,7 @@ function slIsDeployed(r) {
 function updateSlBatchBtn() {
   const n = document.querySelectorAll("#slLibraryTable .sl-lib-check:checked").length;
   const b = $("slBatchDeployBtn");
-  if (b) { b.disabled = n === 0; b.textContent = `🚀 Deploy Selected (${n}) to Paper Bot`; }
+  if (b) { b.disabled = n === 0; b.textContent = `Deploy selected (${n})`; }
 }
 
 function renderStrategyLabLibrary() {
@@ -2891,12 +2958,12 @@ function renderStrategyLabLibrary() {
     <td>${pf(r.profit_factor)}</td>
     <td class="neg">${pct(-Math.abs(r.max_dd_pct || 0), false, 2)}</td>
     <td>${r.total_trades}</td>
-    <td>${slIsDeployed(r) ? `<span class="sl-status-deployed">🚀 Deployed</span>` : `<span class="muted">Saved</span>`}</td>
+    <td>${slIsDeployed(r) ? `<span class="sl-status-deployed">&#9679; Deployed</span>` : `<span class="sl-status-saved">Saved</span>`}</td>
     <td class="l">
-      <button type="button" class="btn btn-xs btn-primary" data-act="deploy" data-rid="${esc(r.id)}">🚀 Deploy to Paper Bot</button>
-      <button type="button" class="btn btn-xs btn-ghost" data-act="load" data-rid="${esc(r.id)}">📊 Load</button>
-      <button type="button" class="btn btn-xs btn-ghost" data-act="rename" data-rid="${esc(r.id)}">✏️ Rename</button>
-      <button type="button" class="btn btn-xs btn-danger" data-act="del" data-rid="${esc(r.id)}">🗑️ Delete</button>
+      <button type="button" class="btn btn-xs btn-primary" data-act="deploy" data-rid="${esc(r.id)}">&#9654; Deploy to paper</button>
+      <button type="button" class="btn btn-xs btn-ghost" data-act="load" data-rid="${esc(r.id)}">Load</button>
+      <button type="button" class="btn btn-xs btn-ghost" data-act="rename" data-rid="${esc(r.id)}">Rename</button>
+      <button type="button" class="btn btn-xs btn-danger" data-act="del" data-rid="${esc(r.id)}">Delete</button>
     </td></tr>`;
   }).join("");
   tbl.innerHTML = head + `<tbody>${body}</tbody>`;
@@ -3000,7 +3067,104 @@ function bindStrategyLab() {
   ["slCoinFilter", "slTfFilter"].forEach((id) => $(id)?.addEventListener("change", () => loadStrategyLab()));
 }
 
+/* UI-only layout wiring: the existing input nodes, polling, and API handlers stay mounted. */
+function renderBotLayoutStatus(s) {
+  const running = !!s.runner.running;
+  setBadge("botRunnerStatus", running ? "Runner running" : "Runner stopped", running ? "badge-ok" : "badge-bot-off");
+  $("botEntriesActive").classList.toggle("hidden", !!s.entries_paused);
+  const notices = [];
+  if (s.wallet_provisional) notices.push(`Funding settlements pending (${(s.pending_funding || []).length}). Wallet P&L is provisional; new entries are blocked while protective management continues.`);
+  const account = accountForMode(s);
+  if (s.daily_halted || s.readiness_state === "HALTED" || account?.halted) notices.push(`Account halted: ${s.halt_reason || account?.halt_reason || "review account risk and runner diagnostics"}.`);
+  $("botAlert").textContent = notices.join(" ");
+  $("botAlert").classList.toggle("is-hidden", notices.length === 0);
+}
+
+function filterDataInventory() {
+  const query = ($("dlInventorySearch").value || "").trim().toLowerCase();
+  const rows = [...$("dlInventoryTable").querySelectorAll("tbody tr")].filter(row => row.querySelector("[data-dl-sync]"));
+  let matches = 0;
+  rows.forEach(row => {
+    const show = !query || row.textContent.toLowerCase().includes(query);
+    row.classList.toggle("is-hidden", !show);
+    if (show) matches++;
+  });
+  $("dlSearchEmpty").classList.toggle("is-hidden", !query || matches > 0 || rows.length === 0);
+}
+
+function bindTerminalLayout() {
+  document.querySelectorAll("[data-ui-tabs]").forEach(group => {
+    const buttons = [...group.querySelectorAll("[data-ui-tab]")];
+    const panes = [...group.querySelectorAll("[data-ui-pane]")];
+    const activate = button => {
+      buttons.forEach(b => {
+        const active = b === button;
+        b.classList.toggle("active", active);
+        b.setAttribute("aria-selected", String(active));
+        b.tabIndex = active ? 0 : -1;
+      });
+      panes.forEach(p => p.classList.toggle("is-hidden", p.dataset.uiPane !== button.dataset.uiTab));
+    };
+    buttons.forEach((button, index) => {
+      button.addEventListener("click", () => activate(button));
+      button.addEventListener("keydown", event => {
+        let next;
+        if (event.key === "ArrowRight") next = (index + 1) % buttons.length;
+        else if (event.key === "ArrowLeft") next = (index - 1 + buttons.length) % buttons.length;
+        else if (event.key === "Home") next = 0;
+        else if (event.key === "End") next = buttons.length - 1;
+        else return;
+        event.preventDefault();
+        activate(buttons[next]);
+        buttons[next].focus();
+      });
+    });
+  });
+  $("dlInventorySearch").addEventListener("input", filterDataInventory);
+
+  const drawer = $("advancedSettingsDrawer");
+  let snapshot = null;
+  const closeDrawer = apply => {
+    if (apply) {
+      const invalid = [...$("advBox").querySelectorAll("input, select")].find(el => el.willValidate && !el.checkValidity());
+      if (invalid) { invalid.reportValidity(); return; }
+      markPreviewStale();
+    } else if (snapshot) {
+      snapshot.controls.forEach(({el, value, checked}) => { el.value = value; el.checked = checked; });
+      updateAdvSummary();
+      updateOverviewHeaderPreview();
+      if (state.result === snapshot.result) {
+        state.resultSaved = snapshot.resultSaved;
+        $("saveResultBtn").disabled = snapshot.saveDisabled;
+        $("unsavedBadge").textContent = snapshot.badgeText;
+        $("unsavedBadge").className = snapshot.badgeClass;
+        $("emptyRunOverlay").classList.toggle("hidden", snapshot.overlayHidden);
+      }
+    }
+    drawer.close();
+    snapshot = null;
+  };
+  $("openAdvancedSettings").addEventListener("click", () => {
+    snapshot = {
+      controls: [...$("advBox").querySelectorAll("input, select")].map(el => ({el, value: el.value, checked: el.checked})),
+      result: state.result, resultSaved: state.resultSaved, saveDisabled: $("saveResultBtn").disabled,
+      badgeText: $("unsavedBadge").textContent, badgeClass: $("unsavedBadge").className,
+      overlayHidden: $("emptyRunOverlay").classList.contains("hidden"),
+    };
+    drawer.showModal();
+  });
+  $("applyAdvancedSettings").addEventListener("click", () => closeDrawer(true));
+  ["cancelAdvancedSettings", "closeAdvancedSettings"].forEach(id => $(id).addEventListener("click", () => closeDrawer(false)));
+  drawer.addEventListener("cancel", event => { event.preventDefault(); closeDrawer(false); });
+  drawer.addEventListener("click", event => {
+    if (event.target !== drawer) return;
+    const bounds = drawer.getBoundingClientRect();
+    if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) closeDrawer(false);
+  });
+}
+
 async function main() {
+  bindTerminalLayout();
   bindBot();
   bindManual();
   bindDataLab();
@@ -3008,7 +3172,8 @@ async function main() {
   loadBotStatus();
   const applyHashView = () => {
     const h = (location.hash || "").replace(/^#\/?/, "");
-    if (h === "bot" || h === "manual" || h === "data" || h === "strategies" || h === "lab") showView(h);
+    if (h === "research") showView("lab");
+    else if (h === "bot" || h === "manual" || h === "data" || h === "strategies" || h === "lab") showView(h);
   };
   applyHashView();
   window.addEventListener("hashchange", applyHashView);
