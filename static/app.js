@@ -22,7 +22,7 @@ const state = {
   lb: { source: "step3c", sort: "net", desc: true, columns: [], rows: [], days: 180 },
 };
 
-const COLORS = { up: "#10b981", down: "#ef4444", accent: "#2f6df6", muted: "#94a3b8", grid: "rgba(148, 163, 184, 0.06)", border: "rgba(148, 163, 184, 0.14)", panel: "#111829" };
+const COLORS = { up: "#0ECB81", down: "#F6465D", warn: "#F0B90B", accent: "#2962FF", muted: "#848E9C", grid: "rgba(132, 142, 156, 0.08)", border: "#242930", panel: "#161A1E" };
 const OVERLAY_STYLE = {
   ema9: { color: "#f5d76e" }, ema21: { color: "#f59e0b" }, ema50: { color: "#a78bfa" }, ema55: { color: "#c084fc" },
   ema100: { color: "#60a5fa" }, ema200: { color: "#e879f9", width: 2 },
@@ -329,14 +329,36 @@ let priceChart, equityChart, candleSeries, volumeSeries, equitySeries, ddSeries;
 
 function baseChartOptions() {
   return {
-    autoSize: true,
-    layout: { background: { type: "solid", color: COLORS.panel }, textColor: COLORS.muted, fontFamily: "ui-monospace, Consolas, monospace", fontSize: 11, attributionLogo: true },
+    autoSize: false,
+    layout: { background: { type: "solid", color: COLORS.panel }, textColor: COLORS.muted, fontFamily: "'JetBrains Mono', ui-monospace, Consolas, monospace", fontSize: 11, attributionLogo: true },
     grid: { vertLines: { color: COLORS.grid }, horzLines: { color: COLORS.grid } },
     rightPriceScale: { borderColor: COLORS.border },
     leftPriceScale: { borderColor: COLORS.border },
     timeScale: { borderColor: COLORS.border, timeVisible: true, secondsVisible: false, rightOffset: 3 },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
   };
+}
+
+function resizeChart(chart, container) {
+  if (chart && container.clientWidth && container.clientHeight) {
+    chart.resize(container.clientWidth, container.clientHeight);
+  }
+}
+
+function observeChartSize(chart, container) {
+  const resize = () => resizeChart(chart, container);
+  if (window.ResizeObserver) {
+    new ResizeObserver(resize).observe(container);
+  } else {
+    window.addEventListener("resize", resize);
+  }
+  resize();
+}
+
+function resizeTerminalCharts() {
+  resizeChart(priceChart, $("priceChart"));
+  resizeChart(equityChart, $("equityChart"));
+  resizeChart(mt.chart, $("mtChart"));
 }
 
 function initCharts() {
@@ -373,6 +395,8 @@ function initCharts() {
       if (tr) selectTrade(tr, { fromChart: true });
     }
   });
+  observeChartSize(priceChart, $("priceChart"));
+  observeChartSize(equityChart, $("equityChart"));
 }
 
 function renderChart(sym) {
@@ -384,7 +408,7 @@ function renderChart(sym) {
   const tick = state.status && state.status.products[sym] && state.status.products[sym].tick_size;
   if (tick) candleSeries.applyOptions({ priceFormat: { type: "price", precision: decimals(tick), minMove: Number(tick) } });
   candleSeries.setData(ch.candles);
-  volumeSeries.setData(ch.volume.map((v) => ({ time: v.time, value: v.value, color: v.up ? "rgba(16,185,129,0.28)" : "rgba(244,63,94,0.28)" })));
+  volumeSeries.setData(ch.volume.map((v) => ({ time: v.time, value: v.value, color: v.up ? "rgba(14,203,129,0.28)" : "rgba(246,70,93,0.28)" })));
 
   state.overlaySeries.forEach((s) => priceChart.removeSeries(s));
   state.overlaySeries = [];
@@ -1156,7 +1180,7 @@ function selectTrade(tr, { fromChart = false } = {}) {
     line(tr.tp_price, COLORS.up, "TP"),
     line(tr.exit_price, long === tr.exit_price > tr.entry_price ? "#4ade80" : "#fb923c", `exit ${tr.exit_reason}`),
   ];
-  if (tr.final_sl !== tr.initial_sl) state.tradeLines.push(line(tr.final_sl, "#f59e0b", "final SL"));
+  if (tr.final_sl !== tr.initial_sl) state.tradeLines.push(line(tr.final_sl, COLORS.warn, "final SL"));
 
   showTab("ledger");
   const rows = $("ledgerTable").querySelectorAll("tbody tr");
@@ -1281,12 +1305,7 @@ function showTab(name) {
     const el = $(`tab-${t}`);
     if (el) el.classList.toggle("hidden", t !== name);
   });
-  if (name === "equity") requestAnimationFrame(() => {
-    const container = $("equityChart");
-    if (equityChart && container.clientWidth && container.clientHeight) {
-      equityChart.resize(container.clientWidth, container.clientHeight);
-    }
-  });
+  if (name === "equity") requestAnimationFrame(resizeTerminalCharts);
 }
 
 function bind() {
@@ -1381,52 +1400,37 @@ function bind() {
     loadSavedResults();
   };
 
-  $("syncBtn").onclick = async () => {
-    try { await startSync({}); } catch (e) { toast(e.message, true); }
-  };
-  $("addCoinBtn").onclick = () => { $("addCoinMsg").textContent = ""; $("addCoinDialog").showModal(); $("newSymbol").focus(); };
-  $("addCoinForm").addEventListener("submit", async (ev) => {
-    if (ev.submitter && ev.submitter.value === "cancel") return;
-    ev.preventDefault();
-    const sym = $("newSymbol").value.trim().toUpperCase();
-    $("addCoinMsg").textContent = `Validating ${sym}…`;
-    $("addCoinSubmit").disabled = true;
-    try {
-      await startSync({ add_symbol: sym, days: Number($("newDays").value) || 90 });
-      $("addCoinDialog").close();
-      toast(`${sym} validated — downloading history in the background`);
-    } catch (e) {
-      $("addCoinMsg").textContent = e.message;
-    } finally {
-      $("addCoinSubmit").disabled = false;
-    }
-  });
 }
 
 /* ------------------------------------------------------------------ Step 7: bot operations view */
-const bot = { timer: null, status: null, busy: false };
+const bot = { status: null, busy: false };
+const terminal = { view: "lab", status: null, pending: null, requested: 0, rendered: 0 };
 
 function showView(name) {
   if (name === "research") name = "lab";
-  document.querySelectorAll(".vbtn").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
-  const activeNav = document.querySelector(".vbtn.active");
-  if (activeNav) {
-    const nav = activeNav.closest(".view-switch");
-    const bounds = nav.getBoundingClientRect(), active = activeNav.getBoundingClientRect();
-    if (active.left < bounds.left) nav.scrollLeft += active.left - bounds.left - 4;
-    else if (active.right > bounds.right) nav.scrollLeft += active.right - bounds.right + 4;
-  }
+  const changed = terminal.view !== name;
+  terminal.view = name;
+  document.querySelectorAll(".vbtn").forEach((b) => {
+    const active = b.dataset.view === name;
+    b.classList.toggle("active", active);
+    if (active) {
+      b.setAttribute("aria-current", "page");
+      $("terminalPageTitle").textContent = b.querySelector(".nav-label").textContent;
+      $("terminalBreadcrumb").textContent = b.querySelector(".nav-short").textContent;
+    } else {
+      b.removeAttribute("aria-current");
+    }
+  });
   $("labView").classList.toggle("hidden", name !== "lab");
   $("botView").classList.toggle("hidden", name !== "bot");
   $("manualView").classList.toggle("hidden", name !== "manual");
   if ($("dataView")) $("dataView").classList.toggle("hidden", name !== "data");
   if ($("strategiesView")) $("strategiesView").classList.toggle("hidden", name !== "strategies");
   if (history.replaceState) history.replaceState(null, "", name === "lab" ? "#research" : `#${name}`);
-  clearInterval(bot.timer);
+  if (changed) window.scrollTo(0, 0);
   clearInterval(mt.timer);
   if (name === "bot") {
-    loadBotStatus();
-    bot.timer = setInterval(() => { if (!document.hidden) loadBotStatus(); }, 5000);
+    refreshBotView();
   } else if (name === "manual") {
     mtEnter();
   } else if (name === "data") {
@@ -1434,6 +1438,7 @@ function showView(name) {
   } else if (name === "strategies") {
     slEnter();
   }
+  requestAnimationFrame(resizeTerminalCharts);
 }
 
 function botMsg(text, isError = false) {
@@ -1449,13 +1454,60 @@ function setBadge(id, text, klass) {
   b.className = `badge ${klass}`;
 }
 
-function modeBadge(s) {
-  if (!s.runner.running) {
-    return s.settings.live_allowed ? ["BOT STOPPED · LIVE ARMED", "badge-live"] : ["BOT STOPPED · LIVE (DISABLED)", "badge-bot-off"];
+function terminalMode(s) {
+  return s?.runner?.running ? s.runner.mode : s?.journal_mode || s?.mode;
+}
+
+function renderTerminalStatus(s, request) {
+  if (request < terminal.rendered) return;
+  terminal.rendered = request;
+  terminal.status = s;
+  const running = !!s?.runner?.running;
+  const mode = terminalMode(s);
+  const modeLabel = mode?.toUpperCase();
+  const modeStyle = { paper: "badge-paper", testnet: "badge-testnet", live: "badge-live" }[mode] || "badge-bot-off";
+  const stopped = s && s.process?.state !== "unknown";
+  const status = running ? "RUNNING" : stopped ? "BOT STOPPED" : "BOT UNKNOWN";
+  const badgeText = modeLabel ? `${status} · ${modeLabel}` : status;
+  if ($("botBadge").textContent !== badgeText) setBadge("botBadge", badgeText, running ? modeStyle : "badge-bot-off");
+  $("terminalBotActive").classList.toggle("hidden", !running);
+  setBadge("terminalAccountMode", modeLabel || "—", modeStyle);
+
+  const wallet = mode === (s?.journal_mode || s?.mode) ? s?.wallet : null;
+  $("terminalAccountEquity").textContent = inr(wallet?.total_equity_inr, false);
+  const pnl = wallet?.today_pnl_pct;
+  const limit = wallet?.daily_loss_limit_pct;
+  const used = isNum(pnl) ? Math.max(0, -pnl) : null;
+  const ratio = used !== null && isNum(limit) && limit > 0 ? used / limit : null;
+  const guard = $("terminalLossGuard");
+  guard.classList.toggle("safe", ratio !== null && ratio < .75);
+  guard.classList.toggle("caution", ratio !== null && ratio >= .75 && ratio < 1);
+  guard.classList.toggle("exhausted", ratio !== null && ratio >= 1);
+  const format = value => isNum(value) ? `${Number(value.toFixed(2))}%` : "—";
+  $("terminalLossValue").textContent = `${format(used)} / ${format(limit)}`;
+  $("terminalLossFill").style.width = `${Math.min(100, (ratio ?? 0) * 100)}%`;
+  guard.setAttribute("aria-label", `Daily loss ${format(used)} used out of ${format(limit)}. Open Bot Account Settings.`);
+}
+
+function loadTerminalStatus() {
+  if (!terminal.pending) {
+    const request = ++terminal.requested;
+    terminal.pending = api("/api/bot/status", { signal: AbortSignal.timeout(15000) })
+      .then(s => renderTerminalStatus(s, request))
+      .catch(() => renderTerminalStatus(null, request))
+      .finally(() => { terminal.pending = null; });
   }
-  const m = (s.runner.mode || s.mode || "paper").toUpperCase();
-  if (m === "LIVE") return ["LIVE BOT", "badge-live"];
-  return [`${m} BOT · RUNNING`, m === "TESTNET" ? "badge-testnet" : "badge-paper"];
+  return terminal.pending;
+}
+
+async function refreshBotView() {
+  const request = ++terminal.requested;
+  const s = await loadBotStatus();
+  if (s && !s.historical_session && (s.journal_mode || s.mode) === (s.runner.running ? s.runner.mode : "paper")) {
+    renderTerminalStatus(s, request);
+  } else {
+    await loadTerminalStatus();
+  }
 }
 
 const paperAccountUi = {session: "", offset: 0, draftKey: null, draftBinding: null, dirty: false,
@@ -1726,6 +1778,7 @@ async function loadBotStatus() {
     bot.status = s;
     renderBot(s);
     $("botRefresh").textContent = `updated ${new Date().toISOString().slice(11, 19)} UTC · auto-refresh 5s`;
+    return s;
   } catch (e) {
     paperAccountUi.statusError = e.message;
     $("botRefresh").textContent = `status failed: ${e.message}`;
@@ -1758,8 +1811,6 @@ function renderRunnerEvidence(s) {
 }
 
 function renderBot(s) {
-  const [bt, bk] = modeBadge(s);
-  setBadge("botBadge", bt, bk);
   const jmode = s.journal_mode || s.mode || "paper";
   setBadge("botModeBadge", `${jmode.toUpperCase()} JOURNAL${s.settings.live_allowed ? "" : " · LIVE (DISABLED)"}`,
     jmode === "testnet" ? "badge-testnet" : jmode === "live" ? "badge-live" : "badge-paper");
@@ -1906,6 +1957,12 @@ function botSummary(path, r) {
   return JSON.stringify(r);
 }
 
+function resetBotModeDraft() {
+  ++paperAccountUi.loadSeq; ++paperAccountUi.accountSeq; ++paperAccountUi.processSeq;
+  Object.assign(paperAccountUi, {statusError:"",accountError:"",account:null,catalog:null,dirty:false,draftKey:null,draftBinding:null,minRevision:null,minRevisionSession:null});
+  try { paperAccountUi.request = JSON.parse(localStorage.getItem(accountRequestKey()) || "null"); } catch (_) { paperAccountUi.request = null; }
+}
+
 function bindBot() {
   document.querySelectorAll(".vbtn").forEach((b) => { b.onclick = () => showView(b.dataset.view); });
   $("botStep").onclick = () => botAction("Run 1 cycle", "/api/bot/step");
@@ -1918,20 +1975,167 @@ function bindBot() {
   $("botResume").onclick = () => botAction("Resume entries", "/api/bot/resume");
   $("botStop").onclick = () => botAction("Stop bot", "/api/bot/stop", null,
     "Stop the bot process?\n\nOpen paper positions stop being managed until it is restarted; exchange-resident SL/TP orders (testnet/live) stay in place.");
-  $("botFlatten").onclick = () => {
-    const typed = prompt("EMERGENCY FLATTEN closes every open bot position at market and pauses new entries.\n\nType FLATTEN to confirm:");
-    if (typed !== "FLATTEN") { botMsg("Flatten cancelled"); return; }
-    botAction("Emergency flatten", "/api/bot/flatten");
-  };
   initPaperAccount();
   $("botMode").onchange = () => {
-    ++paperAccountUi.loadSeq; ++paperAccountUi.accountSeq; ++paperAccountUi.processSeq;
-    Object.assign(paperAccountUi, {statusError:"",accountError:"",account:null,catalog:null,dirty:false,draftKey:null,draftBinding:null,minRevision:null,minRevisionSession:null});
-    try { paperAccountUi.request = JSON.parse(localStorage.getItem(accountRequestKey()) || "null"); } catch (_) { paperAccountUi.request = null; }
+    resetBotModeDraft();
     renderPaperAccount(); loadBotStatus();
   };
   $("botBackup").onclick = () => botAction("Backup state DB", "/api/bot/backup");
   $("botTelegram").onclick = () => botAction("Test Telegram alert", "/api/bot/test-telegram");
+}
+
+function bindEmergencyControls() {
+  const dialog = $("emergencyDialog");
+  const input = $("emergencyConfirmInput");
+  const field = $("emergencyConfirmField");
+  const next = $("emergencyNext");
+  const submit = $("emergencySubmit");
+  const cancel = $("emergencyCancel");
+  const result = $("emergencyResult");
+  let keyword, target, step, submitting;
+
+  function open(stopAll) {
+    if (bot.busy || dialog.open) return;
+    keyword = stopAll ? "STOP" : "FLATTEN";
+    target = stopAll ? terminal.status : null;
+    const mode = stopAll ? terminalMode(target) : botSelectedMode();
+    step = 1;
+    submitting = false;
+    $("emergencyStep").textContent = "Step 1 of 2";
+    $("emergencyTitle").textContent = stopAll ? "Stop all bots" : "Emergency flatten";
+    const warning = stopAll
+      ? "This will flatten open bot positions at market, pause new entries, and then stop the active bot runner."
+      : "This will flatten open positions at market and pause new bot entries.";
+    $("emergencyWarning").textContent = warning + (mode ? ` Account: ${mode.toUpperCase()}.` : "") +
+      (mode && mode !== "paper" ? " Exchange-wide flattening can also close manual positions in this account." : "");
+    $("emergencyKeyword").textContent = keyword;
+    input.value = "";
+    field.hidden = input.disabled = submit.hidden = submit.disabled = true;
+    submit.textContent = stopAll ? "Flatten & stop" : "Flatten positions";
+    next.hidden = false;
+    cancel.disabled = false;
+    cancel.textContent = "Cancel";
+    result.textContent = "";
+    result.classList.remove("error");
+    dialog.showModal();
+    cancel.focus();
+  }
+
+  $("stopAllBtn").onclick = () => open(true);
+  $("botFlatten").onclick = () => open(false);
+  cancel.onclick = () => dialog.close();
+  dialog.addEventListener("cancel", event => { if (submitting) event.preventDefault(); });
+  next.onclick = () => {
+    step = 2;
+    $("emergencyStep").textContent = "Step 2 of 2";
+    next.hidden = true;
+    field.hidden = input.disabled = submit.hidden = false;
+    input.focus();
+  };
+  input.oninput = () => { submit.disabled = submitting || input.value !== keyword; };
+
+  $("emergencyForm").onsubmit = async event => {
+    event.preventDefault();
+    if (!dialog.open || step !== 2 || submitting || bot.busy || input.value !== keyword) return;
+    if (keyword === "FLATTEN") {
+      dialog.close();
+      await botAction("Emergency flatten", "/api/bot/flatten");
+      return;
+    }
+
+    submitting = bot.busy = true;
+    input.disabled = submit.disabled = cancel.disabled = true;
+    result.textContent = "Verifying the active bot account…";
+    let flattened = false;
+    try {
+      const mode = terminalMode(target);
+      const request = ++terminal.requested;
+      const current = await api("/api/bot/status", { signal: AbortSignal.timeout(15000) });
+      renderTerminalStatus(current, request);
+      if (!mode || target.process?.state === "unknown" || terminalMode(current) !== mode || current.process?.state === "unknown" ||
+          current.runner.running !== target.runner.running || current.runner.pid !== target.runner.pid ||
+          current.runner.started !== target.runner.started) {
+        throw new Error("The runner or account changed or could not be verified. Reopen STOP ALL to review the current account.");
+      }
+      const options = { method: "POST", body: JSON.stringify({ mode }) };
+      result.textContent = "Flattening positions and pausing entries…";
+      const report = await api("/api/bot/flatten", options);
+      if (report.status !== "FLAT") {
+        const remaining = `${report.residual?.length || 0} residual position entries, ${report.open_entry_orders?.length || 0} open entry orders`;
+        throw new Error(`Flatten could not verify a flat account (${remaining}). Runner stop was skipped.`);
+      }
+      flattened = true;
+      result.textContent = "Account flat. Stopping the runner…";
+      const stopped = await api("/api/bot/stop", options);
+      if (!stopped.stopped) throw new Error(stopped.reason || "Runner exit could not be verified.");
+      result.textContent = `${mode.toUpperCase()} account flat and runner stopped.`;
+      botMsg(result.textContent);
+    } catch (e) {
+      result.textContent = `${flattened ? "Account flat. Runner stop not verified." : "STOP ALL did not complete."} ${e.message}`;
+      result.classList.add("error");
+      botMsg(result.textContent, true);
+    } finally {
+      step = 3;
+      submitting = bot.busy = false;
+      field.hidden = submit.hidden = true;
+      cancel.disabled = false;
+      cancel.textContent = "Close";
+      cancel.focus();
+      if (terminal.view === "bot") refreshBotView();
+      else loadTerminalStatus();
+    }
+  };
+}
+
+function bindTerminalShell() {
+  const toggle = $("sidebarToggle");
+  toggle.onclick = () => {
+    const collapsed = document.body.classList.toggle("sidebar-collapsed");
+    const label = collapsed ? "Expand sidebar" : "Collapse sidebar";
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.setAttribute("aria-label", label);
+    toggle.title = label;
+    requestAnimationFrame(resizeTerminalCharts);
+  };
+  $("syncBtn").onclick = async () => {
+    try { await startSync({}); } catch (e) { toast(e.message, true); }
+  };
+  $("addCoinBtn").onclick = () => { $("addCoinMsg").textContent = ""; $("addCoinDialog").showModal(); $("newSymbol").focus(); };
+  $("addCoinForm").addEventListener("submit", async (ev) => {
+    if (ev.submitter && ev.submitter.value === "cancel") return;
+    ev.preventDefault();
+    const sym = $("newSymbol").value.trim().toUpperCase();
+    $("addCoinMsg").textContent = `Validating ${sym}…`;
+    $("addCoinSubmit").disabled = true;
+    try {
+      await startSync({ add_symbol: sym, days: Number($("newDays").value) || 90 });
+      $("addCoinDialog").close();
+      toast(`${sym} validated — downloading history in the background`);
+    } catch (e) {
+      $("addCoinMsg").textContent = e.message;
+    } finally {
+      $("addCoinSubmit").disabled = false;
+    }
+  });
+  $("terminalLossGuard").onclick = () => {
+    const selection = $("botMode");
+    const mode = terminalMode(terminal.status) || selection.value;
+    if (mode !== selection.value) {
+      selection.value = mode;
+      resetBotModeDraft();
+    }
+    if (mode === "paper" && paperAccountUi.session) {
+      $("paperSessionSelect").value = paperAccountUi.session = "";
+      paperAccountUi.offset = 0;
+    }
+    showView("bot");
+    requestAnimationFrame(() => {
+      const account = $("paperAccountCard");
+      account.focus({ preventScroll: true });
+      account.scrollIntoView({ block: "start" });
+    });
+  };
+  bindEmergencyControls();
 }
 
 /* ------------------------------------------------------------------ Step 8: manual trade terminal */
@@ -1973,9 +2177,12 @@ async function mtLoadCatalog() {
 
 function mtInitChart() {
   if (mt.chart || !window.LightweightCharts) return;
-  mt.chart = LightweightCharts.createChart($("mtChart"), baseChartOptions());
+  const el = $("mtChart");
+  mt.chart = LightweightCharts.createChart(el, { ...baseChartOptions(),
+    width: el.clientWidth, height: el.clientHeight });
   mt.series = mt.chart.addCandlestickSeries({ upColor: COLORS.up, downColor: COLORS.down, borderVisible: false,
     wickUpColor: COLORS.up, wickDownColor: COLORS.down });
+  observeChartSize(mt.chart, el);
 }
 
 function mtSetLevBounds(maxLev) {
@@ -2118,7 +2325,7 @@ function mtRenderLines(positions) {
   add(p.entry_price, COLORS.accent, `${p.side} ${p.contracts} @ ${p.leverage}x`);
   add(p.sl_price, COLORS.down, "SL", 2);
   add(p.tp_price, COLORS.up, "TP", 2);
-  add(p.liq_price_est, "#f59e0b", "LIQ (est)", 1);
+  add(p.liq_price_est, COLORS.warn, "LIQ (est)", 1);
 }
 
 function mtRender(s, forceChart) {
@@ -3122,9 +3329,10 @@ function bindTerminalLayout() {
   });
   $("dlInventorySearch").addEventListener("input", filterDataInventory);
 
-  const drawer = $("advancedSettingsDrawer");
+  const settings = $("advancedSettingsDrawer");
+  const toggle = $("openAdvancedSettings");
   let snapshot = null;
-  const closeDrawer = apply => {
+  const closeSettings = apply => {
     if (apply) {
       const invalid = [...$("advBox").querySelectorAll("input, select")].find(el => el.willValidate && !el.checkValidity());
       if (invalid) { invalid.reportValidity(); return; }
@@ -3141,41 +3349,48 @@ function bindTerminalLayout() {
         $("emptyRunOverlay").classList.toggle("hidden", snapshot.overlayHidden);
       }
     }
-    drawer.close();
+    settings.hidden = true;
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.focus();
     snapshot = null;
   };
-  $("openAdvancedSettings").addEventListener("click", () => {
+  toggle.addEventListener("click", () => {
+    if (!settings.hidden) { closeSettings(true); return; }
     snapshot = {
       controls: [...$("advBox").querySelectorAll("input, select")].map(el => ({el, value: el.value, checked: el.checked})),
       result: state.result, resultSaved: state.resultSaved, saveDisabled: $("saveResultBtn").disabled,
       badgeText: $("unsavedBadge").textContent, badgeClass: $("unsavedBadge").className,
       overlayHidden: $("emptyRunOverlay").classList.contains("hidden"),
     };
-    drawer.showModal();
+    settings.hidden = false;
+    toggle.setAttribute("aria-expanded", "true");
   });
-  $("applyAdvancedSettings").addEventListener("click", () => closeDrawer(true));
-  ["cancelAdvancedSettings", "closeAdvancedSettings"].forEach(id => $(id).addEventListener("click", () => closeDrawer(false)));
-  drawer.addEventListener("cancel", event => { event.preventDefault(); closeDrawer(false); });
-  drawer.addEventListener("click", event => {
-    if (event.target !== drawer) return;
-    const bounds = drawer.getBoundingClientRect();
-    if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) closeDrawer(false);
+  $("applyAdvancedSettings").addEventListener("click", () => closeSettings(true));
+  ["cancelAdvancedSettings", "closeAdvancedSettings"].forEach(id => $(id).addEventListener("click", () => closeSettings(false)));
+  settings.addEventListener("keydown", event => {
+    if (event.key === "Escape") { event.preventDefault(); closeSettings(false); }
   });
 }
 
 async function main() {
+  bindTerminalShell();
   bindTerminalLayout();
   bindBot();
   bindManual();
   bindDataLab();
   bindStrategyLab();
-  loadBotStatus();
   const applyHashView = () => {
     const h = (location.hash || "").replace(/^#\/?/, "");
     if (h === "research") showView("lab");
     else if (h === "bot" || h === "manual" || h === "data" || h === "strategies" || h === "lab") showView(h);
   };
   applyHashView();
+  if (terminal.view !== "bot") refreshBotView();
+  setInterval(() => {
+    if (document.hidden || bot.busy) return;
+    if (terminal.view === "bot") refreshBotView();
+    else loadTerminalStatus();
+  }, 5000);
   window.addEventListener("hashchange", applyHashView);
   if (!window.LightweightCharts) {
     toast("Could not load TradingView Lightweight Charts from unpkg.com — check your internet connection.", true);

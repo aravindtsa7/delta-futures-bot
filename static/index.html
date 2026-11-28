@@ -4,31 +4,71 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Delta Futures Lab</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%232f6df6'/%3E%3Ctext x='20' y='28' text-anchor='middle' font-family='Arial' font-weight='700' font-size='27' fill='%230b111e'%3ED%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='9' fill='%232962ff'/%3E%3Cpath d='M20 10 30 29H10Z' fill='none' stroke='white' stroke-width='3' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand"><span class="brand-mark">D</span> Delta Futures Lab</div>
-    <nav class="view-switch" aria-label="View">
-      <button class="vbtn active" data-view="lab">Research Lab</button>
-      <button class="vbtn" id="navStrategies" data-view="strategies">Strategy Lab <span id="navStratBadge" class="tab-count">0</span></button>
-      <button class="vbtn" id="navData" data-view="data">Data Lab</button>
-      <button class="vbtn" data-view="bot">Bot Operations</button>
-      <button class="vbtn" data-view="manual">Manual Trade</button>
+  <svg class="terminal-icons" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="terminalIconResearch" viewBox="0 0 24 24"><path d="M3 4v16h18M7 15l4-5 4 2 5-6"/></symbol>
+    <symbol id="terminalIconStrategy" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5ZM3 12l9 5 9-5M3 16l9 5 9-5"/></symbol>
+    <symbol id="terminalIconData" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12a8 3 0 0 0 16 0V6M4 12a8 3 0 0 0 16 0"/></symbol>
+    <symbol id="terminalIconBot" viewBox="0 0 24 24"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M1 13v3m22-3v3M9 13h.01M15 13h.01M9 17h6"/></symbol>
+    <symbol id="terminalIconManual" viewBox="0 0 24 24"><path d="M6 3v3m0 8v7m6-18v9m0 7v2m6-18v3m0 8v7"/><path d="M4 6h4v8H4zm6 6h4v7h-4zm6-6h4v8h-4z"/></symbol>
+    <symbol id="terminalIconSidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m7-11-3 3 3 3"/></symbol>
+  </svg>
+  <aside class="terminal-sidebar" aria-label="DeltaBot terminal">
+    <div class="terminal-sidebar-head">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">Δ</span>
+        <div class="brand-text"><strong>DeltaBot</strong><span>Delta Futures Lab</span></div>
+      </div>
+      <button type="button" id="sidebarToggle" class="sidebar-toggle" aria-controls="terminalNav" aria-expanded="true" aria-label="Collapse sidebar" title="Collapse sidebar"><svg aria-hidden="true"><use href="#terminalIconSidebar"/></svg></button>
+    </div>
+    <nav class="view-switch" id="terminalNav" aria-label="Workspaces">
+      <button type="button" class="vbtn active" data-view="lab" aria-current="page" title="Research Lab"><svg aria-hidden="true"><use href="#terminalIconResearch"/></svg><span class="nav-label">Research Lab</span><span class="nav-short">Research</span></button>
+      <button type="button" class="vbtn" id="navStrategies" data-view="strategies" title="Strategy Lab"><svg aria-hidden="true"><use href="#terminalIconStrategy"/></svg><span class="nav-label">Strategy Lab</span><span class="nav-short">Strategies</span><span id="navStratBadge" class="tab-count">0</span></button>
+      <button type="button" class="vbtn" id="navData" data-view="data" title="Data Lab"><svg aria-hidden="true"><use href="#terminalIconData"/></svg><span class="nav-label">Data Lab</span><span class="nav-short">Data</span></button>
+      <button type="button" class="vbtn" data-view="bot" title="Bot Operations"><svg aria-hidden="true"><use href="#terminalIconBot"/></svg><span class="nav-label">Bot Operations</span><span class="nav-short">Bot Ops</span><span id="terminalBotActive" class="nav-runner hidden" title="Runner active"><span class="nav-runner-label">Active</span></span></button>
+      <button type="button" class="vbtn" data-view="manual" title="Manual Trade"><svg aria-hidden="true"><use href="#terminalIconManual"/></svg><span class="nav-label">Manual Trade</span><span class="nav-short">Manual</span></button>
     </nav>
-    <div class="topbar-actions">
+    <div class="terminal-sidebar-footer">
+      <div class="sidebar-account">
+        <span id="terminalAccountMode" class="badge badge-bot-off">—</span>
+        <span id="terminalAccountEquity" class="mono" title="Active account equity">—</span>
+      </div>
+      <span id="modeBadge" class="status-pill"><span class="dot"></span> Live trading disabled</span>
       <div id="coverage" class="coverage hidden"></div>
       <span id="envBadge" class="badge badge-env hidden">…</span>
-      <span id="botBadge" class="badge badge-bot-off hidden" title="Bot runner status">BOT STOPPED</span>
-      <div class="spacer"></div>
-      <span id="syncStatus" class="sync-status"></span>
-      <span id="modeBadge" class="status-pill"><span class="dot"></span> Live trading disabled</span>
-      <button id="syncBtn" class="btn btn-sync">↻ Sync data</button>
-      <button id="addCoinBtn" class="btn btn-ghost btn-sm" title="Add another perpetual futures symbol">+ Coin</button>
     </div>
-  </header>
+  </aside>
+
+  <main class="terminal-main">
+    <header class="topbar">
+      <div class="command-heading">
+        <div class="command-breadcrumb">DeltaBot <span aria-hidden="true">/</span> <span id="terminalBreadcrumb">Research</span></div>
+        <div id="terminalPageTitle" class="command-title">Research Lab</div>
+      </div>
+      <div class="topbar-actions">
+        <div class="command-quick">
+          <button id="syncBtn" class="btn btn-sync">Sync Data</button>
+          <button id="addCoinBtn" class="btn btn-ghost btn-sm" title="Add another perpetual futures symbol">+ Coin</button>
+        </div>
+        <div class="command-telemetry">
+          <span id="botBadge" class="badge badge-bot-off" title="Bot runner status" role="status">BOT UNKNOWN</span>
+          <button type="button" id="terminalLossGuard" class="loss-guard" title="Daily loss guardrail · Open Bot Account Settings">
+            <span class="loss-guard-label">Daily loss</span>
+            <span id="terminalLossValue" class="mono">— / —</span>
+            <span class="loss-guard-track" aria-hidden="true"><span id="terminalLossFill"></span></span>
+          </button>
+        </div>
+        <button type="button" id="stopAllBtn" class="btn btn-danger">STOP ALL</button>
+      </div>
+    </header>
+    <span id="syncStatus" class="sync-status" role="status"></span>
 
   <div class="layout" id="labView">
     <aside class="panel controls" aria-label="Backtest setup">
@@ -109,7 +149,108 @@
         <input id="risk" type="number" min="0.1" max="100" step="0.1" value="2">
       </div>
 
-      <button type="button" id="openAdvancedSettings" class="btn btn-ghost advanced-trigger" aria-haspopup="dialog" aria-controls="advancedSettingsDrawer">&#8250; Advanced settings</button>
+      <button type="button" id="openAdvancedSettings" class="btn btn-ghost advanced-trigger" aria-expanded="false" aria-controls="advancedSettingsDrawer">&#8250; Advanced settings</button>
+      <section id="advancedSettingsDrawer" class="advanced-settings" aria-labelledby="advancedSettingsTitle" hidden>
+        <div class="advanced-settings-head"><h2 id="advancedSettingsTitle">Leverage, exits &amp; filters</h2><button type="button" id="closeAdvancedSettings" class="btn btn-ghost advanced-close" aria-label="Cancel and collapse advanced settings">&#215;</button></div>
+        <div class="adv-box" id="advBox">
+          <div class="adv-body" id="advSettingsBody">
+            <div class="row2">
+              <div class="field">
+                <label for="leverage">Leverage (1–200x)</label>
+                <input id="leverage" type="number" min="1" max="200" step="1" value="10">
+              </div>
+              <div class="field">
+                <label for="dailyLoss">Daily loss stop %</label>
+                <input id="dailyLoss" type="number" min="0" max="100" step="0.5" value="5">
+              </div>
+            </div>
+
+            <div class="row2">
+              <div class="field">
+                <label for="slType">Stop Loss Type</label>
+                <select id="slType">
+                  <option value="atr_mult">ATR Mult</option>
+                  <option value="fixed_pct">Fixed %</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="slValue">SL Value</label>
+                <input id="slValue" type="number" min="0.1" step="0.1" value="2.0">
+              </div>
+            </div>
+
+            <div class="row2">
+              <div class="field">
+                <label for="tpType">Take Profit Type</label>
+                <select id="tpType">
+                  <option value="atr_mult">ATR Mult</option>
+                  <option value="rr_ratio">R:R Ratio</option>
+                  <option value="fixed_pct">Fixed %</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="tpValue">TP Value</label>
+                <input id="tpValue" type="number" min="0.1" step="0.1" value="5.0">
+              </div>
+            </div>
+
+            <div class="row2">
+              <div class="field trailing-toggle">
+                <label class="inline"><input type="checkbox" id="trailEnabled" checked> Trailing Stop</label>
+              </div>
+              <div class="field">
+                <label for="trailAtr">Trail ATR Mult</label>
+                <input id="trailAtr" type="number" min="0" step="0.5" value="2.5">
+              </div>
+            </div>
+
+            <div class="row2">
+              <div class="field">
+                <label for="slippage">Slippage (bps)</label>
+                <select id="slippage"><option value="0">0 bps</option><option value="2">2 bps</option><option value="5">5 bps</option></select>
+              </div>
+              <div class="field">
+                <label for="feeMode">Fee mode</label>
+                <select id="feeMode"></select>
+              </div>
+            </div>
+
+            <div class="row2">
+              <div class="field">
+                <label for="endSelect">Window anchor</label>
+                <select id="endSelect">
+                  <option value="latest" selected>Latest candle</option>
+                  <option value="step3c">Step 3C anchor</option>
+                  <option value="step4b">Step 4B anchor</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="triggerSource">SL/TP trigger</label>
+                <select id="triggerSource"></select>
+              </div>
+            </div>
+
+            <div class="field">
+              <label class="inline"><input type="checkbox" id="trend4h"> 4h EMA(50/200) trend filter</label>
+              <label class="inline"><input type="checkbox" id="costGate"> Raw ATR ≥ 2× cost gate</label>
+              <label class="inline"><input type="checkbox" id="strictLot"> Strict risk lot cap</label>
+            </div>
+
+            <!-- Hidden legacy compatibility controls -->
+            <div class="hidden">
+              <select id="stopMode"><option value="atr">ATR ×</option><option value="pct">Fixed %</option></select>
+              <select id="exitMode"></select>
+              <select id="presetSelect"><option value="">—</option></select>
+              <select id="presetCapital"><option value="preset">preset</option></select>
+              <div id="presetNote"></div>
+              <input type="radio" name="runMode" value="single" checked>
+              <input type="radio" name="runMode" value="portfolio">
+              <div id="legsNotice"></div>
+            </div>
+          </div>
+        </div>
+        <div class="advanced-settings-actions"><button type="button" id="cancelAdvancedSettings" class="btn btn-ghost">Cancel</button><button type="button" id="applyAdvancedSettings" class="btn btn-primary">Apply settings</button></div>
+      </section>
 
       <div id="advFootSummary" class="adv-foot-summary">10x leverage · ATR exits · Fees + GST</div>
 
@@ -118,7 +259,7 @@
       <div id="runInfo" class="hint" style="margin-top:4px"></div>
     </aside>
 
-    <main class="main">
+    <div class="main">
       <section class="overview-header">
         <div>
           <h1 class="overview-title">Research overview</h1>
@@ -272,118 +413,8 @@
           <div class="table-wrap"><table id="lbTable" class="data"></table></div>
         </div>
       </section>
-    </main>
+    </div>
   </div>
-
-  <dialog id="advancedSettingsDrawer" class="settings-drawer" aria-labelledby="advancedSettingsTitle">
-    <div class="drawer-head"><div><h2 id="advancedSettingsTitle">Advanced backtest settings</h2><p class="hint">Leverage, exits, fees, and entry filters.</p></div><button type="button" id="closeAdvancedSettings" class="btn btn-ghost drawer-close" aria-label="Close advanced settings">&#215;</button></div>
-      <details class="adv-box" id="advBox" open>
-        <summary class="adv-summary">
-          <span class="adv-icon">⚙</span>
-          <div class="adv-text">
-            <div class="adv-title">Advanced settings</div>
-            <div class="adv-sub">Leverage, exits, fees &amp; filters</div>
-          </div>
-          <span class="adv-chevron">▾</span>
-        </summary>
-        <div class="adv-body">
-          <div class="row2">
-            <div class="field">
-              <label for="leverage">Leverage (1–200x)</label>
-              <input id="leverage" type="number" min="1" max="200" step="1" value="10">
-            </div>
-            <div class="field">
-              <label for="dailyLoss">Daily loss stop %</label>
-              <input id="dailyLoss" type="number" min="0" max="100" step="0.5" value="5">
-            </div>
-          </div>
-
-          <div class="row2">
-            <div class="field">
-              <label for="slType">Stop Loss Type</label>
-              <select id="slType">
-                <option value="atr_mult">ATR Mult</option>
-                <option value="fixed_pct">Fixed %</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="slValue">SL Value</label>
-              <input id="slValue" type="number" min="0.1" step="0.1" value="2.0">
-            </div>
-          </div>
-
-          <div class="row2">
-            <div class="field">
-              <label for="tpType">Take Profit Type</label>
-              <select id="tpType">
-                <option value="atr_mult">ATR Mult</option>
-                <option value="rr_ratio">R:R Ratio</option>
-                <option value="fixed_pct">Fixed %</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="tpValue">TP Value</label>
-              <input id="tpValue" type="number" min="0.1" step="0.1" value="5.0">
-            </div>
-          </div>
-
-          <div class="row2">
-            <div class="field">
-              <label class="inline" style="margin-top:18px"><input type="checkbox" id="trailEnabled" checked> Trailing Stop</label>
-            </div>
-            <div class="field">
-              <label for="trailAtr">Trail ATR Mult</label>
-              <input id="trailAtr" type="number" min="0" step="0.5" value="2.5">
-            </div>
-          </div>
-
-          <div class="row2">
-            <div class="field">
-              <label for="slippage">Slippage (bps)</label>
-              <select id="slippage"><option value="0">0 bps</option><option value="2">2 bps</option><option value="5">5 bps</option></select>
-            </div>
-            <div class="field">
-              <label for="feeMode">Fee mode</label>
-              <select id="feeMode"></select>
-            </div>
-          </div>
-
-          <div class="row2">
-            <div class="field">
-              <label for="endSelect">Window anchor</label>
-              <select id="endSelect">
-                <option value="latest" selected>Latest candle</option>
-                <option value="step3c">Step 3C anchor</option>
-                <option value="step4b">Step 4B anchor</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="triggerSource">SL/TP trigger</label>
-              <select id="triggerSource"></select>
-            </div>
-          </div>
-
-          <div class="field">
-            <label class="inline"><input type="checkbox" id="trend4h"> 4h EMA(50/200) trend filter</label>
-            <label class="inline"><input type="checkbox" id="costGate"> Raw ATR ≥ 2× cost gate</label>
-            <label class="inline"><input type="checkbox" id="strictLot"> Strict risk lot cap</label>
-          </div>
-
-          <!-- Hidden legacy compatibility controls -->
-          <div class="hidden">
-            <select id="stopMode"><option value="atr">ATR ×</option><option value="pct">Fixed %</option></select>
-            <select id="exitMode"></select>
-            <select id="presetSelect"><option value="">—</option></select>
-            <select id="presetCapital"><option value="preset">preset</option></select>
-            <div id="presetNote"></div>
-            <input type="radio" name="runMode" value="single" checked>
-            <input type="radio" name="runMode" value="portfolio">
-            <div id="legsNotice"></div>
-          </div>
-        </div>
-      </details>
-    <div class="drawer-actions"><button type="button" id="cancelAdvancedSettings" class="btn btn-ghost">Cancel</button><button type="button" id="applyAdvancedSettings" class="btn btn-primary">Apply settings</button></div>
-  </dialog>
 
   <!-- Custom Strategy Builder Modal -->
   <dialog id="strategyDialog" class="strat-dialog">
@@ -574,7 +605,7 @@
       <div class="table-wrap"><table id="botSignals" class="data"></table></div>
     </section>
     </section>
-      <section class="panel bot-card bot-account hidden" id="paperAccountCard">
+      <section class="panel bot-card bot-account hidden" id="paperAccountCard" tabindex="-1" aria-labelledby="accountSettingsTitle">
         <div class="bot-card-head"><h3 id="accountSettingsTitle">Account Settings</h3><label id="paperSessionField">Session <select id="paperSessionSelect"><option value="">Active paper account</option></select></label></div>
         <div id="paperAccountLifecycle" class="hint" role="status">Verifying process and persisted account…</div>
         <div class="bot-controls account-controls">
@@ -814,7 +845,7 @@
       </div>
       <div class="inventory-search"><input type="search" id="dlInventorySearch" aria-label="Search historical data inventory" placeholder="Search coins or market names..." autocomplete="off"></div>
       <p id="dlSearchEmpty" class="hint is-hidden" role="status">No coins match your search.</p>
-      <div class="table-wrap dl-table-wrap">
+      <div id="dataInventoryWrap" class="table-wrap dl-table-wrap">
         <table id="dlInventoryTable" class="data dl-table"></table>
       </div>
     </section>
@@ -1075,6 +1106,26 @@
       <div class="dialog-actions">
         <button value="cancel" class="btn btn-ghost" formnovalidate>Cancel</button>
         <button id="addCoinSubmit" value="default" class="btn btn-primary">Validate &amp; download</button>
+      </div>
+    </form>
+  </dialog>
+
+  </main>
+
+  <dialog id="emergencyDialog" class="emergency-dialog" aria-labelledby="emergencyTitle" aria-describedby="emergencyWarning">
+    <form id="emergencyForm">
+      <div id="emergencyStep" class="emergency-step">Step 1 of 2</div>
+      <h2 id="emergencyTitle">Stop all bots</h2>
+      <p id="emergencyWarning"></p>
+      <div id="emergencyConfirmField" class="field" hidden>
+        <label for="emergencyConfirmInput">Type <strong id="emergencyKeyword" class="mono">STOP</strong> to confirm</label>
+        <input id="emergencyConfirmInput" class="mono" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" disabled>
+      </div>
+      <p id="emergencyResult" class="hint" role="status"></p>
+      <div class="dialog-actions">
+        <button type="button" id="emergencyCancel" class="btn btn-ghost" autofocus>Cancel</button>
+        <button type="button" id="emergencyNext" class="btn btn-danger">Continue</button>
+        <button type="submit" id="emergencySubmit" class="btn btn-danger" hidden disabled>Flatten &amp; stop</button>
       </div>
     </form>
   </dialog>
